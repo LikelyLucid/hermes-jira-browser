@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -15,6 +16,66 @@ spec.loader.exec_module(repository_context)
 
 
 class RepositoryContextResolutionTests(unittest.TestCase):
+    def test_canonical_worktree_symlink_is_rejected_before_git_runs(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = root / "repo"
+            outside = root / "outside"
+            (repo / ".worktrees").mkdir(parents=True)
+            outside.mkdir()
+            (outside / ".git").write_text("gitdir: elsewhere\n", encoding="utf-8")
+            (repo / ".worktrees" / "jira-DEMO-42").symlink_to(outside, target_is_directory=True)
+            store = mock.Mock()
+            store.get_project_mapping.return_value = {"repo_path": str(repo)}
+
+            with mock.patch.object(repository_context, "_local_context") as local:
+                result = repository_context.get_repository_context(store, "DEMO-42")
+
+        self.assertEqual(result["status"], "unavailable")
+        self.assertEqual(result["reason"], "worktree_unsafe")
+        local.assert_not_called()
+
+    def test_unregistered_nested_repository_is_not_treated_as_the_mapped_worktree(self):
+        import subprocess
+
+        def git(cwd: Path, *args: str) -> None:
+            subprocess.run(["git", *args], cwd=cwd, check=True, capture_output=True, text=True)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            worktree = repo / ".worktrees" / "jira-DEMO-42"
+            worktree.mkdir(parents=True)
+            git(repo, "init", "-q", "-b", "main")
+            git(repo, "config", "user.name", "Test User")
+            git(repo, "config", "user.email", "test@example.com")
+            (repo / "README.md").write_text("mapped\n", encoding="utf-8")
+            git(repo, "add", "README.md")
+            git(repo, "commit", "-qm", "mapped")
+            git(worktree, "init", "-q", "-b", "jira/DEMO-42")
+            git(worktree, "config", "user.name", "Test User")
+            git(worktree, "config", "user.email", "test@example.com")
+            (worktree / "README.md").write_text("other\n", encoding="utf-8")
+            git(worktree, "add", "README.md")
+            git(worktree, "commit", "-qm", "other")
+            store = mock.Mock()
+            store.get_project_mapping.return_value = {"repo_path": str(repo)}
+
+            result = repository_context.get_repository_context(store, "DEMO-42")
+
+        self.assertEqual(result["status"], "unavailable")
+        self.assertEqual(result["reason"], "worktree_repository_mismatch")
+
+    def test_generic_subprocess_runner_bounds_captured_output_before_returning(self):
+        result = repository_context._run_bounded(
+            [sys.executable, "-c", f"print('x' * {repository_context.MAX_COMMAND_OUTPUT * 2})"],
+            cwd=Path.cwd(),
+            timeout=repository_context.GIT_TIMEOUT_SECONDS,
+            environment=repository_context._git_environment(),
+        )
+
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(len(result.stdout), repository_context.MAX_COMMAND_OUTPUT)
+
     def test_missing_project_mapping_is_an_explicit_unavailable_state(self):
         store = mock.Mock()
         store.get_project_mapping.return_value = None
@@ -156,17 +217,16 @@ class RepositoryContextResolutionTests(unittest.TestCase):
 
     def test_git_runner_is_noninteractive_argv_only_and_bounded(self):
         completed = mock.Mock(returncode=0, stdout="ok", stderr="")
-        with mock.patch.object(repository_context.subprocess, "run", return_value=completed) as run:
+        with mock.patch.object(repository_context, "_run_bounded", return_value=completed) as run:
             result = repository_context._run_git(Path("/repo"), "status", "--short")
 
         self.assertEqual(result.stdout, "ok")
         args, kwargs = run.call_args
         self.assertEqual(args[0][:2], ["git", "-c"])
-        self.assertEqual(kwargs["stdin"], repository_context.subprocess.DEVNULL)
+        self.assertEqual(kwargs["cwd"], Path("/repo"))
         self.assertEqual(kwargs["timeout"], repository_context.GIT_TIMEOUT_SECONDS)
-        self.assertNotIn("shell", kwargs)
-        self.assertEqual(kwargs["env"]["GIT_TERMINAL_PROMPT"], "0")
-        self.assertEqual(kwargs["env"]["GIT_CONFIG_NOSYSTEM"], "1")
+        self.assertEqual(kwargs["environment"]["GIT_TERMINAL_PROMPT"], "0")
+        self.assertEqual(kwargs["environment"]["GIT_CONFIG_NOSYSTEM"], "1")
 
     def test_authenticated_gh_adapter_reads_bounded_pr_json_without_network_library(self):
         adapter = repository_context.GhGitHubAdapter(executable="/usr/bin/gh")

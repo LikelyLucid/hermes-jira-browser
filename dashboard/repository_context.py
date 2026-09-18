@@ -7,6 +7,7 @@ import os
 import re
 import shutil
 import subprocess
+import tempfile
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -65,29 +66,49 @@ def _git_environment() -> dict[str, str]:
     return environment
 
 
+def _run_bounded(
+    argv: list[str],
+    *,
+    cwd: Path,
+    timeout: int,
+    environment: dict[str, str],
+) -> subprocess.CompletedProcess[str]:
+    """Capture command output through temporary files so memory stays bounded."""
+    with tempfile.TemporaryFile() as stdout_file, tempfile.TemporaryFile() as stderr_file:
+        process = subprocess.Popen(
+            argv,
+            cwd=cwd,
+            stdin=subprocess.DEVNULL,
+            stdout=stdout_file,
+            stderr=stderr_file,
+            env=environment,
+        )
+        try:
+            returncode = process.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait()
+            raise
+        stdout_file.seek(0)
+        stderr_file.seek(0)
+        stdout = stdout_file.read(MAX_COMMAND_OUTPUT).decode("utf-8", errors="replace")
+        stderr = stderr_file.read(MAX_COMMAND_OUTPUT).decode("utf-8", errors="replace")
+    return subprocess.CompletedProcess(argv, returncode, stdout, stderr)
+
+
 def _run_git(cwd: Path, *args: str) -> subprocess.CompletedProcess[str]:
     try:
-        result = subprocess.run(
+        return _run_bounded(
             ["git", "-c", f"core.hooksPath={os.devnull}", *args],
             cwd=cwd,
-            check=False,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
             timeout=GIT_TIMEOUT_SECONDS,
-            env=_git_environment(),
+            environment=_git_environment(),
         )
     except FileNotFoundError as exc:
         raise RuntimeError("git_not_installed") from exc
     except subprocess.TimeoutExpired as exc:
         raise RuntimeError("git_timeout") from exc
-    return subprocess.CompletedProcess(
-        result.args,
-        result.returncode,
-        (result.stdout or "")[:MAX_COMMAND_OUTPUT],
-        (result.stderr or "")[:MAX_COMMAND_OUTPUT],
-    )
+
 
 
 def _git_success(cwd: Path, *args: str) -> subprocess.CompletedProcess[str]:
@@ -128,7 +149,24 @@ def _parse_recent_commits(output: str) -> tuple[list[dict[str, str]], bool]:
     return commits, len(lines) > MAX_RECENT_COMMITS
 
 
-def _local_context(worktree: Path, *, branch: str, base_ref: str) -> dict[str, Any]:
+def _local_context(worktree: Path, *, repository: Path, branch: str, base_ref: str) -> dict[str, Any]:
+    try:
+        worktree_root = Path(_git_success(worktree, "rev-parse", "--show-toplevel").stdout.strip()).resolve()
+        worktree_common_raw = _git_success(worktree, "rev-parse", "--git-common-dir").stdout.strip()
+        repository_common_raw = _git_success(repository, "rev-parse", "--git-common-dir").stdout.strip()
+        worktree_common = Path(worktree_common_raw)
+        repository_common = Path(repository_common_raw)
+        if not worktree_common.is_absolute():
+            worktree_common = worktree / worktree_common
+        if not repository_common.is_absolute():
+            repository_common = repository / repository_common
+        if worktree_root != worktree.resolve() or worktree_common.resolve() != repository_common.resolve():
+            raise RuntimeError("worktree_repository_mismatch")
+    except RuntimeError as exc:
+        if str(exc) == "worktree_repository_mismatch":
+            raise
+        reason = str(exc) if str(exc) in {"git_not_installed", "git_timeout"} else "git_unavailable"
+        raise RuntimeError(reason) from exc
     try:
         resolved_base = _git_success(
             worktree,
@@ -236,16 +274,11 @@ class GhGitHubAdapter:
         environment = os.environ.copy()
         environment.update({"GH_PROMPT_DISABLED": "1", "GIT_TERMINAL_PROMPT": "0"})
         try:
-            return subprocess.run(
+            return _run_bounded(
                 [self.executable, *args],
                 cwd=cwd,
-                check=False,
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
                 timeout=self.timeout,
-                env=environment,
+                environment=environment,
             )
         except subprocess.TimeoutExpired as exc:
             raise RuntimeError("gh_timeout") from exc
@@ -319,10 +352,14 @@ def get_repository_context(
     worktree = repo_path / ".worktrees" / expected_branch.replace("/", "-")
     if not worktree.is_dir() or not (worktree / ".git").exists():
         return _unavailable(normalized, "worktree_missing")
+    expected_absolute = Path(os.path.abspath(worktree))
+    if worktree.is_symlink() or (worktree / ".git").is_symlink() or worktree.resolve() != expected_absolute:
+        return _unavailable(normalized, "worktree_unsafe")
+    worktree = worktree.resolve()
     try:
-        repository = _local_context(worktree, branch=expected_branch, base_ref=requested_base)
+        repository = _local_context(worktree, repository=repo_path, branch=expected_branch, base_ref=requested_base)
     except RuntimeError as exc:
-        return _unavailable(normalized, str(exc) if str(exc) in {"worktree_branch_mismatch", "base_ref_unavailable", "git_timeout", "git_not_installed"} else "git_unavailable")
+        return _unavailable(normalized, str(exc) if str(exc) in {"worktree_branch_mismatch", "worktree_repository_mismatch", "base_ref_unavailable", "git_timeout", "git_not_installed"} else "git_unavailable")
     adapter = github or GhGitHubAdapter()
     try:
         github_context = _normalise_github(adapter.context(repository=repo_path, branch=expected_branch))
