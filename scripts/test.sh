@@ -71,6 +71,11 @@ from pathlib import Path
 
 def get_hermes_home() -> Path:
     return Path(os.environ.get("HERMES_HOME", Path.home() / ".hermes")).expanduser()
+
+
+def profile_name_for_home(home: Path) -> str:
+    home = Path(home)
+    return home.name if home.parent.name == "profiles" else "default"
 PY
 
 export PYTHONPATH="$WORK_DIR/shims${PYTHONPATH:+:$PYTHONPATH}"
