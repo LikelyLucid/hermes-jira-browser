@@ -20,8 +20,9 @@ TOKEN_PATTERNS = (
     (re.compile(r"\bAIza[0-9A-Za-z_-]{30,}\b"), "Google API key"),
 )
 CREDENTIAL_ASSIGNMENT = re.compile(
-    r"(?i)(?<![A-Za-z0-9])(?:api[_-]?(?:token|key)|access[_-]?token|"
-    r"auth[_-]?token|client[_-]?secret|password|passwd|secret)"
+    r"(?i)(?<![A-Za-z0-9])(?:aws[_-]?secret[_-]?access[_-]?key|"
+    r"api[_-]?(?:token|key)|access[_-]?token|auth[_-]?token|"
+    r"client[_-]?secret|private[_-]?key|password|passwd|secret)"
     r"(?![A-Za-z0-9])\s*[:=]\s*"
     r"(?P<value>\"[^\"\n]*\"|'[^'\n]*'|[^\s,#;]+)"
 )

@@ -35,6 +35,10 @@ class RepositoryScannerTests(unittest.TestCase):
         self.assert_detected(f"JIRA_API_TOKEN={value}\n", "credential assignment")
         self.assert_detected(f"password: {value}\n", "credential assignment")
 
+    def test_detects_aws_secret_access_key_assignment(self) -> None:
+        secret = "a" * 40
+        self.assert_detected(f"AWS_SECRET_ACCESS_KEY={secret}\n", "credential assignment")
+
     def test_placeholder_bypass_requires_an_exact_placeholder(self) -> None:
         key = "api" + "Token"
         placeholder = "your-" + "jira-api-token"
