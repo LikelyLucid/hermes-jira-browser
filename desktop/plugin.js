@@ -68,24 +68,35 @@ function mutationKeyFor(action, logicalId, payload) {
   const cacheKey = `${String(action)}:${String(logicalId)}`
   const fingerprint = JSON.stringify(payload)
   const existing = mutationKeyCache.get(cacheKey)
-  if (existing?.fingerprint === fingerprint) {
+  if (existing?.fingerprint === fingerprint && existing.status !== 'completed') {
     mutationKeyCache.delete(cacheKey)
     mutationKeyCache.set(cacheKey, existing)
     return existing.key
   }
-  const entry = { fingerprint, key: newMutationKey() }
+  // A changed payload is an explicit supersession of the prior logical
+  // mutation. Completed entries are also superseded so a user can intentionally
+  // submit the same payload again after the earlier write finished.
   mutationKeyCache.delete(cacheKey)
-  mutationKeyCache.set(cacheKey, entry)
-  while (mutationKeyCache.size > MUTATION_KEY_CACHE_LIMIT) {
-    mutationKeyCache.delete(mutationKeyCache.keys().next().value)
+  const entry = { fingerprint, key: newMutationKey(), status: 'unresolved' }
+  while (mutationKeyCache.size >= MUTATION_KEY_CACHE_LIMIT) {
+    const completedKey = [...mutationKeyCache.entries()].find(([, candidate]) => candidate.status === 'completed')?.[0]
+    if (completedKey === undefined) {
+      throw new Error('Jira mutation retry capacity is full; resolve an existing mutation before retrying.')
+    }
+    mutationKeyCache.delete(completedKey)
   }
+  mutationKeyCache.set(cacheKey, entry)
   return entry.key
 }
 
 function forgetMutationKey(action, logicalId, payload, key) {
   const cacheKey = `${String(action)}:${String(logicalId)}`
   const entry = mutationKeyCache.get(cacheKey)
-  if (entry?.key === key && entry.fingerprint === JSON.stringify(payload)) mutationKeyCache.delete(cacheKey)
+  if (entry?.key === key && entry.fingerprint === JSON.stringify(payload)) {
+    entry.status = 'completed'
+    mutationKeyCache.delete(cacheKey)
+    mutationKeyCache.set(cacheKey, entry)
+  }
 }
 
 function normaliseIssueKey(value) {
@@ -1214,10 +1225,11 @@ function IssueDetail({ issue, status, projects, mapping, links, baseRef, onOpenI
 
   const applySuggestedTransition = useCallback(async () => {
     if (!suggestedTransition) return
-    const mutationKey = mutationKeyFor('suggestion', issue.key, { transition_id: suggestedTransition.id })
     setBusyAction('suggestion')
     setError('')
+    let mutationKey = ''
     try {
+      mutationKey = mutationKeyFor('suggestion', issue.key, { transition_id: suggestedTransition.id })
       await api(`/issues/${encodeURIComponent(issue.key)}/transitions`, {
         method: 'POST',
         body: { transition_id: suggestedTransition.id, idempotency_key: mutationKey }
@@ -1228,8 +1240,8 @@ function IssueDetail({ issue, status, projects, mapping, links, baseRef, onOpenI
       ])
       onIssueChanged?.(updated)
       setTransitions(Array.isArray(choices?.transitions) ? choices.transitions : [])
-      forgetMutationKey('suggestion', issue.key, { transition_id: suggestedTransition.id }, mutationKey)
       host.notify({ kind: 'success', message: `${issue.key} moved to ${updated.status}.` })
+      forgetMutationKey('suggestion', issue.key, { transition_id: suggestedTransition.id }, mutationKey)
     } catch (cause) {
       setError(errorText(cause, 'Could not apply the suggested status.'))
     } finally {
@@ -1293,21 +1305,22 @@ function IssueDetail({ issue, status, projects, mapping, links, baseRef, onOpenI
   const postComment = useCallback(async () => {
     const body = commentDraft.trim()
     if (!body) return
-    const mutationKey = mutationKeyFor('comment', issue.key, { body })
     setBusyAction('comment')
     setError('')
+    let mutationKey = ''
     try {
+      mutationKey = mutationKeyFor('comment', issue.key, { body })
       const result = await api(`/issues/${encodeURIComponent(issue.key)}/comments`, {
         method: 'POST',
         body: { body, idempotency_key: mutationKey }
       })
-      forgetMutationKey('comment', issue.key, { body }, mutationKey)
       setCommentDraft('')
       onIssueChanged?.({
         ...issue,
         comments: [...(issue.comments || []), result.comment]
       })
       host.notify({ kind: 'success', message: `Comment added to ${issue.key}.` })
+      forgetMutationKey('comment', issue.key, { body }, mutationKey)
     } catch (cause) {
       setError(errorText(cause, 'Could not add the Jira comment.'))
     } finally {
@@ -1317,10 +1330,11 @@ function IssueDetail({ issue, status, projects, mapping, links, baseRef, onOpenI
 
   const moveIssue = useCallback(async () => {
     if (!transitionId) return
-    const mutationKey = mutationKeyFor('transition', issue.key, { transition_id: transitionId })
     setBusyAction('transition')
     setError('')
+    let mutationKey = ''
     try {
+      mutationKey = mutationKeyFor('transition', issue.key, { transition_id: transitionId })
       await api(`/issues/${encodeURIComponent(issue.key)}/transitions`, {
         method: 'POST',
         body: { transition_id: transitionId, idempotency_key: mutationKey }
@@ -1332,8 +1346,8 @@ function IssueDetail({ issue, status, projects, mapping, links, baseRef, onOpenI
       onIssueChanged?.(updated)
       setTransitions(Array.isArray(choices?.transitions) ? choices.transitions : [])
       setTransitionId('')
-      forgetMutationKey('transition', issue.key, { transition_id: transitionId }, mutationKey)
       host.notify({ kind: 'success', message: `${issue.key} moved to ${updated.status}.` })
+      forgetMutationKey('transition', issue.key, { transition_id: transitionId }, mutationKey)
     } catch (cause) {
       setError(errorText(cause, 'Could not change the Jira status.'))
     } finally {
@@ -2557,8 +2571,8 @@ function JiraPage() {
       const updated = await api(`/issues/${encodeURIComponent(issueKey)}`, { timeoutMs: 30_000 })
       setIssues(rows => rows.map(issue => issue.key === issueKey ? { ...issue, ...updated } : issue))
       if (selectedKey === issueKey) setDetail(updated)
-      forgetMutationKey('drag', issueKey, { transition_id: transition.id }, mutationKey)
       host.notify({ kind: 'success', message: `${issueKey} moved to ${updated.status}.` })
+      forgetMutationKey('drag', issueKey, { transition_id: transition.id }, mutationKey)
     } catch (cause) {
       setError(errorText(cause, `Could not move ${issueKey}.`))
     } finally {

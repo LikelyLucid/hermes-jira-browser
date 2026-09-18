@@ -37,6 +37,7 @@ SEARCH_FIELDS = (
 DETAIL_FIELDS = f"{SEARCH_FIELDS},parent,subtasks,fixVersions,components,attachment"
 MAX_JIRA_JSON_BYTES = 16 * 1024 * 1024
 MAX_JIRA_CONFIG_BYTES = 1 * 1024 * 1024
+MAX_JIRA_COMMENT_BODY_BYTES = 64 * 1024
 MAX_ATTACHMENT_PREVIEW_BYTES = 4 * 1024 * 1024
 MAX_ISSUE_COMMENTS = 1_000
 MAX_ADF_DEPTH = 64
@@ -477,6 +478,46 @@ def _normalise_comment(
     }
 
 
+def _adf_node_has_content(node: Any) -> bool:
+    if isinstance(node, str):
+        return bool(node.strip())
+    if not isinstance(node, Mapping):
+        return False
+    node_type = str(node.get("type") or "").strip()
+    if node_type == "text":
+        return bool(str(node.get("text") or "").strip())
+    if node_type in {"media", "inlineCard", "blockCard"}:
+        attrs = node.get("attrs")
+        return isinstance(attrs, Mapping) and any(str(value or "").strip() for value in attrs.values())
+    children = node.get("content")
+    return isinstance(children, list) and any(_adf_node_has_content(child) for child in children)
+
+
+def _validate_comment_response(payload: Any) -> Mapping[str, Any]:
+    if not isinstance(payload, Mapping):
+        raise JiraAmbiguousError("Jira returned an invalid comment response; the write outcome is unknown.")
+    comment_id = str(payload.get("id") or "").strip()
+    body = payload.get("body")
+    if isinstance(body, str):
+        valid_body = bool(body.strip())
+    elif isinstance(body, Mapping):
+        content = body.get("content")
+        valid_body = (
+            str(body.get("type") or "").strip() == "doc"
+            and isinstance(content, list)
+            and any(_adf_node_has_content(node) for node in content)
+        )
+    else:
+        valid_body = False
+    try:
+        body_bytes = len(json.dumps(body, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
+    except (TypeError, ValueError):
+        body_bytes = MAX_JIRA_COMMENT_BODY_BYTES + 1
+    if not comment_id or not valid_body or body_bytes > MAX_JIRA_COMMENT_BODY_BYTES:
+        raise JiraAmbiguousError("Jira returned an invalid comment response; the write outcome is unknown.")
+    return payload
+
+
 def _normalise_issue(issue: Mapping[str, Any], *, detail: bool = False) -> dict[str, Any]:
     fields = issue.get("fields") if isinstance(issue.get("fields"), Mapping) else {}
     status = fields.get("status") if isinstance(fields.get("status"), Mapping) else {}
@@ -845,6 +886,7 @@ class JiraClient:
                 }
             },
         )
+        _validate_comment_response(payload)
         return _normalise_comment(payload)
 
     def transitions(self, issue_key: str) -> list[dict[str, str]]:

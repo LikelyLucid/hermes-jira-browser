@@ -225,6 +225,25 @@ class DesktopPluginTests(unittest.TestCase):
         self.assertLess(manual.index("const [updated, choices]"), manual.index("forgetMutationKey('transition'"))
         self.assertLess(drag.index("const updated = await api"), drag.index("forgetMutationKey('drag'"))
 
+    def test_mutation_retry_cache_pins_unresolved_keys_and_rejects_when_full(self):
+        source = PLUGIN.read_text(encoding="utf-8")
+        cache = source[source.index("function mutationKeyFor"):source.index("function normaliseIssueKey")]
+
+        self.assertIn("status: 'unresolved'", cache)
+        self.assertIn("candidate.status === 'completed'", cache)
+        self.assertIn("Jira mutation retry capacity is full", cache)
+        self.assertNotIn("mutationKeyCache.delete(mutationKeyCache.keys().next().value)", cache)
+        self.assertIn("entry.status = 'completed'", cache)
+
+    def test_comment_cleanup_happens_after_every_followup_succeeds(self):
+        source = PLUGIN.read_text(encoding="utf-8")
+        comment = source[source.index("const postComment = useCallback"):source.index("const moveIssue = useCallback")]
+
+        self.assertLess(comment.index("setCommentDraft('')"), comment.index("onIssueChanged"))
+        self.assertLess(comment.index("onIssueChanged"), comment.index("host.notify"))
+        self.assertLess(comment.index("host.notify"), comment.index("forgetMutationKey('comment'"))
+        self.assertIn("catch (cause)", comment)
+
     def test_explicit_jira_mutations_send_high_entropy_idempotency_keys(self):
         source = PLUGIN.read_text(encoding="utf-8")
 

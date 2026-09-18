@@ -186,8 +186,27 @@ class JiraBrowserApiTests(unittest.TestCase):
 
         client.add_comment.assert_called_once_with("DEMO-42", "Done")
 
-    def test_remote_failure_keeps_pending_receipt_without_repeating_jira(self):
+    def test_malformed_comment_response_keeps_pending_receipt_without_repeating_jira(self):
         payload = plugin_api.CommentRequest(body="Done", idempotency_key="comment-key-123460")
+        client = mock.Mock()
+        client.add_comment.side_effect = plugin_api.SERVICE.JiraAmbiguousError(
+            "Jira returned an invalid comment response; the write outcome is unknown."
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            store = plugin_api.SERVICE.JiraStore(Path(tmp) / "state.sqlite3")
+            with mock.patch.object(plugin_api, "_store", return_value=store), mock.patch.object(plugin_api, "_client", return_value=client):
+                with self.assertRaises(plugin_api.HTTPException):
+                    asyncio.run(plugin_api.add_comment("DEMO-42", payload))
+                with self.assertRaisesRegex(plugin_api.HTTPException, "already pending"):
+                    asyncio.run(plugin_api.add_comment("DEMO-42", payload))
+                receipt = store.get_mutation_receipt(payload.idempotency_key)
+                self.assertIsNotNone(receipt)
+                self.assertEqual(receipt["completed"], 0)
+
+        client.add_comment.assert_called_once_with("DEMO-42", "Done")
+
+    def test_remote_failure_keeps_pending_receipt_without_repeating_jira(self):
+        payload = plugin_api.CommentRequest(body="Done", idempotency_key="comment-key-123463")
         client = mock.Mock()
         client.add_comment.side_effect = RuntimeError("request outcome unknown")
         with tempfile.TemporaryDirectory() as tmp:

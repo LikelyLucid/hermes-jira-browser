@@ -1248,6 +1248,36 @@ class JiraClientTests(unittest.TestCase):
         self.assertEqual(captured["body"]["body"]["type"], "doc")
         self.assertEqual(result["body"], "Implemented and verified.")
 
+    def test_add_comment_rejects_malformed_success_responses_as_ambiguous(self):
+        client = jira_service.JiraClient(jira_service.JiraConfig(
+            base_url="https://jira.example.invalid",
+            email="dev@example.com",
+            api_token="very-secret",
+        ))
+
+        for response_payload in (
+            {},
+            {"id": "9001"},
+            {"id": "9001", "body": {}},
+            {"id": "9001", "body": {"type": "doc", "content": [{}]}},
+        ):
+            class Response:
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, *args):
+                    return None
+
+                def read(self, _limit=-1):
+                    return json.dumps(response_payload).encode("utf-8")
+
+            opener = mock.Mock()
+            opener.open.return_value = Response()
+            with self.subTest(response_payload=response_payload), mock.patch.object(
+                jira_service.urllib.request, "build_opener", return_value=opener
+            ), self.assertRaises(jira_service.JiraAmbiguousError):
+                client.add_comment("DEMO-42", "Implemented and verified.")
+
     def test_transitions_returns_safe_status_choices(self):
         client = jira_service.JiraClient(jira_service.JiraConfig(
             base_url="https://jira.example.invalid",
