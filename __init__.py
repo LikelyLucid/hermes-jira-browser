@@ -111,7 +111,7 @@ def _json_result(data: Any) -> str:
         preview_budget = max(1, preview_budget // 2)
 
 
-def jira_assigned_issues(args: Any) -> str:
+def jira_assigned_issues(args: Any, **_context: Any) -> str:
     """List the current user's active assigned Jira issues."""
     values = _mapping_args(args)
     return _json_result(_load_client().search(
@@ -121,7 +121,7 @@ def jira_assigned_issues(args: Any) -> str:
     ))
 
 
-def jira_search_issues(args: Any) -> str:
+def jira_search_issues(args: Any, **_context: Any) -> str:
     """Search Jira with a bounded JQL expression and page size."""
     values = _mapping_args(args)
     jql = str(values.get("jql") or "").strip()
@@ -136,13 +136,13 @@ def jira_search_issues(args: Any) -> str:
     ))
 
 
-def jira_issue_detail(args: Any) -> str:
+def jira_issue_detail(args: Any, **_context: Any) -> str:
     """Fetch one fresh, normalized Jira issue detail."""
     values = _mapping_args(args)
     return _json_result(_load_client().issue(_issue_key(values)))
 
 
-def jira_issue_transitions(args: Any) -> str:
+def jira_issue_transitions(args: Any, **_context: Any) -> str:
     """List the available transitions for one Jira issue without applying one."""
     values = _mapping_args(args)
     return _json_result(_load_client().transitions(_issue_key(values)))

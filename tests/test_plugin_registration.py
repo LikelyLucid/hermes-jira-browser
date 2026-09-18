@@ -97,6 +97,15 @@ class PluginRegistrationTests(unittest.TestCase):
         self.assertEqual(transitions["data"][0]["id"], "31")
         self.assertEqual(client.calls, [("issue", "DEMO-42"), ("transitions", "DEMO-42")])
 
+    def test_handlers_accept_normal_hermes_dispatch_context(self):
+        client = FakeJiraClient()
+        dispatch_context = {"task_id": "task-1", "session_id": "session-1", "user_task": "inspect Jira"}
+        with mock.patch.object(plugin, "_load_client", return_value=client):
+            result = plugin.jira_issue_detail({"issue_key": "DEMO-42"}, **dispatch_context)
+
+        self.assertEqual(json.loads(result)["data"]["key"], "DEMO-42")
+        self.assertEqual(client.calls, [("issue", "DEMO-42")])
+
     def test_tool_results_are_strings_and_bound_oversized_jira_data(self):
         client = FakeJiraClient()
         client.issue = mock.Mock(return_value={"key": "DEMO-42", "description": "x" * 200_000})
