@@ -69,6 +69,12 @@ function issueKeyFromHash(hash = window.location.hash) {
   return normaliseIssueKey(new URLSearchParams(query).get(ISSUE_QUERY_PARAM))
 }
 
+function hashHasIssueParam(hash = window.location.hash) {
+  const route = String(hash || '').replace(/^#/, '')
+  const [path, query = ''] = route.split('?')
+  return path === ROUTE && new URLSearchParams(query).has(ISSUE_QUERY_PARAM)
+}
+
 function jiraRoute(issueKey = '') {
   const current = String(window.location.hash || '').replace(/^#/, '')
   const [path, query = ''] = current.split('?')
@@ -2008,7 +2014,7 @@ function JiraPage() {
   }, [])
 
   useEffect(() => {
-    if (!selectedKey && issueKeyFromHash()) host.navigate(jiraRoute(''))
+    if (!selectedKey && hashHasIssueParam()) host.navigate(jiraRoute(''))
   }, [selectedKey])
 
 
@@ -2460,11 +2466,6 @@ function JiraPage() {
       return
     }
     const companionId = `${ID}:ticket:${issue.key}`
-    if (companionDisposers.has(companionId)) {
-      host.revealPane?.(`plugin-workspace:${companionId}`)
-      host.navigate('/')
-      return
-    }
     try {
       const disposer = host.openWorkspace(companionId, {
         dock: { pane: 'workspace', pos: 'right' },

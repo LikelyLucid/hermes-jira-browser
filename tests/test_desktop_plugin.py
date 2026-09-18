@@ -224,10 +224,12 @@ class DesktopPluginTests(unittest.TestCase):
         self.assertIn("const ISSUE_QUERY_PARAM = 'issue'", source)
         self.assertIn("const ISSUE_KEY_PATTERN = /^[A-Z][A-Z0-9]+-\\d+$/", source)
         self.assertIn("function issueKeyFromHash", source)
+        self.assertIn("function hashHasIssueParam", source)
         self.assertIn("window.addEventListener('hashchange', syncFromHash)", source)
         self.assertIn("params.delete(ISSUE_QUERY_PARAM)", source)
         self.assertIn("host.navigate(jiraRoute(key))", source)
         self.assertIn("const key = normaliseIssueKey(issueKey)", source)
+        self.assertIn("if (!selectedKey && hashHasIssueParam()) host.navigate(jiraRoute(''))", source)
 
     def test_ticket_companion_is_opt_in_deduplicated_and_read_only(self):
         source = PLUGIN.read_text(encoding="utf-8")
@@ -241,6 +243,7 @@ class DesktopPluginTests(unittest.TestCase):
         self.assertIn("readOnly: true", source)
         self.assertIn("Pin beside chat", source)
         self.assertIn("host.navigate('/')", source)
+        self.assertNotIn("host.revealPane", source)
         self.assertIn("host.notify({ kind: 'warning', message: 'Pinning tickets beside chat is not supported", source)
 
     def test_companion_cleanup_uses_the_native_disposer(self):
