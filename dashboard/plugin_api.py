@@ -48,6 +48,7 @@ class SessionLinkRequest(BaseModel):
     connection_id: str = Field(default="local", min_length=1, max_length=200)
     profile_name: str = Field(default="default", min_length=1, max_length=200)
     target_profile: str | None = Field(default=None, min_length=1, max_length=200)
+    clear_detachment: bool = False
 
     @field_validator("connection_id", "profile_name", "target_profile", mode="before")
     @classmethod
@@ -409,6 +410,7 @@ async def link_session(payload: SessionLinkRequest) -> dict[str, Any]:
             project_id=metadata["project_id"],
             worktree_path=metadata["worktree_path"],
             branch=metadata["branch"],
+            clear_detachment=payload.clear_detachment,
         )
         return {"link": link}
     except Exception as exc:

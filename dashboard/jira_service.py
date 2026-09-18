@@ -1635,6 +1635,7 @@ class JiraStore:
         project_id: str | None = None,
         worktree_path: str | None = None,
         branch: str | None = None,
+        clear_detachment: bool = False,
     ) -> dict[str, Any]:
         if not all((issue_id.strip(), issue_key.strip(), session_id.strip())):
             raise ValueError("Issue id, issue key, and session id are required.")
@@ -1656,7 +1657,7 @@ class JiraStore:
                     project_id=excluded.project_id,
                     worktree_path=COALESCE(excluded.worktree_path, session_links.worktree_path),
                     branch=COALESCE(excluded.branch, session_links.branch),
-                    detached=0
+                    detached=CASE WHEN ? THEN 0 ELSE session_links.detached END
                 """,
                 (
                     issue_id.strip(),
@@ -1670,6 +1671,7 @@ class JiraStore:
                     worktree_path.strip() if worktree_path else None,
                     branch.strip() if branch else None,
                     _utc_now(),
+                    1 if clear_detachment else 0,
                 ),
             )
             row = db.execute(
