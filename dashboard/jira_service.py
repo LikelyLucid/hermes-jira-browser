@@ -1440,6 +1440,22 @@ class JiraStore:
             raise ValueError("Session owner must be the active local owner.")
         return connection, profile, target
 
+    @classmethod
+    def _normalize_read_owner(
+        cls,
+        jira_origin: Any,
+        connection_id: Any,
+        profile_name: Any,
+        target_profile: Any,
+    ) -> tuple[str, str, str, str]:
+        """Normalize every part of a read key before it reaches SQLite."""
+        return (
+            cls._normalize_jira_origin(jira_origin),
+            validate_owner_field(connection_id, field_name="connection_id"),
+            validate_owner_field(profile_name, field_name="profile_name"),
+            validate_owner_field(target_profile, field_name="target_profile"),
+        )
+
     def claim_legacy_origin(self, configured_origin: str) -> int:
         """Keep legacy rows quarantined; origin adoption is never implicit or supported."""
         raise ValueError("Legacy Jira links are quarantined and cannot be adopted.")
@@ -1725,18 +1741,33 @@ class JiraStore:
             ).fetchone()
         return dict(row) if row else {}
 
-    def links_for_issue(self, issue_id: str, *, jira_origin: str | None = None) -> list[dict[str, Any]]:
-        origin = jira_origin.strip().rstrip("/") if jira_origin is not None else ""
-        if not origin:
-            raise ValueError("Jira origin is required for link reads.")
-        clauses = ["issue_id = ?", "detached = 0"]
-        params: list[Any] = [issue_id.strip()]
-        clauses.append("jira_origin = ?")
-        params.append(origin)
+    def links_for_issue(
+        self,
+        issue_id: str,
+        *,
+        jira_origin: str,
+        connection_id: str,
+        profile_name: str,
+        target_profile: str,
+    ) -> list[dict[str, Any]]:
+        issue = issue_id.strip()
+        if not issue:
+            raise ValueError("Issue id is required for link reads.")
+        origin, connection, profile, target = self._normalize_read_owner(
+            jira_origin,
+            connection_id,
+            profile_name,
+            target_profile,
+        )
         with self._connect() as db:
             rows = db.execute(
-                f"SELECT * FROM session_links WHERE {' AND '.join(clauses)} ORDER BY created_at DESC",
-                params,
+                """
+                SELECT * FROM session_links
+                WHERE issue_id = ? AND jira_origin = ? AND connection_id = ?
+                  AND profile_name = ? AND target_profile = ? AND detached = 0
+                ORDER BY created_at DESC
+                """,
+                (issue, origin, connection, profile, target),
             ).fetchall()
         return [dict(row) for row in rows]
 
@@ -1744,16 +1775,20 @@ class JiraStore:
         self,
         issue_id: str,
         *,
-        jira_origin: str = "",
-        connection_id: str = "local",
-        profile_name: str = "default",
-        target_profile: str | None = None,
+        jira_origin: str,
+        connection_id: str,
+        profile_name: str,
+        target_profile: str,
     ) -> set[str]:
-        origin = jira_origin.strip().rstrip("/")
-        if not origin:
-            raise ValueError("Jira origin is required for link reads.")
-        profile = profile_name.strip() or "default"
-        target = (target_profile or profile).strip() or profile
+        issue = issue_id.strip()
+        if not issue:
+            raise ValueError("Issue id is required for link reads.")
+        origin, connection, profile, target = self._normalize_read_owner(
+            jira_origin,
+            connection_id,
+            profile_name,
+            target_profile,
+        )
         with self._connect() as db:
             rows = db.execute(
                 """
@@ -1762,9 +1797,9 @@ class JiraStore:
                   AND profile_name = ? AND target_profile = ? AND detached = 1
                 """,
                 (
-                    issue_id.strip(),
+                    issue,
                     origin,
-                    connection_id.strip() or "local",
+                    connection,
                     profile,
                     target,
                 ),
@@ -1775,19 +1810,29 @@ class JiraStore:
         self,
         issue_id: str,
         *,
-        jira_origin: str | None = None,
+        jira_origin: str,
+        connection_id: str,
+        profile_name: str,
+        target_profile: str,
     ) -> list[dict[str, Any]]:
-        origin = jira_origin.strip().rstrip("/") if jira_origin is not None else ""
-        if not origin:
-            raise ValueError("Jira origin is required for link reads.")
-        clauses = ["issue_id = ?", "detached = 1"]
-        params: list[Any] = [issue_id.strip()]
-        clauses.append("jira_origin = ?")
-        params.append(origin)
+        issue = issue_id.strip()
+        if not issue:
+            raise ValueError("Issue id is required for link reads.")
+        origin, connection, profile, target = self._normalize_read_owner(
+            jira_origin,
+            connection_id,
+            profile_name,
+            target_profile,
+        )
         with self._connect() as db:
             rows = db.execute(
-                f"SELECT * FROM session_links WHERE {' AND '.join(clauses)} ORDER BY created_at DESC",
-                params,
+                """
+                SELECT * FROM session_links
+                WHERE issue_id = ? AND jira_origin = ? AND connection_id = ?
+                  AND profile_name = ? AND target_profile = ? AND detached = 1
+                ORDER BY created_at DESC
+                """,
+                (issue, origin, connection, profile, target),
             ).fetchall()
         return [dict(row) for row in rows]
 

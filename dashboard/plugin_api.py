@@ -152,6 +152,39 @@ def _validate_active_owner(
     return profile, connection
 
 
+def _owner_qualified_rows(
+    rows: list[dict[str, Any]],
+    *,
+    jira_origin: str,
+    connection_id: str,
+    profile_name: str,
+    target_profile: str,
+) -> list[dict[str, Any]]:
+    """Keep only rows whose complete owner key matches this request."""
+    expected = SERVICE.JiraStore._normalize_read_owner(
+        jira_origin,
+        connection_id,
+        profile_name,
+        target_profile,
+    )
+    qualified: list[dict[str, Any]] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        try:
+            actual = SERVICE.JiraStore._normalize_read_owner(
+                row.get("jira_origin"),
+                row.get("connection_id"),
+                row.get("profile_name"),
+                row.get("target_profile"),
+            )
+        except ValueError:
+            continue
+        if actual == expected:
+            qualified.append(row)
+    return qualified
+
+
 @router.get("/status")
 async def status() -> dict[str, Any]:
     return await asyncio.to_thread(SERVICE.config_status)
@@ -337,12 +370,55 @@ async def cleanup_worktree(payload: WorktreeRequest) -> dict[str, Any]:
 
 
 @router.get("/links/{issue_id}")
-async def issue_links(issue_id: str) -> dict[str, Any]:
+async def issue_links(
+    issue_id: str,
+    connection_id: str,
+    profile_name: str,
+    target_profile: str,
+) -> dict[str, Any]:
     try:
+        profile_name, connection_id = _validate_active_owner(
+            profile_name,
+            connection_id,
+            target_profile,
+        )
+        target_profile = SERVICE.validate_owner_field(
+            target_profile,
+            field_name="target_profile",
+        )
         store = _store()
-        jira_origin = _client().config.base_url
-        links = await asyncio.to_thread(store.links_for_issue, issue_id, jira_origin=jira_origin)
-        detached = await asyncio.to_thread(store.detached_links_for_issue, issue_id, jira_origin=jira_origin)
+        client = _client()
+        jira_origin = SERVICE.JiraStore._normalize_jira_origin(client.config.base_url)
+        links = await asyncio.to_thread(
+            store.links_for_issue,
+            issue_id,
+            jira_origin=jira_origin,
+            connection_id=connection_id,
+            profile_name=profile_name,
+            target_profile=target_profile,
+        )
+        detached = await asyncio.to_thread(
+            store.detached_links_for_issue,
+            issue_id,
+            jira_origin=jira_origin,
+            connection_id=connection_id,
+            profile_name=profile_name,
+            target_profile=target_profile,
+        )
+        links = _owner_qualified_rows(
+            links,
+            jira_origin=jira_origin,
+            connection_id=connection_id,
+            profile_name=profile_name,
+            target_profile=target_profile,
+        )
+        detached = _owner_qualified_rows(
+            detached,
+            jira_origin=jira_origin,
+            connection_id=connection_id,
+            profile_name=profile_name,
+            target_profile=target_profile,
+        )
         links = await asyncio.to_thread(SERVICE.enrich_session_links, links)
         return {"links": links, "detached": detached}
     except Exception as exc:
