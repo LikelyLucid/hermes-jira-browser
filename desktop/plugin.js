@@ -197,17 +197,15 @@ function flattenProjectSessions(project) {
 
 function readFocusedSessionOwner() {
   const focusedOwnerAtom = host.state?.focusedSessionOwner
-  const focused = focusedOwnerAtom?.get?.()
-  if (typeof focusedOwnerAtom?.get === 'function') {
-    if (!focused) return null
-  }
-  if ((focused?.connectionId || focused?.connection_id) && (focused?.profile || focused?.profile_name)) {
-    const profileName = String(focused.profile || focused.profile_name).trim() || 'default'
-    return {
-      connectionId: String(focused.connectionId || focused.connection_id).trim(),
-      profileName,
-      targetProfile: String(focused.targetProfile || focused.target_profile || profileName).trim() || profileName
-    }
+  if (focusedOwnerAtom != null) {
+    if (typeof focusedOwnerAtom.get !== 'function') return null
+    const focused = focusedOwnerAtom.get()
+    const connectionId = String(focused?.connectionId || focused?.connection_id || '').trim()
+    const profileName = String(focused?.profile || focused?.profile_name || '').trim()
+    const rawTargetProfile = focused?.targetProfile ?? focused?.target_profile
+    if (!connectionId || !profileName || (rawTargetProfile !== undefined && !String(rawTargetProfile).trim())) return null
+    const targetProfile = String(rawTargetProfile || profileName).trim()
+    return { connectionId, profileName, targetProfile }
   }
   const connectionId = String(
     host.state?.connectionId?.get?.()
@@ -442,22 +440,48 @@ function writeTicketWorktree(issueKey, worktree) {
   pluginContext.storage.set(WORKTREE_LINKS_KEY, links)
 }
 
-function readDetachedChatIds(issueKey) {
-  const detached = pluginContext?.storage.get(DETACHED_CHAT_LINKS_KEY, {}) || {}
-  const values = detached[String(issueKey || '').toUpperCase()]
-  return new Set(Array.isArray(values) ? values.map(String) : [])
+function normaliseJiraOrigin(value) {
+  return String(value || '').trim().replace(/\/+$/, '')
 }
 
-function writeChatDetached(issueKey, link, value) {
+function detachedChatStorageKey(issueKey, jiraOrigin, link) {
+  const owner = link?.connectionId || link?.profileName ? link : ownerFromLink(link)
+  const origin = normaliseJiraOrigin(jiraOrigin)
+  const key = String(issueKey || '').trim().toUpperCase()
+  if (!origin || !key || !owner?.connectionId || !owner?.profileName || !owner?.targetProfile) return ''
+  return [origin, key, owner.connectionId, owner.profileName, owner.targetProfile]
+    .map(value => encodeURIComponent(String(value)))
+    .join('::')
+}
+
+function readDetachedChatIds(issueKey, jiraOrigin = '', owner = null) {
+  const detached = pluginContext?.storage.get(DETACHED_CHAT_LINKS_KEY, {}) || {}
+  const key = String(issueKey || '').trim().toUpperCase()
+  const values = [
+    ...(Array.isArray(detached[key]) ? detached[key] : []),
+    ...(Array.isArray(detached[detachedChatStorageKey(issueKey, jiraOrigin, owner)])
+      ? detached[detachedChatStorageKey(issueKey, jiraOrigin, owner)]
+      : [])
+  ].map(String)
+  const result = new Set(values)
+  const resolvedOwner = owner?.connectionId || owner?.profileName ? owner : ownerFromLink(owner)
+  if (resolvedOwner) {
+    for (const sessionId of values) {
+      result.add(sessionLinkIdentity({ session_id: sessionId, ...resolvedOwner }))
+    }
+  }
+  return result
+}
+
+function writeChatDetached(issueKey, link, value, jiraOrigin = '') {
   if (!pluginContext || !issueKey || !link?.session_id) return
   const detached = pluginContext.storage.get(DETACHED_CHAT_LINKS_KEY, {}) || {}
-  const key = String(issueKey).toUpperCase()
+  const key = detachedChatStorageKey(issueKey, jiraOrigin, link)
+  if (!key) return
   const ids = new Set(Array.isArray(detached[key]) ? detached[key].map(String) : [])
-  const identity = sessionLinkIdentity(link)
   const sessionId = String(link.session_id).trim()
-  if (value) ids.add(identity)
+  if (value) ids.add(sessionId)
   else {
-    ids.delete(identity)
     ids.delete(sessionId)
   }
   if (ids.size > 0) detached[key] = [...ids]
@@ -465,18 +489,21 @@ function writeChatDetached(issueKey, link, value) {
   pluginContext.storage.set(DETACHED_CHAT_LINKS_KEY, detached)
 }
 
-function mergeBackendDetachedLinks(issueKey, links) {
-  const detached = readDetachedChatIds(issueKey)
+function mergeBackendDetachedLinks(issueKey, links, jiraOrigin = '') {
+  const detached = readDetachedChatIds(issueKey, jiraOrigin)
   for (const link of Array.isArray(links) ? links : []) {
     if ((link?.detached || link?.is_detached || link?.tombstone || link?.deleted || link?.detached_at || link?.deleted_at)
       && link?.connection_id && link?.profile_name && link?.session_id) {
       detached.add(sessionLinkIdentity(link))
+      const ownerKey = detachedChatStorageKey(issueKey, link?.jira_origin || jiraOrigin, link)
+      if (ownerKey && pluginContext) {
+        const current = pluginContext.storage.get(DETACHED_CHAT_LINKS_KEY, {}) || {}
+        const values = new Set(Array.isArray(current[ownerKey]) ? current[ownerKey].map(String) : [])
+        values.add(String(link.session_id).trim())
+        current[ownerKey] = [...values]
+        pluginContext.storage.set(DETACHED_CHAT_LINKS_KEY, current)
+      }
     }
-  }
-  if (detached.size > 0 && pluginContext) {
-    const current = pluginContext.storage.get(DETACHED_CHAT_LINKS_KEY, {}) || {}
-    current[String(issueKey).toUpperCase()] = [...detached]
-    pluginContext.storage.set(DETACHED_CHAT_LINKS_KEY, current)
   }
   return detached
 }
@@ -493,33 +520,22 @@ function linkAvailability(link) {
   return isFocusedOwner ? link : { ...link, available: undefined }
 }
 
-function filterDetachedLinks(issueKey, links, backendDetached = []) {
-  const detached = mergeBackendDetachedLinks(issueKey, backendDetached)
+function filterDetachedLinks(issueKey, links, backendDetached = [], jiraOrigin = '') {
+  const detached = mergeBackendDetachedLinks(issueKey, backendDetached, jiraOrigin)
   const candidates = Array.isArray(links) ? links : []
   const legacyLocalDetachIds = new Set()
   for (const link of candidates) {
     const sessionId = String(link?.session_id || '').trim()
     if (sessionId && detached.has(sessionId)) legacyLocalDetachIds.add(sessionId)
   }
-  if (legacyLocalDetachIds.size > 0) {
-    for (const link of candidates) {
-      const sessionId = String(link?.session_id || '').trim()
-      if (!legacyLocalDetachIds.has(sessionId)) continue
-      detached.delete(sessionId)
-      detached.add(sessionLinkIdentity(link))
-    }
-    if (pluginContext) {
-      const current = pluginContext.storage.get(DETACHED_CHAT_LINKS_KEY, {}) || {}
-      current[String(issueKey).toUpperCase()] = [...detached]
-      pluginContext.storage.set(DETACHED_CHAT_LINKS_KEY, current)
-    }
-  }
   return candidates.filter(link => {
     const sessionId = String(link?.session_id || '').trim()
     const identity = sessionLinkIdentity(link)
     const legacyLocalDetach = legacyLocalDetachIds.has(sessionId)
+    const ownerLocalDetach = readDetachedChatIds(issueKey, jiraOrigin, link)
     return !link?.detached && !link?.is_detached && !link?.tombstone && !link?.deleted
-      && !link?.detached_at && !link?.deleted_at && !detached.has(identity) && !legacyLocalDetach
+      && !link?.detached_at && !link?.deleted_at && !detached.has(identity)
+      && !ownerLocalDetach.has(sessionId) && !legacyLocalDetach
   }).map(linkAvailability)
 }
 
@@ -1231,7 +1247,7 @@ function IssueDetail({ issue, status, projects, mapping, links, baseRef, onOpenI
         }
       })
       const linkCandidate = { session_id: sessionId, ...sessionOwnerFields(owner) }
-      writeChatDetached(issue.key, linkCandidate, false)
+      writeChatDetached(issue.key, linkCandidate, false, status?.base_url)
       await onLinksChanged()
       host.notify({ kind: 'success', message: `Linked the current chat to ${issue.key}.` })
     } catch (cause) {
@@ -1275,7 +1291,7 @@ function IssueDetail({ issue, status, projects, mapping, links, baseRef, onOpenI
         }
       })
       const linkCandidate = { session_id: sessionId, ...sessionOwnerFields(owner) }
-      writeChatDetached(issue.key, linkCandidate, false)
+      writeChatDetached(issue.key, linkCandidate, false, status?.base_url)
       setRelatedChats(current => current.filter(candidate => sessionLinkIdentity(candidate) !== sessionLinkIdentity(linkCandidate)))
       await onLinksChanged()
       host.notify({ kind: 'success', message: `Attached the chat to ${issue.key}.` })
@@ -1299,7 +1315,7 @@ function IssueDetail({ issue, status, projects, mapping, links, baseRef, onOpenI
     const unlinkKey = sessionLinkIdentity(link)
     setUnlinkingChatKey(unlinkKey)
     setError('')
-    writeChatDetached(issue.key, link, true)
+    writeChatDetached(issue.key, link, true, status?.base_url)
     try {
       const query = new URLSearchParams({ connection_id: owner.connectionId, profile_name: owner.profileName, target_profile: owner.targetProfile })
       const result = await api(`/links/${encodeURIComponent(issue.id)}/${encodeURIComponent(sessionId)}?${query.toString()}`, { method: 'DELETE' })
@@ -1307,7 +1323,7 @@ function IssueDetail({ issue, status, projects, mapping, links, baseRef, onOpenI
       await onLinksChanged()
       host.notify({ kind: 'success', message: `Unlinked the chat from ${issue.key}. The Hermes chat was kept.` })
     } catch (cause) {
-      writeChatDetached(issue.key, link, false)
+      writeChatDetached(issue.key, link, false, status?.base_url)
       setError(errorText(cause, 'Could not unlink the chat.'))
     } finally {
       setUnlinkingChatKey('')
@@ -1326,7 +1342,7 @@ function IssueDetail({ issue, status, projects, mapping, links, baseRef, onOpenI
       const sessions = await listCurrentProfileSessions(mapping?.hermes_project_id, issue?.project_key, route)
       if (!isCurrent()) return
       const linkedIds = new Set(links.map(link => sessionLinkIdentity(link)))
-      const detachedIds = readDetachedChatIds(issue.key)
+      const detachedIds = readDetachedChatIds(issue.key, status?.base_url, owner)
       const repoPath = String(mapping?.repo_path || '').replace(/\/$/, '')
       const worktreeMap = new Map()
       for (const session of sessions) {
@@ -1698,6 +1714,7 @@ function IssueDetail({ issue, status, projects, mapping, links, baseRef, onOpenI
           issue_id: issue.id,
           issue_key: issue.key,
           session_id: storedId,
+          clear_detachment: true,
           ...sessionOwnerFields(owner)
         }
       })
@@ -2637,7 +2654,7 @@ function JiraPage() {
       try {
         const result = await api(`/links/${encodeURIComponent(issue.id)}`)
         return [issue.key, {
-          links: filterDetachedLinks(issue.key, result?.links, result?.detached),
+          links: filterDetachedLinks(issue.key, result?.links, result?.detached, status?.base_url),
           loading: false,
           storedAt: Date.now()
         }]
@@ -2652,12 +2669,12 @@ function JiraPage() {
         return next
       })
     })
-  }, [issueWorkSignature])
+  }, [issueWorkSignature, status?.base_url])
 
   const reloadLinks = useCallback(async () => {
     if (!detail?.id) return
     const result = await api(`/links/${encodeURIComponent(detail.id)}`)
-    const nextLinks = filterDetachedLinks(detail.key, result?.links, result?.detached)
+    const nextLinks = filterDetachedLinks(detail.key, result?.links, result?.detached, status?.base_url)
     setLinks(nextLinks)
     setWorkStates(current => {
       const next = {
@@ -2667,7 +2684,7 @@ function JiraPage() {
       writeWorkStateCache(next)
       return next
     })
-  }, [detail?.id, detail?.key])
+  }, [detail?.id, detail?.key, status?.base_url])
 
   useEffect(() => {
     if (!selectedKey) {
@@ -2688,7 +2705,7 @@ function JiraPage() {
           : { mapping: null }
         if (!alive) return
         setDetail(nextDetail)
-        setLinks(filterDetachedLinks(nextDetail.key, linksResult?.links, linksResult?.detached))
+        setLinks(filterDetachedLinks(nextDetail.key, linksResult?.links, linksResult?.detached, status?.base_url))
         setMapping(mappingResult?.mapping || null)
       })
       .catch(cause => {
@@ -2700,7 +2717,7 @@ function JiraPage() {
     return () => {
       alive = false
     }
-  }, [selectedKey])
+  }, [selectedKey, status?.base_url])
 
   const laneProbeKeys = useMemo(() => {
     const representatives = new Map()

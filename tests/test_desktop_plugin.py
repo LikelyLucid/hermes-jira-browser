@@ -348,11 +348,11 @@ class DesktopPluginTests(unittest.TestCase):
     def test_backend_detach_tombstones_are_consumed_separately_from_active_links(self):
         source = PLUGIN.read_text(encoding="utf-8")
 
-        self.assertIn("function filterDetachedLinks(issueKey, links, backendDetached = [])", source)
-        self.assertIn("mergeBackendDetachedLinks(issueKey, backendDetached)", source)
-        self.assertIn("filterDetachedLinks(issue.key, result?.links, result?.detached)", source)
-        self.assertIn("filterDetachedLinks(detail.key, result?.links, result?.detached)", source)
-        self.assertIn("filterDetachedLinks(nextDetail.key, linksResult?.links, linksResult?.detached)", source)
+        self.assertIn("function filterDetachedLinks(issueKey, links, backendDetached = [], jiraOrigin = '')", source)
+        self.assertIn("mergeBackendDetachedLinks(issueKey, backendDetached, jiraOrigin)", source)
+        self.assertIn("filterDetachedLinks(issue.key, result?.links, result?.detached, status?.base_url)", source)
+        self.assertIn("filterDetachedLinks(detail.key, result?.links, result?.detached, status?.base_url)", source)
+        self.assertIn("filterDetachedLinks(nextDetail.key, linksResult?.links, linksResult?.detached, status?.base_url)", source)
 
     def test_foreign_owner_scans_never_mix_ambient_backend_sessions(self):
         source = PLUGIN.read_text(encoding="utf-8")
@@ -372,7 +372,7 @@ class DesktopPluginTests(unittest.TestCase):
         self.assertIn("if (result?.unlinked !== true) throw new Error", source)
         self.assertIn("clear_detachment: true", source)
         self.assertIn("clear_detachment: false", source)
-        self.assertIn("writeChatDetached(issue.key, linkCandidate, false)", source)
+        self.assertIn("writeChatDetached(issue.key, linkCandidate, false, status?.base_url)", source)
         self.assertIn("if (!owner) throw new Error('The focused chat owner is ambiguous or unavailable.')", source)
         self.assertIn("if (!link?.connection_id || !link?.profile_name) return null", source)
 
@@ -421,7 +421,7 @@ class DesktopPluginTests(unittest.TestCase):
 
         self.assertIn("const legacyLocalDetachIds = new Set", filtering)
         self.assertIn("legacyLocalDetachIds.add(sessionId)", filtering)
-        self.assertIn("!legacyLocalDetachIds.has(sessionId)", filtering)
+        self.assertIn("!legacyLocalDetach", filtering)
         self.assertLess(filtering.index("legacyLocalDetachIds.add(sessionId)"), filtering.index(".filter(link =>"))
 
     def test_new_chat_uses_focused_route_without_target_profile_match(self):
@@ -479,6 +479,49 @@ class DesktopPluginTests(unittest.TestCase):
         self.assertIn("const currentLinkIdentity = sessionLinkIdentity", link)
         self.assertIn("if (currentLinkIdentity !== focusedLinkIdentity) throw new Error", link)
         self.assertIn("scanGeneration.current += 1", link)
+
+    def test_present_but_invalid_focused_owner_never_uses_ambient_fallback(self):
+        source = PLUGIN.read_text(encoding="utf-8")
+        focused_owner = source[source.index("function readFocusedSessionOwner"):source.index("function ownerFromLink")]
+
+        self.assertIn("if (focusedOwnerAtom != null)", focused_owner)
+        self.assertIn("if (typeof focusedOwnerAtom.get !== 'function') return null", focused_owner)
+        self.assertIn("if (!connectionId || !profileName", focused_owner)
+        self.assertLess(
+            focused_owner.index("if (!connectionId || !profileName"),
+            focused_owner.index("const connectionId = String(\n    host.state?.connectionId"),
+        )
+
+    def test_every_link_write_is_owner_qualified_and_manual_writes_clear_detachment(self):
+        source = PLUGIN.read_text(encoding="utf-8")
+        writes = []
+        cursor = 0
+        while True:
+            start = source.find("await api('/links'", cursor)
+            if start < 0:
+                break
+            end = source.find("\n      })", start)
+            self.assertGreater(end, start)
+            writes.append(source[start:end])
+            cursor = end + 1
+
+        self.assertEqual(len(writes), 4)
+        self.assertEqual(sum("...sessionOwnerFields(owner)" in write for write in writes), 4)
+        self.assertEqual(sum("clear_detachment: true" in write for write in writes), 3)
+        self.assertEqual(sum("clear_detachment: false" in write for write in writes), 1)
+        self.assertIn("new URLSearchParams({ connection_id: owner.connectionId, profile_name: owner.profileName, target_profile: owner.targetProfile })", source)
+
+    def test_detached_local_keys_are_scoped_by_jira_origin_and_full_owner(self):
+        source = PLUGIN.read_text(encoding="utf-8")
+        detached = source[source.index("function normaliseJiraOrigin"):source.index("function linkAvailability")]
+
+        self.assertIn("function detachedChatStorageKey(issueKey, jiraOrigin, link)", detached)
+        self.assertIn("const origin = normaliseJiraOrigin(jiraOrigin)", detached)
+        self.assertIn("owner.connectionId, owner.profileName, owner.targetProfile", detached)
+        self.assertIn("encodeURIComponent", detached)
+        self.assertIn("writeChatDetached(issue.key, link, true, status?.base_url)", source)
+        self.assertIn("readDetachedChatIds(issue.key, status?.base_url, owner)", source)
+        self.assertIn("clear_detachment: true", source[source.index("const startWork"):source.index("if (!issue) return", source.index("const startWork"))])
 
 
 if __name__ == "__main__":
