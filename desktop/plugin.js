@@ -196,7 +196,11 @@ function flattenProjectSessions(project) {
 }
 
 function readFocusedSessionOwner() {
-  const focused = host.state?.focusedSessionOwner?.get?.()
+  const focusedOwnerAtom = host.state?.focusedSessionOwner
+  const focused = focusedOwnerAtom?.get?.()
+  if (typeof focusedOwnerAtom?.get === 'function') {
+    if (!focused) return null
+  }
   if ((focused?.connectionId || focused?.connection_id) && (focused?.profile || focused?.profile_name)) {
     const profileName = String(focused.profile || focused.profile_name).trim() || 'default'
     return {
@@ -219,6 +223,7 @@ function readFocusedSessionOwner() {
 }
 
 function ownerFromLink(link) {
+  if (!link?.connection_id || !link?.profile_name) return null
   const hasConnectionOwner = Boolean(link?.connection_id)
   const profileName = String(
     link?.profile_name
@@ -245,6 +250,7 @@ function ownerFromRoute(route) {
 function sessionLinkIdentity(link) {
   const owner = link?.connectionId || link?.profileName ? link : ownerFromLink(link)
   const sessionId = String(link?.session_id || link?.sessionId || link?.id || '').trim()
+  if (!owner) return `unowned::::${sessionId}`
   return `${owner.connectionId}::${owner.profileName}::${owner.targetProfile}::${sessionId}`
 }
 
@@ -258,6 +264,7 @@ function sessionOwnerFields(owner) {
 
 async function resolveSessionRoute(value, options = {}) {
   const owner = value?.connectionId || value?.profileName ? value : ownerFromLink(value)
+  if (!owner) throw new Error('The linked chat owner is unavailable.')
   const matchTarget = options.matchTarget !== false
   if (typeof host.profileRoutes !== 'function') throw new Error('Hermes Desktop connection routing is unavailable.')
   const routes = await host.profileRoutes()
@@ -272,7 +279,9 @@ async function resolveSessionRoute(value, options = {}) {
 }
 
 async function resolveFocusedSessionRoute() {
-  const route = await resolveSessionRoute(readFocusedSessionOwner(), { matchTarget: false })
+  const owner = readFocusedSessionOwner()
+  if (!owner) throw new Error('The focused chat owner is ambiguous or unavailable.')
+  const route = await resolveSessionRoute(owner, { matchTarget: false })
   return route
 }
 
@@ -458,6 +467,7 @@ function linkAvailability(link) {
   if (link?.available !== false) return link
   const owner = ownerFromLink(link)
   const focused = readFocusedSessionOwner()
+  if (!owner || !focused) return { ...link, available: undefined }
   const isFocusedOwner = owner.connectionId === focused.connectionId
     && owner.profileName === focused.profileName
     && owner.targetProfile === focused.targetProfile
@@ -1155,6 +1165,8 @@ function IssueDetail({ issue, status, projects, mapping, links, baseRef, onOpenI
       host.notify({ kind: 'warning', message: 'Open a persisted chat before linking it to Jira.' })
       return
     }
+    scanGeneration.current += 1
+    setScanningChats(false)
     setBusyAction('link')
     setError('')
     try {
@@ -1167,9 +1179,12 @@ function IssueDetail({ issue, status, projects, mapping, links, baseRef, onOpenI
           issue_id: issue.id,
           issue_key: issue.key,
           session_id: sessionId,
+          clear_detachment: true,
           ...sessionOwnerFields(owner)
         }
       })
+      const linkCandidate = { session_id: sessionId, ...sessionOwnerFields(owner) }
+      writeChatDetached(issue.key, linkCandidate, false)
       await onLinksChanged()
       host.notify({ kind: 'success', message: `Linked the current chat to ${issue.key}.` })
     } catch (cause) {
@@ -1194,6 +1209,8 @@ function IssueDetail({ issue, status, projects, mapping, links, baseRef, onOpenI
   const attachRelatedChat = useCallback(async chat => {
     const sessionId = String(chat?.session_id || chat?.id || '').trim()
     if (!sessionId) return
+    scanGeneration.current += 1
+    setScanningChats(false)
     setBusyAction(`attach:${sessionId}`)
     setError('')
     try {
@@ -1206,6 +1223,7 @@ function IssueDetail({ issue, status, projects, mapping, links, baseRef, onOpenI
           issue_id: issue.id,
           issue_key: issue.key,
           session_id: sessionId,
+          clear_detachment: true,
           ...sessionOwnerFields(owner)
         }
       })
@@ -1224,14 +1242,21 @@ function IssueDetail({ issue, status, projects, mapping, links, baseRef, onOpenI
   const unlinkChat = useCallback(async link => {
     const sessionId = String(link?.session_id || '').trim()
     if (!sessionId || !issue?.id || !issue?.key) return
+    scanGeneration.current += 1
+    setScanningChats(false)
     const owner = ownerFromLink(link)
+    if (!owner) {
+      setError('The linked chat owner is unavailable; refresh the ticket before unlinking.')
+      return
+    }
     const unlinkKey = sessionLinkIdentity(link)
     setUnlinkingChatKey(unlinkKey)
     setError('')
     writeChatDetached(issue.key, link, true)
     try {
       const query = new URLSearchParams({ connection_id: owner.connectionId, profile_name: owner.profileName })
-      await api(`/links/${encodeURIComponent(issue.id)}/${encodeURIComponent(sessionId)}?${query.toString()}`, { method: 'DELETE' })
+      const result = await api(`/links/${encodeURIComponent(issue.id)}/${encodeURIComponent(sessionId)}?${query.toString()}`, { method: 'DELETE' })
+      if (result?.unlinked !== true) throw new Error('The Jira association was not removed.')
       await onLinksChanged()
       host.notify({ kind: 'success', message: `Unlinked the chat from ${issue.key}. The Hermes chat was kept.` })
     } catch (cause) {
@@ -1291,6 +1316,7 @@ function IssueDetail({ issue, status, projects, mapping, links, baseRef, onOpenI
               issue_id: issue.id,
               issue_key: issue.key,
               session_id: sessionId,
+              clear_detachment: false,
               ...sessionOwnerFields(owner)
             }
           })

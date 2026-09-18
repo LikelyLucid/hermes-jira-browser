@@ -358,7 +358,7 @@ class DesktopPluginTests(unittest.TestCase):
 
         self.assertIn("function isAmbientOwnerRoute", source)
         self.assertIn("isAmbientOwnerRoute(ownerRoute) && jiraProjectKey", source)
-        self.assertIn("const route = await resolveSessionRoute(readFocusedSessionOwner(), { matchTarget: false })", source)
+        self.assertIn("const route = await resolveFocusedSessionRoute()", source)
 
     def test_focused_owner_resolution_and_detach_are_fail_closed(self):
         source = PLUGIN.read_text(encoding="utf-8")
@@ -368,6 +368,12 @@ class DesktopPluginTests(unittest.TestCase):
         self.assertGreaterEqual(source.count("const route = await resolveFocusedSessionRoute()"), 4)
         self.assertIn("sessionLinkIdentity(candidate) !== sessionLinkIdentity(linkCandidate)", source)
         self.assertNotIn("Older running backends do not have the DELETE route yet", source)
+        self.assertIn("if (result?.unlinked !== true) throw new Error", source)
+        self.assertIn("clear_detachment: true", source)
+        self.assertIn("clear_detachment: false", source)
+        self.assertIn("writeChatDetached(issue.key, linkCandidate, false)", source)
+        self.assertIn("if (!owner) throw new Error('The focused chat owner is ambiguous or unavailable.')", source)
+        self.assertIn("if (!link?.connection_id || !link?.profile_name) return null", source)
 
 
 if __name__ == "__main__":
