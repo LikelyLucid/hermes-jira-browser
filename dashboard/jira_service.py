@@ -693,6 +693,30 @@ def save_settings(value: Mapping[str, Any], path: str | Path | None = None) -> d
     return settings
 
 
+class JiraRequestError(RuntimeError):
+    """A Jira request failure with an explicit send/outcome classification."""
+
+    classification = "ambiguous"
+
+
+class JiraPreRequestError(JiraRequestError):
+    """The request was rejected locally before any bytes were sent."""
+
+    classification = "pre_request"
+
+
+class JiraDefinitiveRejectionError(JiraRequestError):
+    """Jira definitively rejected the request with a client-error response."""
+
+    classification = "definitive_rejection"
+
+
+class JiraAmbiguousError(JiraRequestError):
+    """The request may have been accepted but its outcome is unknown."""
+
+    classification = "ambiguous"
+
+
 class NoJiraRedirects(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, request, fp, code, msg, headers, newurl):
         raise RuntimeError("Jira redirect refused to protect the configured credentials.")
@@ -711,43 +735,53 @@ class JiraClient:
         method: str = "GET",
         body: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
-        query = urllib.parse.urlencode({key: value for key, value in (params or {}).items() if value is not None})
-        url = f"{self.config.base_url}{path}{'?' + query if query else ''}"
-        credentials = base64.b64encode(f"{self.config.email}:{self.config.api_token}".encode("utf-8")).decode("ascii")
-        headers = {
-            "Accept": "application/json",
-            "Authorization": f"Basic {credentials}",
-            "User-Agent": "Hermes-Jira-Browser/0.1",
-        }
-        data = None
-        if body is not None:
-            headers["Content-Type"] = "application/json"
-            data = json.dumps(body).encode("utf-8")
-        request = urllib.request.Request(
-            url,
-            data=data,
-            headers=headers,
-            method=method,
-        )
+        try:
+            query = urllib.parse.urlencode({key: value for key, value in (params or {}).items() if value is not None})
+            url = f"{self.config.base_url}{path}{'?' + query if query else ''}"
+            credentials = base64.b64encode(f"{self.config.email}:{self.config.api_token}".encode("utf-8")).decode("ascii")
+            headers = {
+                "Accept": "application/json",
+                "Authorization": f"Basic {credentials}",
+                "User-Agent": "Hermes-Jira-Browser/0.1",
+            }
+            data = None
+            if body is not None:
+                headers["Content-Type"] = "application/json"
+                data = json.dumps(body).encode("utf-8")
+            request = urllib.request.Request(
+                url,
+                data=data,
+                headers=headers,
+                method=method,
+            )
+        except Exception as exc:
+            raise JiraPreRequestError("Jira request could not be constructed locally.") from exc
         try:
             opener = urllib.request.build_opener(NoJiraRedirects())
+        except Exception as exc:
+            raise JiraPreRequestError("Jira request could not be prepared locally.") from exc
+        try:
             with opener.open(request, timeout=self.timeout) as response:
                 raw = response.read(MAX_JIRA_JSON_BYTES + 1)
                 if len(raw) > MAX_JIRA_JSON_BYTES:
-                    raise RuntimeError("Jira JSON response is too large.")
+                    raise JiraAmbiguousError("Jira returned a response that is too large.")
                 payload = json.loads(raw.decode("utf-8")) if raw else {}
         except urllib.error.HTTPError as exc:
-            if exc.code in (401, 403):
-                raise RuntimeError("Jira rejected the configured credentials.") from exc
-            if exc.code == 429:
-                raise RuntimeError("Jira rate limit reached; wait before refreshing.") from exc
-            raise RuntimeError(f"Jira returned HTTP {exc.code}.") from exc
+            if 400 <= exc.code < 500:
+                if exc.code in (401, 403):
+                    message = "Jira rejected the configured credentials."
+                elif exc.code == 429:
+                    message = "Jira rate limit rejected the request; wait before retrying."
+                else:
+                    message = f"Jira rejected the request with HTTP {exc.code}."
+                raise JiraDefinitiveRejectionError(message) from exc
+            raise JiraAmbiguousError(f"Jira returned HTTP {exc.code}; the write outcome is unknown.") from exc
         except urllib.error.URLError as exc:
-            raise RuntimeError("Could not reach Jira.") from exc
+            raise JiraAmbiguousError("Could not determine whether Jira accepted the request.") from exc
         except (TimeoutError, json.JSONDecodeError, UnicodeDecodeError) as exc:
-            raise RuntimeError("Jira returned an invalid or timed-out response.") from exc
+            raise JiraAmbiguousError("Jira returned an invalid or timed-out response; the write outcome is unknown.") from exc
         if not isinstance(payload, dict):
-            raise RuntimeError("Jira returned an invalid response.")
+            raise JiraAmbiguousError("Jira returned an invalid response; the write outcome is unknown.")
         return payload
 
     def _request_bytes(
