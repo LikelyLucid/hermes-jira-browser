@@ -203,6 +203,15 @@ class DesktopPluginTests(unittest.TestCase):
         self.assertIn("Suggested next step", source)
         self.assertIn("Apply suggestion", source)
 
+    def test_explicit_jira_mutations_send_high_entropy_idempotency_keys(self):
+        source = PLUGIN.read_text(encoding="utf-8")
+
+        self.assertIn("crypto.randomUUID()", source)
+        self.assertIn("body: { body, idempotency_key: mutationKey }", source)
+        self.assertIn("body: { transition_id: suggestedTransition.id, idempotency_key: mutationKey }", source)
+        self.assertIn("body: { transition_id: transitionId, idempotency_key: mutationKey }", source)
+        self.assertIn("body: { transition_id: transition.id, idempotency_key: mutationKey }", source)
+
     def test_attention_view_surfaces_tracking_friction(self):
         source = PLUGIN.read_text(encoding="utf-8")
 

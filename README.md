@@ -19,6 +19,7 @@ A native Jira workspace for Hermes Desktop. It presents Jira issues on a Kanban-
 - Provides read-only repository, branch, diff, commit, ahead/behind, pull-request, and CI context for a ticket when its mapped Jira worktree exists.
 - Drafts Jira updates in a normal Hermes session; posting remains explicit.
 - Suggests transitions but never applies one without a click.
+- Persists idempotency receipts for explicit Jira comments and transitions so a retried request cannot duplicate a completed write.
 - Exposes four read-only agent tools: assigned issues, bounded JQL search, fresh issue detail, and available transitions.
 - Agent tool results are treated as untrusted Jira reference data; no write or attachment-download tool is registered.
 - Stores human-editable, credential-free settings as JSON.

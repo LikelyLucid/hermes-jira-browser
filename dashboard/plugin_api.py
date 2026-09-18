@@ -49,10 +49,12 @@ class SessionLinkRequest(BaseModel):
 
 class CommentRequest(BaseModel):
     body: str = Field(min_length=1, max_length=32_000)
+    idempotency_key: str = Field(min_length=16, max_length=200, pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]{15,199}$")
 
 
 class TransitionRequest(BaseModel):
     transition_id: str = Field(min_length=1, max_length=100)
+    idempotency_key: str = Field(min_length=16, max_length=200, pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]{15,199}$")
 
 
 def _store():
@@ -64,9 +66,42 @@ def _client():
 
 
 def _safe_http_error(exc: Exception, *, status_code: int = 500) -> HTTPException:
-    if isinstance(exc, ValueError):
+    if isinstance(exc, (SERVICE.MutationConflictError, SERVICE.MutationPendingError)):
+        status_code = 409
+    elif isinstance(exc, ValueError):
         status_code = 400
     return HTTPException(status_code=status_code, detail=str(exc))
+
+
+async def _run_mutation(
+    *,
+    action: str,
+    issue_key: str,
+    idempotency_key: str,
+    payload: dict[str, Any],
+    operation,
+) -> dict[str, Any]:
+    store = _store()
+    reservation = await asyncio.to_thread(
+        store.reserve_mutation,
+        idempotency_key=idempotency_key,
+        action=action,
+        issue_key=issue_key,
+        payload=payload,
+    )
+    if reservation["status"] == "completed":
+        return reservation["result"]
+    try:
+        client = await asyncio.to_thread(_client)
+    except Exception:
+        await asyncio.to_thread(store.release_mutation, idempotency_key)
+        raise
+    # Once the Jira call begins, retain a pending receipt on every failure:
+    # the remote side may have accepted the request even if this process did not
+    # receive a response, so retrying automatically could duplicate the write.
+    result = await asyncio.to_thread(operation, client)
+    await asyncio.to_thread(store.complete_mutation, idempotency_key, result)
+    return result
 
 
 @router.get("/status")
@@ -140,8 +175,13 @@ async def attachment_preview(issue_key: str, attachment_id: str) -> dict[str, An
 @router.post("/issues/{issue_key}/comments")
 async def add_comment(issue_key: str, payload: CommentRequest) -> dict[str, Any]:
     try:
-        comment = await asyncio.to_thread(_client().add_comment, issue_key, payload.body)
-        return {"comment": comment}
+        return await _run_mutation(
+            action="comment",
+            issue_key=issue_key,
+            idempotency_key=payload.idempotency_key,
+            payload={"body": payload.body},
+            operation=lambda client: {"comment": client.add_comment(issue_key, payload.body)},
+        )
     except Exception as exc:
         raise _safe_http_error(exc, status_code=502) from exc
 
@@ -157,7 +197,13 @@ async def issue_transitions(issue_key: str) -> dict[str, Any]:
 @router.post("/issues/{issue_key}/transitions")
 async def transition_issue(issue_key: str, payload: TransitionRequest) -> dict[str, Any]:
     try:
-        return await asyncio.to_thread(_client().transition_issue, issue_key, payload.transition_id)
+        return await _run_mutation(
+            action="transition",
+            issue_key=issue_key,
+            idempotency_key=payload.idempotency_key,
+            payload={"transition_id": payload.transition_id},
+            operation=lambda client: client.transition_issue(issue_key, payload.transition_id),
+        )
     except Exception as exc:
         raise _safe_http_error(exc, status_code=502) from exc
 

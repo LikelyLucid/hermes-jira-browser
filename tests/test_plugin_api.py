@@ -98,12 +98,85 @@ class JiraBrowserApiTests(unittest.TestCase):
     def test_add_comment_uses_jira_client(self):
         client = mock.Mock()
         client.add_comment.return_value = {"id": "9001", "body": "Done"}
-        payload = plugin_api.CommentRequest(body="Done")
-        with mock.patch.object(plugin_api, "_client", return_value=client):
-            result = asyncio.run(plugin_api.add_comment("DEMO-42", payload))
+        payload = plugin_api.CommentRequest(body="Done", idempotency_key="comment-key-123456")
+        with tempfile.TemporaryDirectory() as tmp:
+            store = plugin_api.SERVICE.JiraStore(Path(tmp) / "state.sqlite3")
+            with mock.patch.object(plugin_api, "_store", return_value=store), mock.patch.object(plugin_api, "_client", return_value=client):
+                result = asyncio.run(plugin_api.add_comment("DEMO-42", payload))
 
         self.assertEqual(result["comment"]["id"], "9001")
         client.add_comment.assert_called_once_with("DEMO-42", "Done")
+
+    def test_duplicate_comment_calls_jira_once_and_returns_stored_result(self):
+        client = mock.Mock()
+        client.add_comment.return_value = {"id": "9001", "body": "Done"}
+        payload = plugin_api.CommentRequest(body="Done", idempotency_key="comment-key-123457")
+        with tempfile.TemporaryDirectory() as tmp:
+            store = plugin_api.SERVICE.JiraStore(Path(tmp) / "state.sqlite3")
+            with mock.patch.object(plugin_api, "_store", return_value=store), mock.patch.object(plugin_api, "_client", return_value=client):
+                first = asyncio.run(plugin_api.add_comment("DEMO-42", payload))
+                second = asyncio.run(plugin_api.add_comment("DEMO-42", payload))
+
+        self.assertEqual(first, second)
+        client.add_comment.assert_called_once_with("DEMO-42", "Done")
+
+    def test_duplicate_transition_calls_jira_once_and_returns_stored_result(self):
+        client = mock.Mock()
+        client.transition_issue.return_value = {"transition_id": "31"}
+        payload = plugin_api.TransitionRequest(transition_id="31", idempotency_key="transition-key-123456")
+        with tempfile.TemporaryDirectory() as tmp:
+            store = plugin_api.SERVICE.JiraStore(Path(tmp) / "state.sqlite3")
+            with mock.patch.object(plugin_api, "_store", return_value=store), mock.patch.object(plugin_api, "_client", return_value=client):
+                first = asyncio.run(plugin_api.transition_issue("DEMO-42", payload))
+                second = asyncio.run(plugin_api.transition_issue("DEMO-42", payload))
+
+        self.assertEqual(first, second)
+        client.transition_issue.assert_called_once_with("DEMO-42", "31")
+
+    def test_conflicting_idempotency_key_is_rejected(self):
+        client = mock.Mock()
+        client.add_comment.return_value = {"id": "9001"}
+        with tempfile.TemporaryDirectory() as tmp:
+            store = plugin_api.SERVICE.JiraStore(Path(tmp) / "state.sqlite3")
+            with mock.patch.object(plugin_api, "_store", return_value=store), mock.patch.object(plugin_api, "_client", return_value=client):
+                asyncio.run(plugin_api.add_comment("DEMO-42", plugin_api.CommentRequest(body="Done", idempotency_key="same-key-1234567")))
+                with self.assertRaisesRegex(plugin_api.HTTPException, "different mutation"):
+                    asyncio.run(plugin_api.add_comment("DEMO-42", plugin_api.CommentRequest(body="Other", idempotency_key="same-key-1234567")))
+
+        client.add_comment.assert_called_once_with("DEMO-42", "Done")
+
+    def test_remote_failure_keeps_pending_receipt_without_repeating_jira(self):
+        payload = plugin_api.CommentRequest(body="Done", idempotency_key="comment-key-123460")
+        client = mock.Mock()
+        client.add_comment.side_effect = RuntimeError("request outcome unknown")
+        with tempfile.TemporaryDirectory() as tmp:
+            store = plugin_api.SERVICE.JiraStore(Path(tmp) / "state.sqlite3")
+            with mock.patch.object(plugin_api, "_store", return_value=store), mock.patch.object(plugin_api, "_client", return_value=client):
+                with self.assertRaises(plugin_api.HTTPException):
+                    asyncio.run(plugin_api.add_comment("DEMO-42", payload))
+                with self.assertRaisesRegex(plugin_api.HTTPException, "already pending"):
+                    asyncio.run(plugin_api.add_comment("DEMO-42", payload))
+
+        client.add_comment.assert_called_once_with("DEMO-42", "Done")
+
+    def test_pre_jira_client_failure_releases_idempotency_claim(self):
+        payload = plugin_api.CommentRequest(body="Done", idempotency_key="comment-key-123458")
+        with tempfile.TemporaryDirectory() as tmp:
+            store = plugin_api.SERVICE.JiraStore(Path(tmp) / "state.sqlite3")
+            with mock.patch.object(plugin_api, "_store", return_value=store), mock.patch.object(
+                plugin_api, "_client", side_effect=RuntimeError("not configured")
+            ):
+                with self.assertRaises(plugin_api.HTTPException):
+                    asyncio.run(plugin_api.add_comment("DEMO-42", payload))
+            self.assertEqual(
+                store.reserve_mutation(
+                    idempotency_key=payload.idempotency_key,
+                    action="comment",
+                    issue_key="DEMO-42",
+                    payload={"body": "Done"},
+                )["status"],
+                "claimed",
+            )
 
     def test_attachment_preview_uses_jira_client_without_exposing_credentials(self):
         client = mock.Mock()
@@ -123,9 +196,11 @@ class JiraBrowserApiTests(unittest.TestCase):
     def test_transition_issue_uses_selected_transition(self):
         client = mock.Mock()
         client.transition_issue.return_value = {"transition_id": "31"}
-        payload = plugin_api.TransitionRequest(transition_id="31")
-        with mock.patch.object(plugin_api, "_client", return_value=client):
-            result = asyncio.run(plugin_api.transition_issue("DEMO-42", payload))
+        payload = plugin_api.TransitionRequest(transition_id="31", idempotency_key="transition-key-123459")
+        with tempfile.TemporaryDirectory() as tmp:
+            store = plugin_api.SERVICE.JiraStore(Path(tmp) / "state.sqlite3")
+            with mock.patch.object(plugin_api, "_store", return_value=store), mock.patch.object(plugin_api, "_client", return_value=client):
+                result = asyncio.run(plugin_api.transition_issue("DEMO-42", payload))
 
         self.assertEqual(result["transition_id"], "31")
         client.transition_issue.assert_called_once_with("DEMO-42", "31")

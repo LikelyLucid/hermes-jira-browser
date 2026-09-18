@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import base64
 import errno
+import hashlib
 import json
 import os
 import re
@@ -1067,6 +1068,34 @@ def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
+MAX_MUTATION_KEY_LENGTH = 200
+MAX_MUTATION_RESULT_BYTES = 128 * 1024
+_MUTATION_KEY_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{15,199}$")
+
+
+class MutationPendingError(RuntimeError):
+    """An identical mutation is already in flight or unresolved."""
+
+
+class MutationConflictError(ValueError):
+    """An idempotency key was reused for a different mutation."""
+
+
+def validate_mutation_key(value: str) -> str:
+    key = str(value or "").strip()
+    if not (16 <= len(key) <= MAX_MUTATION_KEY_LENGTH) or not _MUTATION_KEY_PATTERN.fullmatch(key):
+        raise ValueError("idempotency_key must be 16-200 safe characters.")
+    return key
+
+
+def _mutation_payload_hash(payload: Mapping[str, Any]) -> str:
+    try:
+        encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    except (TypeError, ValueError) as exc:
+        raise ValueError("Mutation payload is not JSON serializable.") from exc
+    return hashlib.sha256(encoded).hexdigest()
+
+
 class JiraStore:
     def __init__(self, path: str | Path):
         self.path = Path(path).expanduser().absolute()
@@ -1208,8 +1237,109 @@ class JiraStore:
                     UNIQUE(issue_id, session_id)
                 );
                 CREATE INDEX IF NOT EXISTS session_links_issue_idx ON session_links(issue_id, created_at DESC);
+                CREATE TABLE IF NOT EXISTS mutation_receipts (
+                    idempotency_key TEXT PRIMARY KEY CHECK(length(idempotency_key) BETWEEN 16 AND 200),
+                    action TEXT NOT NULL,
+                    issue_key TEXT NOT NULL,
+                    payload_sha256 TEXT NOT NULL,
+                    claimed INTEGER NOT NULL CHECK (claimed IN (0, 1)),
+                    completed INTEGER NOT NULL CHECK (completed IN (0, 1)),
+                    result_json TEXT,
+                    created_at TEXT NOT NULL,
+                    claimed_at TEXT NOT NULL,
+                    completed_at TEXT,
+                    updated_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS mutation_receipts_pending_idx
+                    ON mutation_receipts(completed, updated_at);
                 """
             )
+
+    def reserve_mutation(
+        self,
+        *,
+        idempotency_key: str,
+        action: str,
+        issue_key: str,
+        payload: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        key = validate_mutation_key(idempotency_key)
+        mutation = str(action or "").strip()
+        issue = str(issue_key or "").strip().upper()
+        if mutation not in {"comment", "transition"}:
+            raise ValueError("Unsupported Jira mutation.")
+        if not issue:
+            raise ValueError("issue_key is required.")
+        payload_sha256 = _mutation_payload_hash(payload)
+        now = _utc_now()
+        with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute(
+                "SELECT * FROM mutation_receipts WHERE idempotency_key = ?",
+                (key,),
+            ).fetchone()
+            if row is not None:
+                if (
+                    row["action"] != mutation
+                    or row["issue_key"] != issue
+                    or row["payload_sha256"] != payload_sha256
+                ):
+                    raise MutationConflictError("Idempotency key was already used for a different mutation.")
+                if row["completed"]:
+                    try:
+                        result = json.loads(row["result_json"] or "null")
+                    except json.JSONDecodeError as exc:
+                        raise RuntimeError("Stored Jira mutation result is invalid.") from exc
+                    return {"status": "completed", "result": result}
+                raise MutationPendingError("An identical Jira mutation is already pending.")
+            db.execute(
+                """
+                INSERT INTO mutation_receipts
+                    (idempotency_key, action, issue_key, payload_sha256, claimed, completed,
+                     result_json, created_at, claimed_at, completed_at, updated_at)
+                VALUES (?, ?, ?, ?, 1, 0, NULL, ?, ?, NULL, ?)
+                """,
+                (key, mutation, issue, payload_sha256, now, now, now),
+            )
+        return {"status": "claimed"}
+
+    def complete_mutation(self, idempotency_key: str, result: Mapping[str, Any]) -> None:
+        key = validate_mutation_key(idempotency_key)
+        try:
+            result_json = json.dumps(result, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("Jira mutation result is not JSON serializable.") from exc
+        if len(result_json.encode("utf-8")) > MAX_MUTATION_RESULT_BYTES:
+            raise ValueError("Jira mutation result is too large to store.")
+        now = _utc_now()
+        with self._connect() as db:
+            cursor = db.execute(
+                """
+                UPDATE mutation_receipts
+                SET completed = 1, result_json = ?, completed_at = ?, updated_at = ?
+                WHERE idempotency_key = ? AND claimed = 1 AND completed = 0
+                """,
+                (result_json, now, now, key),
+            )
+        if cursor.rowcount != 1:
+            raise RuntimeError("Jira mutation receipt is no longer pending.")
+
+    def release_mutation(self, idempotency_key: str) -> None:
+        key = validate_mutation_key(idempotency_key)
+        with self._connect() as db:
+            db.execute(
+                "DELETE FROM mutation_receipts WHERE idempotency_key = ? AND claimed = 1 AND completed = 0",
+                (key,),
+            )
+
+    def get_mutation_receipt(self, idempotency_key: str) -> dict[str, Any] | None:
+        key = validate_mutation_key(idempotency_key)
+        with self._connect() as db:
+            row = db.execute(
+                "SELECT * FROM mutation_receipts WHERE idempotency_key = ?",
+                (key,),
+            ).fetchone()
+        return dict(row) if row else None
 
     def set_project_mapping(
         self,

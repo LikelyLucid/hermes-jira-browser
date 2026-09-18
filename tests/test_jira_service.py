@@ -670,6 +670,53 @@ class StoreTests(unittest.TestCase):
             with mock.patch.object(jira_service.sqlite3, "connect", side_effect=swap_then_connect):
                 with self.assertRaises(ValueError):
                     store._connect()
+    def test_mutation_receipt_replays_completed_result_and_rejects_conflicts(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = jira_service.JiraStore(Path(tmp) / "jira.sqlite3")
+            first = store.reserve_mutation(
+                idempotency_key="comment-key-123456",
+                action="comment",
+                issue_key="DEMO-42",
+                payload={"body": "Done"},
+            )
+            self.assertEqual(first["status"], "claimed")
+            result = {"comment": {"id": "9001", "body": "Done"}}
+            store.complete_mutation("comment-key-123456", result)
+            receipt = store.get_mutation_receipt("comment-key-123456")
+            self.assertEqual(receipt["claimed"], 1)
+            self.assertEqual(receipt["completed"], 1)
+            self.assertEqual(len(receipt["payload_sha256"]), 64)
+            self.assertLessEqual(len(receipt["result_json"].encode("utf-8")), jira_service.MAX_MUTATION_RESULT_BYTES)
+
+            replay = store.reserve_mutation(
+                idempotency_key="comment-key-123456",
+                action="comment",
+                issue_key="DEMO-42",
+                payload={"body": "Done"},
+            )
+            self.assertEqual(replay, {"status": "completed", "result": result})
+            with self.assertRaisesRegex(ValueError, "different mutation"):
+                store.reserve_mutation(
+                    idempotency_key="comment-key-123456",
+                    action="transition",
+                    issue_key="DEMO-42",
+                    payload={"transition_id": "31"},
+                )
+
+    def test_pending_mutation_is_not_repeated_and_pre_jira_failure_can_release(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = jira_service.JiraStore(Path(tmp) / "jira.sqlite3")
+            kwargs = {
+                "idempotency_key": "transition-key-123456",
+                "action": "transition",
+                "issue_key": "DEMO-42",
+                "payload": {"transition_id": "31"},
+            }
+            self.assertEqual(store.reserve_mutation(**kwargs)["status"], "claimed")
+            with self.assertRaises(jira_service.MutationPendingError):
+                store.reserve_mutation(**kwargs)
+            store.release_mutation(kwargs["idempotency_key"])
+            self.assertEqual(store.reserve_mutation(**kwargs)["status"], "claimed")
 
     def test_maps_project_and_links_chat_and_worktree(self):
         with tempfile.TemporaryDirectory() as tmp:

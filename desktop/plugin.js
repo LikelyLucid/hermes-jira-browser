@@ -57,6 +57,10 @@ function errorText(error, fallback = 'Something went wrong.') {
   return fallback
 }
 
+function newMutationKey() {
+  return crypto.randomUUID()
+}
+
 function normaliseIssueKey(value) {
   const key = String(value || '').trim()
   return ISSUE_KEY_PATTERN.test(key) ? key : ''
@@ -1183,12 +1187,13 @@ function IssueDetail({ issue, status, projects, mapping, links, baseRef, onOpenI
 
   const applySuggestedTransition = useCallback(async () => {
     if (!suggestedTransition) return
+    const mutationKey = newMutationKey()
     setBusyAction('suggestion')
     setError('')
     try {
       await api(`/issues/${encodeURIComponent(issue.key)}/transitions`, {
         method: 'POST',
-        body: { transition_id: suggestedTransition.id }
+        body: { transition_id: suggestedTransition.id, idempotency_key: mutationKey }
       })
       const [updated, choices] = await Promise.all([
         api(`/issues/${encodeURIComponent(issue.key)}`, { timeoutMs: 30_000 }),
@@ -1260,12 +1265,13 @@ function IssueDetail({ issue, status, projects, mapping, links, baseRef, onOpenI
   const postComment = useCallback(async () => {
     const body = commentDraft.trim()
     if (!body) return
+    const mutationKey = newMutationKey()
     setBusyAction('comment')
     setError('')
     try {
       const result = await api(`/issues/${encodeURIComponent(issue.key)}/comments`, {
         method: 'POST',
-        body: { body }
+        body: { body, idempotency_key: mutationKey }
       })
       setCommentDraft('')
       onIssueChanged?.({
@@ -1282,12 +1288,13 @@ function IssueDetail({ issue, status, projects, mapping, links, baseRef, onOpenI
 
   const moveIssue = useCallback(async () => {
     if (!transitionId) return
+    const mutationKey = newMutationKey()
     setBusyAction('transition')
     setError('')
     try {
       await api(`/issues/${encodeURIComponent(issue.key)}/transitions`, {
         method: 'POST',
-        body: { transition_id: transitionId }
+        body: { transition_id: transitionId, idempotency_key: mutationKey }
       })
       const [updated, choices] = await Promise.all([
         api(`/issues/${encodeURIComponent(issue.key)}`, { timeoutMs: 30_000 }),
@@ -2505,6 +2512,7 @@ function JiraPage() {
     if (!current || !targetStatus || current.status === targetStatus || movingKey) return
     setMovingKey(issueKey)
     setError('')
+    const mutationKey = newMutationKey()
     try {
       const choices = await api(`/issues/${encodeURIComponent(issueKey)}/transitions`)
       const transition = (choices?.transitions || []).find(candidate =>
@@ -2513,7 +2521,7 @@ function JiraPage() {
       if (!transition) throw new Error(`${issueKey} cannot move directly to ${targetStatus}.`)
       await api(`/issues/${encodeURIComponent(issueKey)}/transitions`, {
         method: 'POST',
-        body: { transition_id: transition.id }
+        body: { transition_id: transition.id, idempotency_key: mutationKey }
       })
       const updated = await api(`/issues/${encodeURIComponent(issueKey)}`, { timeoutMs: 30_000 })
       setIssues(rows => rows.map(issue => issue.key === issueKey ? { ...issue, ...updated } : issue))
