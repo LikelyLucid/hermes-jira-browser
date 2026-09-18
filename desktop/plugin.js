@@ -49,6 +49,7 @@ const DRAWER_MAX_WIDTH = 760
 const BOARD_MIN_WIDTH = 320
 
 let pluginContext = null
+const companionDisposers = new Map()
 
 function errorText(error, fallback = 'Something went wrong.') {
   if (error && typeof error.message === 'string' && error.message.trim()) return error.message.trim()
@@ -1998,7 +1999,6 @@ function JiraPage() {
   const saveTimer = useRef(null)
   const settingsSaveGeneration = useRef(0)
   const workStateGeneration = useRef(0)
-  const companionDisposers = useRef(new Map())
 
   useEffect(() => {
     const syncFromHash = () => setSelectedKey(issueKeyFromHash())
@@ -2011,12 +2011,6 @@ function JiraPage() {
     if (!selectedKey && issueKeyFromHash()) host.navigate(jiraRoute(''))
   }, [selectedKey])
 
-  useEffect(() => {
-    return () => {
-      for (const disposer of companionDisposers.current.values()) disposer()
-      companionDisposers.current.clear()
-    }
-  }, [])
 
   useEffect(() => {
     let alive = true
@@ -2466,12 +2460,14 @@ function JiraPage() {
       return
     }
     const companionId = `${ID}:ticket:${issue.key}`
-    if (companionDisposers.current.has(companionId)) {
+    if (companionDisposers.has(companionId)) {
+      host.revealPane?.(`plugin-workspace:${companionId}`)
       host.navigate('/')
       return
     }
     try {
       const disposer = host.openWorkspace(companionId, {
+        dock: { pane: 'workspace', pos: 'right' },
         title: `${issue.key} · ${issue.summary || 'Jira ticket'}`,
         minWidth: '28rem',
         render: () => jsx('div', {
@@ -2490,13 +2486,13 @@ function JiraPage() {
             readOnly: true
           })
         }),
-        onClose: () => companionDisposers.current.delete(companionId)
+        onClose: () => companionDisposers.delete(companionId)
       })
       if (typeof disposer !== 'function') {
         host.notify({ kind: 'warning', message: 'Pinning tickets beside chat is unavailable on this Desktop version.' })
         return
       }
-      companionDisposers.current.set(companionId, disposer)
+      companionDisposers.set(companionId, disposer)
       host.navigate('/')
     } catch (cause) {
       host.notify({ kind: 'warning', message: errorText(cause, 'Could not pin the Jira ticket beside chat.') })
@@ -2881,6 +2877,8 @@ export default {
       }
     ])
     if (typeof ctx.onDispose === 'function') ctx.onDispose(() => {
+      for (const disposer of companionDisposers.values()) disposer()
+      companionDisposers.clear()
       pluginContext = null
     })
   }

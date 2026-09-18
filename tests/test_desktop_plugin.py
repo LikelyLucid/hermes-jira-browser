@@ -225,11 +225,12 @@ class DesktopPluginTests(unittest.TestCase):
     def test_ticket_companion_is_opt_in_deduplicated_and_read_only(self):
         source = PLUGIN.read_text(encoding="utf-8")
 
-        self.assertIn("const companionDisposers = useRef(new Map())", source)
+        self.assertIn("const companionDisposers = new Map()", source)
         self.assertIn("typeof host.openWorkspace !== 'function'", source)
         self.assertIn("const companionId = `${ID}:ticket:${issue.key}`", source)
         self.assertIn("const disposer = host.openWorkspace(companionId", source)
-        self.assertIn("companionDisposers.current.set(companionId, disposer)", source)
+        self.assertIn("dock: { pane: 'workspace', pos: 'right' }", source)
+        self.assertIn("companionDisposers.set(companionId, disposer)", source)
         self.assertIn("readOnly: true", source)
         self.assertIn("Pin beside chat", source)
         self.assertIn("host.navigate('/')", source)
@@ -238,8 +239,10 @@ class DesktopPluginTests(unittest.TestCase):
     def test_companion_cleanup_uses_the_native_disposer(self):
         source = PLUGIN.read_text(encoding="utf-8")
 
-        self.assertIn("for (const disposer of companionDisposers.current.values()) disposer()", source)
-        self.assertIn("companionDisposers.current.delete(companionId)", source)
+        self.assertIn("for (const disposer of companionDisposers.values()) disposer()", source)
+        self.assertIn("companionDisposers.delete(companionId)", source)
+        jira_page = source[source.index("function JiraPage()") : source.index("export default")]
+        self.assertNotIn("for (const disposer of companionDisposers.values()) disposer()", jira_page)
 
     def test_ticket_palette_picker_is_not_registered_without_a_safe_sdk_prompt(self):
         source = PLUGIN.read_text(encoding="utf-8")
