@@ -79,6 +79,65 @@ export function eventSessionIdentity(event = {}) {
   }
 }
 
+function ownerKey(owner = {}) {
+  return [owner?.connectionId, owner?.profile, owner?.targetProfile]
+    .map(value => String(value || ''))
+    .join('::')
+}
+
+function eventOwner(event = {}) {
+  const payload = event?.payload && typeof event.payload === 'object' ? event.payload : event
+  return event?.owner || event?.route || payload?.owner || payload?.route || event
+}
+
+function eventTurnKey(event = {}) {
+  const payload = event?.payload && typeof event.payload === 'object' ? event.payload : event
+  return String(payload?.turn_id || payload?.turnId || payload?.request_id || '').trim()
+}
+
+export function rememberEventState(states = new Map(), event = {}) {
+  const identity = eventSessionIdentity(event)
+  const state = eventState(event)
+  const owner = eventOwner(event)
+  const scopedOwner = ownerKey(owner)
+  if (!state || !scopedOwner || (!identity.storedId && !identity.runtimeId)) return states
+  const next = new Map(states)
+  const record = {
+    state,
+    terminal: state === 'failed',
+    turnKey: eventTurnKey(event)
+  }
+  for (const id of [identity.storedId, identity.runtimeId].filter(Boolean)) {
+    const key = `${scopedOwner}::${id}`
+    const previous = next.get(key)
+    if (previous?.terminal && state !== 'failed' && (!record.turnKey || record.turnKey === previous.turnKey)) continue
+    next.set(key, record)
+  }
+  return next
+}
+
+export function eventStateForSession(states = new Map(), owner = {}, row = {}) {
+  const scopedOwner = ownerKey(owner)
+  if (!scopedOwner) return ''
+  const ids = [row?.session_key, row?.stored_session_id, row?.id, row?.session_id]
+    .map(value => String(value || '').trim())
+    .filter(Boolean)
+  const records = ids.map(id => states.get(`${scopedOwner}::${id}`)).filter(Boolean)
+  if (records.some(record => record.terminal && record.state === 'failed')) return 'failed'
+  return records.sort((left, right) => statusPriority(right.state) - statusPriority(left.state))[0]?.state || ''
+}
+
+export function ticketStateMap(entries = []) {
+  const result = {}
+  for (const entry of Array.isArray(entries) ? entries : []) {
+    const ticketKey = String(entry?.ticketKey || entry?.link?.ticketKey || '').trim()
+    const state = String(entry?.state || '').trim()
+    if (!ticketKey || !LIVE_STATES.includes(state)) continue
+    if (!result[ticketKey] || statusPriority(state) > statusPriority(result[ticketKey])) result[ticketKey] = state
+  }
+  return result
+}
+
 export function eventState(event = {}) {
   const payload = event?.payload && typeof event.payload === 'object' ? event.payload : event
   const value = text(payload?.status || payload?.state || event?.status || event?.state)

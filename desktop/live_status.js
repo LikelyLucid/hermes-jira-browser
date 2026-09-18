@@ -26,9 +26,11 @@ const SessionStatusDot = sdk.SessionStatusDot
 import {
   chooseTicketContext,
   eventSessionIdentity,
+  eventStateForSession,
   markNotified,
   normaliseLiveState,
   notificationTransition,
+  rememberEventState,
   shouldNotify,
   statusLabel,
   statusPriority
@@ -49,7 +51,8 @@ export const liveStatusAtom = atomFactory({
 let pluginContext = null
 let controller = null
 let contextGeneration = 0
-let currentContext = { links: [], selectedKey: '', title: '' }
+let currentContext = { links: [], selectedKey: '', title: '', tickets: {} }
+let eventStates = new Map()
 
 function safeStorageGet(key, fallback) {
   try {
@@ -175,39 +178,26 @@ async function resolveOwners(links, focusedStoredSessionId) {
   return { owners, ambiguous, routes }
 }
 
-async function activeRowsForOwners(ownerRoutes, legacyIds) {
+function withEventState(row, route) {
+  if (!row) return row
+  const state = eventStateForSession(eventStates, route, row)
+  return state ? { ...row, status: state, eventState: state, failed: state === 'failed' } : row
+}
+
+async function activeRowsForOwners(ownerRoutes) {
   const rows = new Map()
-  const busyBySession = host.state?.busyBySession?.get?.() || {}
   if (typeof host.requestProfile === 'function' && ownerRoutes.length > 0) {
     await Promise.all(ownerRoutes.map(async route => {
       try {
         const result = await host.requestProfile(route, 'session.active_list', {})
         for (const row of Array.isArray(result?.sessions) ? result.sessions : []) {
           const storedId = String(row?.session_key || '').trim()
-          if (storedId) rows.set(`${routeKey(route)}::${storedId}`, { ...row, owner: route })
+          if (storedId) rows.set(`${routeKey(route)}::${storedId}`, withEventState({ ...row, owner: route }, route))
         }
       } catch {
         // A route can disappear while a remote profile is reconnecting.
       }
     }))
-    return rows
-  }
-
-  // Compatibility-only path for pre-routing SDKs. Current SDKs always use the
-  // owner-qualified branch above; this never guesses a profile on new hosts.
-  if (typeof host.request === 'function' && legacyIds.size > 0) {
-    try {
-      const result = await host.request('session.active_list', {})
-      for (const row of Array.isArray(result?.sessions) ? result.sessions : []) {
-        const storedId = String(row?.session_key || '').trim()
-        if (legacyIds.has(storedId)) rows.set(`legacy::${storedId}`, {
-          ...row,
-          busy: row.busy ?? Boolean(busyBySession[String(row?.id || '')])
-        })
-      }
-    } catch {
-      // Retain the last snapshot through transient gateway failure.
-    }
   }
   return rows
 }
@@ -247,11 +237,27 @@ function focusToken() {
   ])
 }
 
+function contextLinks() {
+  const links = new Map()
+  const add = (link, ticketKey = '') => {
+    const id = linkId(link)
+    if (!id) return
+    const tagged = { ...link, ...(ticketKey ? { ticketKey } : {}) }
+    const key = `${ticketKey}::${id}`
+    links.set(key, tagged)
+  }
+  for (const link of currentContext.links) add(link, link.ticketKey || currentContext.selectedKey)
+  for (const [ticketKey, ticket] of Object.entries(currentContext.tickets || {})) {
+    for (const link of Array.isArray(ticket?.links) ? ticket.links : []) add(link, ticketKey)
+  }
+  return [...links.values()]
+}
+
 async function refresh() {
   if (!controller || !pluginContext) return
   const runGeneration = contextGeneration
   const runFocusToken = focusToken()
-  const links = Array.isArray(currentContext.links) ? currentContext.links.filter(link => linkId(link)) : []
+  const links = contextLinks()
   if (links.length === 0) {
     liveStatusAtom.set({ context: currentContext, entries: [], notificationsEnabled: notificationsEnabled(), refreshedAt: Date.now() })
     return
@@ -260,20 +266,22 @@ async function refresh() {
   const previous = new Map(liveStatusAtom.get().entries.map(entry => [`${entry.ownerKey}::${linkId(entry.link)}`, entry]))
   const { owners, ambiguous } = await resolveOwners(links, focusedStoredId)
   const ownerRoutes = [...new Map([...owners.values()].filter(validRoute).map(route => [routeKey(route), route])).values()]
-  const legacyIds = new Set(links.map(linkId).filter(id => !owners.has(id) && !ambiguous.has(id)))
-  const activeRows = await activeRowsForOwners(ownerRoutes, legacyIds)
+  const activeRows = await activeRowsForOwners(ownerRoutes)
   if (runGeneration !== contextGeneration || runFocusToken !== focusToken()) return
   const receipts = readReceipts()
   let nextReceipts = receipts
   const entries = links.map(link => {
     const id = linkId(link)
     const owner = owners.get(id) || null
-    const ownerKey = owner ? routeKey(owner) : 'legacy'
+    const ownerKey = owner ? routeKey(owner) : 'unavailable'
     const active = owner
       ? activeRows.get(`${ownerKey}::${id}`) || null
-      : activeRows.get(`legacy::${id}`) || null
+      : null
     const previousEntry = previous.get(`${ownerKey}::${id}`)
-    const state = ambiguous.has(id) ? 'idle' : normaliseLiveState(link, active)
+    const eventState = owner ? eventStateForSession(eventStates, owner, { session_key: id }) : ''
+    const state = ambiguous.has(id) || !owner
+      ? 'failed'
+      : normaliseLiveState(link, active, eventState ? { state: eventState } : null)
     const entry = {
       active,
       epoch: epochFor({ active, link }, previousEntry),
@@ -281,6 +289,8 @@ async function refresh() {
       owner,
       ownerKey,
       state,
+      available: Boolean(owner) && !ambiguous.has(id),
+      ticketKey: String(link.ticketKey || currentContext.selectedKey || '').trim(),
       ticketLabel: currentContext.title || currentContext.selectedKey || 'Jira ticket'
     }
     if (notificationsEnabled() && !ambiguous.has(id)) nextReceipts = notifyTransition(entry, previousEntry, nextReceipts)
@@ -351,7 +361,8 @@ export function publishJiraContext(context = {}) {
   currentContext = {
     links: Array.isArray(context.links) ? context.links.map(link => ({ ...link })) : [],
     selectedKey: String(context.selectedKey || '').trim(),
-    title: String(context.title || '').trim()
+    title: String(context.title || '').trim(),
+    tickets: context.tickets && typeof context.tickets === 'object' ? context.tickets : {}
   }
   liveStatusAtom.set({ ...liveStatusAtom.get(), context: currentContext })
   scheduleRefresh()
@@ -363,6 +374,7 @@ export function subscribeLiveStatuses(callback) {
 
 export function installLiveStatus(ctx) {
   pluginContext = ctx
+  eventStates = new Map()
   if (typeof ctx?.register !== 'function') return () => undefined
   controller = { refreshing: false }
   const disposers = []
@@ -415,6 +427,8 @@ export function installLiveStatus(ctx) {
   const onEvent = typeof host.onEvent === 'function' ? host.onEvent('*', event => {
     const identity = eventSessionIdentity(event)
     if (!identity.storedId && !identity.runtimeId) return
+    const owner = event?.owner || event?.route || event?.payload?.owner || event?.payload?.route || event
+    if (validRoute(owner)) eventStates = rememberEventState(eventStates, { ...event, owner })
     scheduleRefresh()
   }) : null
   if (typeof onEvent === 'function') disposers.push(onEvent)
@@ -435,7 +449,8 @@ export function installLiveStatus(ctx) {
     controller = null
     pluginContext = null
     contextGeneration += 1
-    liveStatusAtom.set({ context: { links: [], selectedKey: '', title: '' }, entries: [], notificationsEnabled: false, refreshedAt: 0 })
+    eventStates = new Map()
+    liveStatusAtom.set({ context: { links: [], selectedKey: '', title: '', tickets: {} }, entries: [], notificationsEnabled: false, refreshedAt: 0 })
   }
   if (typeof ctx.onDispose === 'function') ctx.onDispose(dispose)
   return dispose

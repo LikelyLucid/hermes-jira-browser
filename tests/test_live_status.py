@@ -42,6 +42,9 @@ class LiveStatusTests(unittest.TestCase):
         self.assertIn("notificationTransition", source)
         self.assertIn("${entry.ownerKey}:${linkId(entry.link)}:${entry.epoch}", source)
         self.assertIn("transition.kind === 'needs-input' ? 'warning' : 'success'", source)
+        self.assertNotIn("host.request('session.active_list'", source)
+        self.assertIn("available: Boolean(owner) && !ambiguous.has(id)", source)
+        self.assertIn("eventStateForSession(eventStates", source)
 
     def test_live_registration_provides_route_palette_keybind_status_and_titlebar(self):
         source = LIVE.read_text(encoding="utf-8")

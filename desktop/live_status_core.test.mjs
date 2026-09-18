@@ -4,10 +4,13 @@ import {
   chooseTicketContext,
   eventSessionIdentity,
   eventState,
+  eventStateForSession,
   markNotified,
   normaliseLiveState,
   notificationTransition,
-  shouldNotify
+  rememberEventState,
+  shouldNotify,
+  ticketStateMap
 } from './live_status_core.mjs'
 
 assert.equal(normaliseLiveState({}, { status: 'working' }), 'working')
@@ -31,6 +34,7 @@ assert.deepEqual(waiting, { kind: 'needs-input', key: 'needs-input:turn-1' })
 const completed = notificationTransition('working', 'idle', 'turn-1')
 assert.deepEqual(completed, { kind: 'completed', key: 'completed:turn-1' })
 assert.equal(notificationTransition('waiting', 'working', 'turn-1'), null)
+assert.equal(notificationTransition('failed', 'idle', 'turn-1'), null)
 let receipts = {}
 assert.equal(shouldNotify(receipts, completed), true)
 receipts = markNotified(receipts, completed)
@@ -41,3 +45,21 @@ assert.deepEqual(eventSessionIdentity({ type: 'message.complete', payload: { ses
 })
 assert.equal(eventState({ type: 'message.complete', payload: { session_key: 'stored-1' } }), 'idle')
 assert.equal(eventState({ type: 'clarify.request', payload: { session_key: 'stored-1' } }), 'waiting')
+assert.equal(eventState({ type: 'turn.error', payload: { session_key: 'stored-1' } }), 'failed')
+
+const owner = { connectionId: 'gateway-a', profile: 'default', targetProfile: 'default' }
+let eventStates = new Map()
+eventStates = rememberEventState(eventStates, {
+  type: 'turn.error',
+  payload: { session_key: 'stored-1', session_id: 'runtime-1' },
+  owner
+})
+assert.equal(eventStateForSession(eventStates, owner, { session_key: 'stored-1', id: 'runtime-1', status: 'idle' }), 'failed')
+assert.equal(eventStateForSession(eventStates, owner, { session_key: 'stored-1', id: 'runtime-1', status: 'working' }), 'failed')
+assert.equal(eventStateForSession(eventStates, { connectionId: 'gateway-b', profile: 'default', targetProfile: 'default' }, { session_key: 'stored-1' }), '')
+
+assert.deepEqual(ticketStateMap([
+  { ticketKey: 'ABC-1', state: 'idle' },
+  { ticketKey: 'ABC-1', state: 'failed' },
+  { ticketKey: 'ABC-2', state: 'archived' }
+]), { 'ABC-1': 'failed', 'ABC-2': 'archived' })
