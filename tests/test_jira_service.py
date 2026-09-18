@@ -738,6 +738,68 @@ class StoreTests(unittest.TestCase):
         self.assertEqual(removed, 1)
         self.assertEqual(completed, 2)
 
+    def test_completing_a_receipt_keeps_the_completed_count_within_the_hard_limit(self):
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(
+            jira_service, "MAX_COMPLETED_MUTATION_RECEIPTS", 2
+        ):
+            store = jira_service.JiraStore(Path(tmp) / "jira.sqlite3")
+            for index in range(3):
+                key = f"comment-key-hard-limit-{index:04d}"
+                store.reserve_mutation(
+                    idempotency_key=key,
+                    action="comment",
+                    issue_key="DEMO-42",
+                    payload={"body": f"Done {index}"},
+                )
+                store.complete_mutation(key, {"comment": {"id": str(index)}})
+
+            with store._connect() as db:
+                completed = db.execute(
+                    "SELECT COUNT(*) FROM mutation_receipts WHERE completed = 1"
+                ).fetchone()[0]
+
+        self.assertEqual(completed, 2)
+
+    def test_expired_same_key_is_pruned_before_replay_lookup(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = jira_service.JiraStore(Path(tmp) / "jira.sqlite3")
+            kwargs = {
+                "idempotency_key": "comment-key-expired-0001",
+                "action": "comment",
+                "issue_key": "DEMO-42",
+                "payload": {"body": "Done"},
+            }
+            store.reserve_mutation(**kwargs)
+            store.complete_mutation(kwargs["idempotency_key"], {"comment": {"id": "1"}})
+            with store._connect() as db:
+                db.execute(
+                    "UPDATE mutation_receipts SET completed_at = ?, updated_at = ? WHERE idempotency_key = ?",
+                    ("2000-01-01T00:00:00Z", "2000-01-01T00:00:00Z", kwargs["idempotency_key"]),
+                )
+
+            self.assertEqual(store.reserve_mutation(**kwargs), {"status": "claimed"})
+
+    def test_store_startup_prunes_expired_completed_receipts_without_new_mutation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "jira.sqlite3"
+            store = jira_service.JiraStore(path)
+            key = "comment-key-startup-expired"
+            store.reserve_mutation(
+                idempotency_key=key,
+                action="comment",
+                issue_key="DEMO-42",
+                payload={"body": "Done"},
+            )
+            store.complete_mutation(key, {"comment": {"id": "1"}})
+            with store._connect() as db:
+                db.execute(
+                    "UPDATE mutation_receipts SET completed_at = ?, updated_at = ? WHERE idempotency_key = ?",
+                    ("2000-01-01T00:00:00Z", "2000-01-01T00:00:00Z", key),
+                )
+
+            reopened = jira_service.JiraStore(path)
+            self.assertIsNone(reopened.get_mutation_receipt(key))
+
     def test_pending_mutation_receipts_have_a_hard_global_limit(self):
         with tempfile.TemporaryDirectory() as tmp, mock.patch.object(jira_service, "MAX_PENDING_MUTATION_RECEIPTS", 2):
             store = jira_service.JiraStore(Path(tmp) / "jira.sqlite3")

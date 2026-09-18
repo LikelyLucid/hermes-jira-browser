@@ -1257,6 +1257,11 @@ class JiraStore:
                     ON mutation_receipts(completed, updated_at);
                 """
             )
+            self._prune_mutation_receipts_db(
+                db,
+                max_completed=MAX_COMPLETED_MUTATION_RECEIPTS,
+                retention_days=MUTATION_RECEIPT_RETENTION_DAYS,
+            )
 
     def reserve_mutation(
         self,
@@ -1277,6 +1282,11 @@ class JiraStore:
         now = _utc_now()
         with self._connect() as db:
             db.execute("BEGIN IMMEDIATE")
+            self._prune_mutation_receipts_db(
+                db,
+                max_completed=MAX_COMPLETED_MUTATION_RECEIPTS,
+                retention_days=MUTATION_RECEIPT_RETENTION_DAYS,
+            )
             row = db.execute(
                 "SELECT * FROM mutation_receipts WHERE idempotency_key = ?",
                 (key,),
@@ -1295,11 +1305,6 @@ class JiraStore:
                         raise RuntimeError("Stored Jira mutation result is invalid.") from exc
                     return {"status": "completed", "result": result}
                 raise MutationPendingError("An identical Jira mutation is already pending.")
-            self._prune_mutation_receipts_db(
-                db,
-                max_completed=MAX_COMPLETED_MUTATION_RECEIPTS,
-                retention_days=MUTATION_RECEIPT_RETENTION_DAYS,
-            )
             pending_count = int(db.execute(
                 "SELECT COUNT(*) FROM mutation_receipts WHERE completed = 0"
             ).fetchone()[0])
@@ -1371,6 +1376,7 @@ class JiraStore:
             raise ValueError("Jira mutation result is too large to store.")
         now = _utc_now()
         with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
             cursor = db.execute(
                 """
                 UPDATE mutation_receipts
@@ -1379,8 +1385,13 @@ class JiraStore:
                 """,
                 (result_json, now, now, key),
             )
-        if cursor.rowcount != 1:
-            raise RuntimeError("Jira mutation receipt is no longer pending.")
+            if cursor.rowcount != 1:
+                raise RuntimeError("Jira mutation receipt is no longer pending.")
+            self._prune_mutation_receipts_db(
+                db,
+                max_completed=MAX_COMPLETED_MUTATION_RECEIPTS,
+                retention_days=MUTATION_RECEIPT_RETENTION_DAYS,
+            )
 
     def release_mutation(self, idempotency_key: str) -> None:
         key = validate_mutation_key(idempotency_key)
@@ -1393,6 +1404,11 @@ class JiraStore:
     def get_mutation_receipt(self, idempotency_key: str) -> dict[str, Any] | None:
         key = validate_mutation_key(idempotency_key)
         with self._connect() as db:
+            self._prune_mutation_receipts_db(
+                db,
+                max_completed=MAX_COMPLETED_MUTATION_RECEIPTS,
+                retention_days=MUTATION_RECEIPT_RETENTION_DAYS,
+            )
             row = db.execute(
                 "SELECT * FROM mutation_receipts WHERE idempotency_key = ?",
                 (key,),

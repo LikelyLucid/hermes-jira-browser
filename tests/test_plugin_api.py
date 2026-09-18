@@ -4,6 +4,7 @@ import asyncio
 import importlib.util
 import os
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -124,6 +125,40 @@ class JiraBrowserApiTests(unittest.TestCase):
                 second = asyncio.run(plugin_api.add_comment("DEMO-42", payload))
 
         self.assertEqual(first, second)
+        client.add_comment.assert_called_once_with("DEMO-42", "Done")
+
+    def test_concurrent_duplicate_comment_is_rejected_while_first_request_is_in_flight(self):
+        entered = threading.Event()
+        release = threading.Event()
+        client = mock.Mock()
+
+        def add_comment(_issue_key, _body):
+            entered.set()
+            if not release.wait(timeout=2):
+                raise RuntimeError("test synchronization timed out")
+            return {"id": "9001", "body": "Done"}
+
+        client.add_comment.side_effect = add_comment
+        payload = plugin_api.CommentRequest(body="Done", idempotency_key="comment-key-concurrent-1")
+
+        async def exercise(store):
+            with mock.patch.object(plugin_api, "_store", return_value=store), mock.patch.object(
+                plugin_api, "_client", return_value=client
+            ):
+                first = asyncio.create_task(plugin_api.add_comment("DEMO-42", payload))
+                self.assertTrue(await asyncio.to_thread(entered.wait, 2))
+                try:
+                    with self.assertRaisesRegex(plugin_api.HTTPException, "already pending"):
+                        await plugin_api.add_comment("DEMO-42", payload)
+                finally:
+                    release.set()
+                return await first
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store = plugin_api.SERVICE.JiraStore(Path(tmp) / "state.sqlite3")
+            result = asyncio.run(exercise(store))
+
+        self.assertEqual(result["comment"]["id"], "9001")
         client.add_comment.assert_called_once_with("DEMO-42", "Done")
 
     def test_duplicate_transition_calls_jira_once_and_returns_stored_result(self):
