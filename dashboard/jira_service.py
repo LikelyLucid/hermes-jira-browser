@@ -21,7 +21,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from collections.abc import Mapping
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, NamedTuple, cast
 
@@ -1069,7 +1069,10 @@ def _utc_now() -> str:
 
 
 MAX_MUTATION_KEY_LENGTH = 200
-MAX_MUTATION_RESULT_BYTES = 128 * 1024
+MAX_MUTATION_RESULT_BYTES = 64 * 1024
+MAX_COMPLETED_MUTATION_RECEIPTS = 1_000
+MAX_PENDING_MUTATION_RECEIPTS = 1_000
+MUTATION_RECEIPT_RETENTION_DAYS = 30
 _MUTATION_KEY_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{15,199}$")
 
 
@@ -1292,6 +1295,16 @@ class JiraStore:
                         raise RuntimeError("Stored Jira mutation result is invalid.") from exc
                     return {"status": "completed", "result": result}
                 raise MutationPendingError("An identical Jira mutation is already pending.")
+            self._prune_mutation_receipts_db(
+                db,
+                max_completed=MAX_COMPLETED_MUTATION_RECEIPTS,
+                retention_days=MUTATION_RECEIPT_RETENTION_DAYS,
+            )
+            pending_count = int(db.execute(
+                "SELECT COUNT(*) FROM mutation_receipts WHERE completed = 0"
+            ).fetchone()[0])
+            if pending_count >= MAX_PENDING_MUTATION_RECEIPTS:
+                raise MutationPendingError("Too many unresolved Jira mutations are pending.")
             db.execute(
                 """
                 INSERT INTO mutation_receipts
@@ -1302,6 +1315,51 @@ class JiraStore:
                 (key, mutation, issue, payload_sha256, now, now, now),
             )
         return {"status": "claimed"}
+
+    @staticmethod
+    def _prune_mutation_receipts_db(
+        db: sqlite3.Connection,
+        *,
+        max_completed: int,
+        retention_days: int,
+    ) -> int:
+        limit = max(0, int(max_completed))
+        days = max(0, int(retention_days))
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat().replace("+00:00", "Z")
+        before = db.total_changes
+        db.execute(
+            "DELETE FROM mutation_receipts WHERE completed = 1 AND completed_at < ?",
+            (cutoff,),
+        )
+        if limit == 0:
+            db.execute("DELETE FROM mutation_receipts WHERE completed = 1")
+        else:
+            db.execute(
+                """
+                DELETE FROM mutation_receipts
+                WHERE completed = 1 AND idempotency_key NOT IN (
+                    SELECT idempotency_key FROM mutation_receipts
+                    WHERE completed = 1
+                    ORDER BY completed_at DESC, idempotency_key DESC
+                    LIMIT ?
+                )
+                """,
+                (limit,),
+            )
+        return db.total_changes - before
+
+    def prune_mutation_receipts(
+        self,
+        *,
+        max_completed: int = MAX_COMPLETED_MUTATION_RECEIPTS,
+        retention_days: int = MUTATION_RECEIPT_RETENTION_DAYS,
+    ) -> int:
+        with self._connect() as db:
+            return self._prune_mutation_receipts_db(
+                db,
+                max_completed=max_completed,
+                retention_days=retention_days,
+            )
 
     def complete_mutation(self, idempotency_key: str, result: Mapping[str, Any]) -> None:
         key = validate_mutation_key(idempotency_key)

@@ -718,6 +718,45 @@ class StoreTests(unittest.TestCase):
             store.release_mutation(kwargs["idempotency_key"])
             self.assertEqual(store.reserve_mutation(**kwargs)["status"], "claimed")
 
+    def test_completed_mutation_receipts_are_pruned_to_a_bounded_window(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = jira_service.JiraStore(Path(tmp) / "jira.sqlite3")
+            for index in range(3):
+                key = f"comment-key-prune-{index:04d}"
+                store.reserve_mutation(
+                    idempotency_key=key,
+                    action="comment",
+                    issue_key="DEMO-42",
+                    payload={"body": f"Done {index}"},
+                )
+                store.complete_mutation(key, {"comment": {"id": str(index)}})
+
+            removed = store.prune_mutation_receipts(max_completed=2, retention_days=30)
+            with store._connect() as db:
+                completed = db.execute("SELECT COUNT(*) FROM mutation_receipts WHERE completed = 1").fetchone()[0]
+
+        self.assertEqual(removed, 1)
+        self.assertEqual(completed, 2)
+
+    def test_pending_mutation_receipts_have_a_hard_global_limit(self):
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(jira_service, "MAX_PENDING_MUTATION_RECEIPTS", 2):
+            store = jira_service.JiraStore(Path(tmp) / "jira.sqlite3")
+            for index in range(2):
+                store.reserve_mutation(
+                    idempotency_key=f"comment-key-pending-{index:04d}",
+                    action="comment",
+                    issue_key="DEMO-42",
+                    payload={"body": f"Done {index}"},
+                )
+
+            with self.assertRaisesRegex(jira_service.MutationPendingError, "unresolved"):
+                store.reserve_mutation(
+                    idempotency_key="comment-key-pending-9999",
+                    action="comment",
+                    issue_key="DEMO-42",
+                    payload={"body": "Another"},
+                )
+
     def test_maps_project_and_links_chat_and_worktree(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = jira_service.JiraStore(Path(tmp) / "jira.sqlite3")

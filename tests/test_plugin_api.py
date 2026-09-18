@@ -17,6 +17,12 @@ spec.loader.exec_module(plugin_api)
 
 
 class JiraBrowserApiTests(unittest.TestCase):
+    def test_mutation_requests_reject_whitespace_before_reserving_a_receipt(self):
+        with self.assertRaises(ValueError):
+            plugin_api.CommentRequest(body="   ", idempotency_key="comment-key-123456")
+        with self.assertRaises(ValueError):
+            plugin_api.TransitionRequest(transition_id="   ", idempotency_key="transition-key-123456")
+
     def test_router_exposes_expected_read_and_handoff_routes(self):
         routes = {(route.path, next(iter(route.methods))) for route in plugin_api.router.routes if route.methods}
         paths = {path for path, _method in routes}

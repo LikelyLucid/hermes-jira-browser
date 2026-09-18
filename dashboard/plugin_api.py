@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any
 
 from fastapi import APIRouter, HTTPException
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 
 _SERVICE_PATH = Path(__file__).with_name("jira_service.py")
@@ -51,10 +51,26 @@ class CommentRequest(BaseModel):
     body: str = Field(min_length=1, max_length=32_000)
     idempotency_key: str = Field(min_length=16, max_length=200, pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]{15,199}$")
 
+    @field_validator("body")
+    @classmethod
+    def _normalise_body(cls, value: str) -> str:
+        body = value.strip()
+        if not body:
+            raise ValueError("body must not be blank")
+        return body
+
 
 class TransitionRequest(BaseModel):
     transition_id: str = Field(min_length=1, max_length=100)
     idempotency_key: str = Field(min_length=16, max_length=200, pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]{15,199}$")
+
+    @field_validator("transition_id")
+    @classmethod
+    def _normalise_transition_id(cls, value: str) -> str:
+        transition_id = value.strip()
+        if not transition_id:
+            raise ValueError("transition_id must not be blank")
+        return transition_id
 
 
 def _store():
