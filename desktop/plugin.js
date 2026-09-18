@@ -353,12 +353,13 @@ function IssueRowTitle({ issue }) {
   })
 }
 
-function JiraCard({ issue, active, attentionReasons = [], onOpen, workState }) {
+function JiraCard({ issue, active, attentionReasons = [], onOpen, workState, workingSessionIds }) {
   const tone = statusColor(issue)
   const linkedWork = Array.isArray(workState?.links) ? workState.links : []
   const branch = linkedWork.find(link => link.branch)?.branch || ''
+  const working = linkedWork.some(link => workingSessionIds?.has(String(link.session_id || '')))
   return jsxs('div', {
-    className: `group relative flex cursor-grab flex-col gap-2 rounded-md border border-(--ui-stroke-tertiary) border-l-2 bg-(--ui-bg-elevated) p-2.5 transition-colors hover:bg-primary/[0.06] active:cursor-grabbing${active ? ' border-(--dt-composer-ring) bg-[color-mix(in_srgb,var(--dt-composer-ring)_7%,transparent)]' : ''}`,
+    className: `group relative flex cursor-grab flex-col gap-2 rounded-md border border-(--ui-stroke-tertiary) border-l-2 bg-(--ui-bg-elevated) p-2.5 transition-colors hover:bg-primary/[0.06] active:cursor-grabbing${working ? ' border-(--dt-composer-ring) ring-1 ring-(--dt-composer-ring) bg-[color-mix(in_srgb,var(--dt-composer-ring)_10%,transparent)]' : active ? ' border-(--dt-composer-ring) bg-[color-mix(in_srgb,var(--dt-composer-ring)_7%,transparent)]' : ''}`,
     draggable: true,
     onClick: () => onOpen(issue.key),
     onDragStart: event => {
@@ -397,10 +398,19 @@ function JiraCard({ issue, active, attentionReasons = [], onOpen, workState }) {
           jsx('span', { className: 'ml-auto shrink-0 text-(--ui-text-quaternary)', children: relativeDate(issue.updated) })
         ]
       }),
-      linkedWork.length || attentionReasons.length
+      linkedWork.length || attentionReasons.length || working
         ? jsxs('div', {
             className: 'flex flex-wrap items-center gap-1 border-t border-(--ui-stroke-tertiary) pt-1.5 text-[0.6rem] text-(--ui-text-tertiary)',
             children: [
+              working
+                ? jsxs('span', {
+                    className: 'inline-flex items-center gap-1 rounded bg-[color-mix(in_srgb,var(--dt-composer-ring)_14%,transparent)] px-1.5 py-0.5 text-(--dt-composer-ring)',
+                    children: [
+                      jsx(Codicon, { className: 'animate-pulse', name: 'loading~spin', size: '0.65rem' }),
+                      jsx('span', { children: 'Working' })
+                    ]
+                  })
+                : null,
               linkedWork.length
                 ? jsxs('span', {
                     className: 'inline-flex items-center gap-1 rounded bg-foreground/5 px-1.5 py-0.5',
@@ -432,7 +442,7 @@ function JiraCard({ issue, active, attentionReasons = [], onOpen, workState }) {
   })
 }
 
-function JiraLane({ lane, attentionByKey, collapsed, selectedKey, onToggle, onOpen, onMove, workStates }) {
+function JiraLane({ lane, attentionByKey, collapsed, selectedKey, onToggle, onOpen, onMove, workingSessionIds, workStates }) {
   const [over, setOver] = useState(false)
   const label = lane.label || 'Tickets'
   const tone = statusColor(lane)
@@ -507,7 +517,8 @@ function JiraLane({ lane, attentionByKey, collapsed, selectedKey, onToggle, onOp
               active: issue.key === selectedKey,
               attentionReasons: attentionByKey[issue.key] || [],
               onOpen,
-              workState: workStates[issue.key]
+              workState: workStates[issue.key],
+              workingSessionIds
             }, issue.id || issue.key))
           : jsx('div', {
               className: 'pointer-events-none absolute inset-0 grid place-items-center text-[0.6875rem] text-(--ui-text-quaternary)',
@@ -1926,6 +1937,7 @@ function JiraPage() {
   const [mapping, setMapping] = useState(null)
   const [links, setLinks] = useState([])
   const [workStates, setWorkStates] = useState(() => readWorkStateCache())
+  const [workingSessionIds, setWorkingSessionIds] = useState(() => new Set())
   const [settings, setSettings] = useState(null)
   const [activeView, setActiveView] = useState('assigned')
   const [submittedJql, setSubmittedJql] = useState(DEFAULT_JQL)
@@ -1948,6 +1960,35 @@ function JiraPage() {
   const saveTimer = useRef(null)
   const settingsSaveGeneration = useRef(0)
   const workStateGeneration = useRef(0)
+
+  useEffect(() => {
+    let alive = true
+    let refreshing = false
+    const refreshWorkingSessions = async () => {
+      if (refreshing) return
+      refreshing = true
+      try {
+        const result = await host.request('session.active_list', {})
+        if (!alive) return
+        setWorkingSessionIds(new Set(
+          (Array.isArray(result?.sessions) ? result.sessions : [])
+            .filter(session => session.status === 'working')
+            .map(session => String(session.session_key || ''))
+            .filter(Boolean)
+        ))
+      } catch {
+        // Retain the last live snapshot through a transient gateway failure.
+      } finally {
+        refreshing = false
+      }
+    }
+    void refreshWorkingSessions()
+    const timer = window.setInterval(() => void refreshWorkingSessions(), 3_000)
+    return () => {
+      alive = false
+      window.clearInterval(timer)
+    }
+  }, [])
   const drawerResize = useRef(null)
 
   const loadIssues = useCallback(async (nextJql, options = {}) => {
@@ -2558,6 +2599,7 @@ function JiraPage() {
                     onToggle: () => toggleLane(lane.key),
                     onOpen: openTicket,
                     onMove: moveIssueToLane,
+                    workingSessionIds,
                     workStates
                   }, lane.key)
                 ),

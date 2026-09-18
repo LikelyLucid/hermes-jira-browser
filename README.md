@@ -12,6 +12,7 @@ A native Jira workspace for Hermes Desktop. It presents Jira issues on a Kanban-
 - Maps Jira projects to Hermes Projects and creates or reuses issue worktrees.
 - Links one worktree to a ticket and automatically discovers sessions rooted in it.
 - Supports explicit **Resume work**, **New chat**, chat attachment, and chat unlinking.
+- Highlights a ticket card with a live ring and **Working** badge while any linked Hermes session is actively running.
 - Opens work sessions without submitting an agent task.
 - Drafts Jira updates in a normal Hermes session; posting remains explicit.
 - Suggests transitions but never applies one without a click.

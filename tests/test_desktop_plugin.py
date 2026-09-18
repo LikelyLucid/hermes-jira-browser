@@ -102,6 +102,16 @@ class DesktopPluginTests(unittest.TestCase):
         self.assertIn("workState: workStates[issue.key]", source)
         self.assertIn("Linked work", source)
 
+    def test_working_linked_session_highlights_the_ticket_card(self):
+        source = PLUGIN.read_text(encoding="utf-8")
+
+        self.assertIn("host.request('session.active_list'", source)
+        self.assertIn("session.status === 'working'", source)
+        self.assertIn("const [workingSessionIds, setWorkingSessionIds]", source)
+        self.assertIn("const working = linkedWork.some", source)
+        self.assertIn("ring-1 ring-(--dt-composer-ring)", source)
+        self.assertIn("children: 'Working'", source)
+
     def test_existing_linked_work_is_resumed_without_duplicate_session(self):
         source = PLUGIN.read_text(encoding="utf-8")
 
