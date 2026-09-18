@@ -1417,17 +1417,32 @@ class JiraStore:
                 retention_days=MUTATION_RECEIPT_RETENTION_DAYS,
             )
 
-    def claim_legacy_origin(self, configured_origin: str) -> int:
-        """Claim only unqualified legacy rows; later config changes cannot re-home them."""
-        origin = configured_origin.strip().rstrip("/")
+    @staticmethod
+    def _normalize_jira_origin(value: Any) -> str:
+        if not isinstance(value, str):
+            raise ValueError("Jira origin must be a string.")
+        origin = value.strip().rstrip("/")
         if not origin:
-            raise ValueError("Jira origin is required to claim legacy links.")
-        with self._connect() as db:
-            cursor = db.execute(
-                "UPDATE session_links SET jira_origin = ? WHERE jira_origin = ''",
-                (origin,),
-            )
-        return cursor.rowcount
+            raise ValueError("Jira origin is required for session links.")
+        return origin
+
+    @staticmethod
+    def _validate_local_owner(
+        connection_id: Any,
+        profile_name: Any,
+        target_profile: Any,
+    ) -> tuple[str, str, str]:
+        connection = validate_owner_field(connection_id, field_name="connection_id")
+        profile = validate_owner_field(profile_name, field_name="profile_name")
+        target = validate_owner_field(target_profile, field_name="target_profile")
+        active_profile = active_profile_name()
+        if connection != "local" or active_profile is None or profile != active_profile or target != active_profile:
+            raise ValueError("Session owner must be the active local owner.")
+        return connection, profile, target
+
+    def claim_legacy_origin(self, configured_origin: str) -> int:
+        """Keep legacy rows quarantined; origin adoption is never implicit or supported."""
+        raise ValueError("Legacy Jira links are quarantined and cannot be adopted.")
 
     @staticmethod
     def _create_session_links_table(db: sqlite3.Connection) -> None:
@@ -1652,10 +1667,10 @@ class JiraStore:
         issue_id: str,
         issue_key: str,
         session_id: str,
-        jira_origin: str = "",
-        connection_id: str = "local",
-        profile_name: str = "default",
-        target_profile: str | None = None,
+        jira_origin: str,
+        connection_id: str,
+        profile_name: str,
+        target_profile: str,
         project_id: str | None = None,
         worktree_path: str | None = None,
         branch: str | None = None,
@@ -1663,10 +1678,12 @@ class JiraStore:
     ) -> dict[str, Any]:
         if not all((issue_id.strip(), issue_key.strip(), session_id.strip())):
             raise ValueError("Issue id, issue key, and session id are required.")
-        origin = jira_origin.strip().rstrip("/")
-        connection = connection_id.strip() or "local"
-        profile = profile_name.strip() or "default"
-        target = (target_profile or profile).strip() or profile
+        origin = self._normalize_jira_origin(jira_origin)
+        connection, profile, target = self._validate_local_owner(
+            connection_id,
+            profile_name,
+            target_profile,
+        )
         with self._connect() as db:
             db.execute(
                 """
@@ -1779,15 +1796,19 @@ class JiraStore:
         *,
         issue_id: str,
         session_id: str,
-        jira_origin: str = "",
-        connection_id: str = "local",
-        profile_name: str = "default",
-        target_profile: str | None = None,
+        jira_origin: str,
+        connection_id: str,
+        profile_name: str,
+        target_profile: str,
     ) -> bool:
         issue = issue_id.strip()
         session = session_id.strip()
-        profile = profile_name.strip() or "default"
-        target = (target_profile or profile).strip() or profile
+        origin = self._normalize_jira_origin(jira_origin)
+        connection, profile, target = self._validate_local_owner(
+            connection_id,
+            profile_name,
+            target_profile,
+        )
         if not issue or not session:
             raise ValueError("Issue id and session id are required.")
         with self._connect() as db:
@@ -1800,8 +1821,8 @@ class JiraStore:
                 (
                     issue,
                     session,
-                    jira_origin.strip().rstrip("/"),
-                    connection_id.strip() or "local",
+                    origin,
+                    connection,
                     profile,
                     target,
                 ),

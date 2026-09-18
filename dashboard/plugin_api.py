@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any
 
 from fastapi import APIRouter, HTTPException
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, Field, field_validator
 
 
 _SERVICE_PATH = Path(__file__).with_name("jira_service.py")
@@ -45,23 +45,15 @@ class SessionLinkRequest(BaseModel):
     issue_id: str = Field(min_length=1)
     issue_key: str = Field(min_length=1)
     session_id: str = Field(min_length=1)
-    connection_id: str = Field(default="local", min_length=1, max_length=200)
-    profile_name: str = Field(default="default", min_length=1, max_length=200)
-    target_profile: str | None = Field(default=None, min_length=1, max_length=200)
+    connection_id: str = Field(min_length=1, max_length=200)
+    profile_name: str = Field(min_length=1, max_length=200)
+    target_profile: str = Field(min_length=1, max_length=200)
     clear_detachment: bool = False
 
     @field_validator("connection_id", "profile_name", "target_profile", mode="before")
     @classmethod
     def _validate_owner_field(cls, value: Any, info):
-        if value is None and info.field_name == "target_profile":
-            return None
         return SERVICE.validate_owner_field(value, field_name=info.field_name)
-
-    @model_validator(mode="after")
-    def _default_target_profile(self):
-        if self.target_profile is None:
-            self.target_profile = self.profile_name
-        return self
 
 
 class CommentRequest(BaseModel):
@@ -147,14 +139,14 @@ async def _run_mutation(
 def _validate_active_owner(
     profile_name: str,
     connection_id: str,
-    target_profile: str | None = None,
+    target_profile: str,
 ) -> tuple[str, str]:
     profile = SERVICE.validate_owner_field(profile_name, field_name="profile_name")
     connection = SERVICE.validate_owner_field(connection_id, field_name="connection_id")
     active_profile = SERVICE.active_profile_name()
     if connection != "local" or active_profile is None or profile != active_profile:
         raise ValueError("Session owner is not registered to this backend.")
-    target = SERVICE.validate_owner_field(target_profile or profile, field_name="target_profile")
+    target = SERVICE.validate_owner_field(target_profile, field_name="target_profile")
     if target != active_profile:
         raise ValueError("Target profile is not registered to this backend.")
     return profile, connection
@@ -361,9 +353,9 @@ async def issue_links(issue_id: str) -> dict[str, Any]:
 async def unlink_session(
     issue_id: str,
     session_id: str,
-    connection_id: str = "local",
-    profile_name: str = "default",
-    target_profile: str | None = None,
+    connection_id: str,
+    profile_name: str,
+    target_profile: str,
 ) -> dict[str, bool]:
     try:
         profile_name, connection_id = _validate_active_owner(
@@ -372,7 +364,7 @@ async def unlink_session(
             target_profile,
         )
         target_profile = SERVICE.validate_owner_field(
-            target_profile or profile_name,
+            target_profile,
             field_name="target_profile",
         )
         client = _client()
@@ -399,7 +391,7 @@ async def link_session(payload: SessionLinkRequest) -> dict[str, Any]:
             payload.target_profile,
         )
         target_profile = SERVICE.validate_owner_field(
-            payload.target_profile or profile_name,
+            payload.target_profile,
             field_name="target_profile",
         )
         store = _store()
