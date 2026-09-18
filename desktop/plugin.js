@@ -214,11 +214,11 @@ function readFocusedSessionOwner() {
       || host.activeConnectionId?.()
       || 'local'
   ).trim() || 'local'
-  const profileName = String(
-    host.state?.focusedSessionProfile?.get?.()
-      || host.state?.profile?.get?.()
-      || 'default'
-  ).trim() || 'default'
+  const ambientProfileName = String(host.state?.profile?.get?.() || '').trim()
+  const focusedProfileName = String(host.state?.focusedSessionProfile?.get?.() || '').trim()
+  if (!ambientProfileName) return null
+  if (focusedProfileName && focusedProfileName !== ambientProfileName) return null
+  const profileName = focusedProfileName || ambientProfileName
   return { connectionId, profileName, targetProfile: profileName }
 }
 
@@ -268,14 +268,15 @@ async function resolveSessionRoute(value, options = {}) {
   const matchTarget = options.matchTarget !== false
   if (typeof host.profileRoutes !== 'function') throw new Error('Hermes Desktop connection routing is unavailable.')
   const routes = await host.profileRoutes()
-  const route = (Array.isArray(routes) ? routes : []).find(candidate => {
+  const matches = (Array.isArray(routes) ? routes : []).filter(candidate => {
     const candidateOwner = ownerFromRoute(candidate)
     return candidateOwner.connectionId === owner.connectionId
       && candidateOwner.profileName === owner.profileName
       && (!matchTarget || candidateOwner.targetProfile === owner.targetProfile)
   })
-  if (!route) throw new Error(`The connection/profile owner ${owner.connectionId}::${owner.profileName} is unavailable.`)
-  return route
+  if (matches.length === 0) throw new Error(`The connection/profile owner ${owner.connectionId}::${owner.profileName} is unavailable.`)
+  if (matches.length > 1) throw new Error(`The connection/profile owner ${owner.connectionId}::${owner.profileName} is ambiguous.`)
+  return matches[0]
 }
 
 async function resolveFocusedSessionRoute() {
@@ -487,17 +488,29 @@ function linkAvailability(link) {
 
 function filterDetachedLinks(issueKey, links, backendDetached = []) {
   const detached = mergeBackendDetachedLinks(issueKey, backendDetached)
-  return (Array.isArray(links) ? links : []).filter(link => {
+  const candidates = Array.isArray(links) ? links : []
+  const legacyLocalDetachIds = new Set()
+  for (const link of candidates) {
     const sessionId = String(link?.session_id || '').trim()
-    const identity = sessionLinkIdentity(link)
-    const legacyLocalDetach = detached.has(sessionId)
-    if (legacyLocalDetach && pluginContext) {
+    if (sessionId && detached.has(sessionId)) legacyLocalDetachIds.add(sessionId)
+  }
+  if (legacyLocalDetachIds.size > 0) {
+    for (const link of candidates) {
+      const sessionId = String(link?.session_id || '').trim()
+      if (!legacyLocalDetachIds.has(sessionId)) continue
       detached.delete(sessionId)
-      detached.add(identity)
+      detached.add(sessionLinkIdentity(link))
+    }
+    if (pluginContext) {
       const current = pluginContext.storage.get(DETACHED_CHAT_LINKS_KEY, {}) || {}
       current[String(issueKey).toUpperCase()] = [...detached]
       pluginContext.storage.set(DETACHED_CHAT_LINKS_KEY, current)
     }
+  }
+  return candidates.filter(link => {
+    const sessionId = String(link?.session_id || '').trim()
+    const identity = sessionLinkIdentity(link)
+    const legacyLocalDetach = legacyLocalDetachIds.has(sessionId)
     return !link?.detached && !link?.is_detached && !link?.tombstone && !link?.deleted
       && !link?.detached_at && !link?.deleted_at && !detached.has(identity) && !legacyLocalDetach
   }).map(linkAvailability)
@@ -1616,7 +1629,7 @@ function IssueDetail({ issue, status, projects, mapping, links, baseRef, onOpenI
     let linked = false
     let ownerRoute = null
     try {
-      ownerRoute = await resolveSessionRoute(readFocusedSessionOwner())
+      ownerRoute = await resolveFocusedSessionRoute()
       const owner = ownerFromRoute(ownerRoute)
       worktree = linkedWorktree?.path
         ? {
@@ -1713,10 +1726,8 @@ function IssueDetail({ issue, status, projects, mapping, links, baseRef, onOpenI
         try {
           if (ownerRoute && typeof host.requestProfile === 'function') {
             await host.requestProfile(ownerRoute, 'session.delete', { session_id: storedId })
-          } else {
-            await host.request('session.delete', { session_id: storedId })
+            storedId = ''
           }
-          storedId = ''
         } catch {
           // Keep the session if Hermes refuses cleanup; it still points at the worktree.
         }

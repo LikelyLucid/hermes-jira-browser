@@ -376,6 +376,47 @@ class DesktopPluginTests(unittest.TestCase):
         self.assertIn("if (!owner) throw new Error('The focused chat owner is ambiguous or unavailable.')", source)
         self.assertIn("if (!link?.connection_id || !link?.profile_name) return null", source)
 
+    def test_focused_profile_fallback_is_ambient_verified_and_fail_closed(self):
+        source = PLUGIN.read_text(encoding="utf-8")
+        focused_owner = source[source.index("function readFocusedSessionOwner"):source.index("function ownerFromLink")]
+
+        self.assertIn("const ambientProfileName", focused_owner)
+        self.assertIn("const focusedProfileName", focused_owner)
+        self.assertIn("focusedProfileName && focusedProfileName !== ambientProfileName", focused_owner)
+        self.assertIn("if (!ambientProfileName) return null", focused_owner)
+        self.assertNotIn("|| 'default'\n  ).trim() || 'default'\n  return { connectionId, profileName, targetProfile: profileName }", focused_owner)
+
+    def test_owner_route_resolution_rejects_ambiguous_same_owner_routes(self):
+        source = PLUGIN.read_text(encoding="utf-8")
+        resolver = source[source.index("async function resolveSessionRoute"):source.index("async function resolveFocusedSessionRoute")]
+
+        self.assertIn("const matches = (Array.isArray(routes) ? routes : []).filter", resolver)
+        self.assertIn("if (matches.length > 1) throw new Error", resolver)
+        self.assertNotIn(").find(candidate =>", resolver)
+
+    def test_raw_legacy_detach_tombstones_suppress_all_owner_qualified_matches(self):
+        source = PLUGIN.read_text(encoding="utf-8")
+        filtering = source[source.index("function filterDetachedLinks"):source.index("function clampDrawerWidth")]
+
+        self.assertIn("const legacyLocalDetachIds = new Set", filtering)
+        self.assertIn("legacyLocalDetachIds.add(sessionId)", filtering)
+        self.assertIn("!legacyLocalDetachIds.has(sessionId)", filtering)
+        self.assertLess(filtering.index("legacyLocalDetachIds.add(sessionId)"), filtering.index(".filter(link =>"))
+
+    def test_new_chat_uses_focused_route_without_target_profile_match(self):
+        source = PLUGIN.read_text(encoding="utf-8")
+        start_work = source[source.index("const startWork = useCallback"):source.index("if (!issue) return")]
+
+        self.assertIn("ownerRoute = await resolveFocusedSessionRoute()", start_work)
+        self.assertNotIn("resolveSessionRoute(readFocusedSessionOwner())", start_work)
+
+    def test_start_work_cleanup_never_uses_ambient_session_delete(self):
+        source = PLUGIN.read_text(encoding="utf-8")
+        start_work = source[source.index("const startWork = useCallback"):source.index("if (!issue) return")]
+
+        self.assertIn("host.requestProfile(ownerRoute, 'session.delete'", start_work)
+        self.assertNotIn("host.request('session.delete'", start_work)
+
     def test_ownerless_links_and_legacy_detach_tombstones_fail_closed(self):
         source = PLUGIN.read_text(encoding="utf-8")
 
@@ -385,7 +426,7 @@ class DesktopPluginTests(unittest.TestCase):
         detach = source[source.index("function writeChatDetached"):source.index("function mergeBackendDetachedLinks")]
         self.assertIn("ids.delete(sessionId)", detach)
         filtering = source[source.index("function filterDetachedLinks"):source.index("function clampDrawerWidth")]
-        self.assertIn("const legacyLocalDetach = detached.has(sessionId)", filtering)
+        self.assertIn("const legacyLocalDetach = legacyLocalDetachIds.has(sessionId)", filtering)
 
     def test_ambient_owner_route_matches_the_full_active_route_tuple(self):
         source = PLUGIN.read_text(encoding="utf-8")
