@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
+import stat
 import subprocess
 import sys
 import tempfile
@@ -44,6 +45,7 @@ class JiraConfigTests(unittest.TestCase):
                 ),
                 encoding="utf-8",
             )
+            config_path.chmod(0o600)
 
             config = jira_service.load_jira_config(config_path)
             status = jira_service.config_status(config_path)
@@ -63,6 +65,7 @@ class JiraConfigTests(unittest.TestCase):
                 json.dumps({"baseUrl": "https://example.atlassian.net", "email": "dev@example.com"}),
                 encoding="utf-8",
             )
+            path.chmod(0o600)
             with mock.patch.dict(os.environ, {"JIRA_API_TOKEN": "from-env"}, clear=False):
                 config = jira_service.load_jira_config(path)
             self.assertEqual(config.api_token, "from-env")
@@ -82,6 +85,25 @@ class JiraConfigTests(unittest.TestCase):
                 config = jira_service.load_jira_config(missing_path)
             self.assertEqual(config.base_url, "https://jira.example.invalid")
 
+    def test_accepts_only_clean_https_origins(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "config.json"
+            valid = {"baseUrl": "https://jira.example.invalid///", "email": "dev@example.com", "token": "secret"}
+            path.write_text(json.dumps(valid), encoding="utf-8")
+            path.chmod(0o600)
+            self.assertEqual(jira_service.load_jira_config(path).base_url, "https://jira.example.invalid")
+
+            for base_url in (
+                "https://jira.example.invalid/path",
+                "https://user:pass@jira.example.invalid",
+                "https://jira.example.invalid?token=leak",
+                "https://jira.example.invalid#fragment",
+                "https:///missing-host",
+            ):
+                path.write_text(json.dumps({**valid, "baseUrl": base_url}), encoding="utf-8")
+                with self.assertRaisesRegex(ValueError, "origin"):
+                    jira_service.load_jira_config(path)
+
     def test_rejects_plaintext_jira_url(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "config.json"
@@ -89,13 +111,27 @@ class JiraConfigTests(unittest.TestCase):
                 json.dumps({"baseUrl": "http://jira.example.com", "email": "dev@example.com", "token": "secret"}),
                 encoding="utf-8",
             )
+            path.chmod(0o600)
             with self.assertRaisesRegex(ValueError, "https"):
+                jira_service.load_jira_config(path)
+
+    def test_rejects_group_or_other_readable_credential_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "config.json"
+            path.write_text(
+                json.dumps({"baseUrl": "https://jira.example.invalid", "email": "dev@example.com", "token": "secret"}),
+                encoding="utf-8",
+            )
+            path.chmod(0o644)
+
+            with self.assertRaisesRegex(ValueError, "permissions"):
                 jira_service.load_jira_config(path)
 
     def test_rejects_incomplete_config(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "config.json"
             path.write_text(json.dumps({"baseUrl": "https://example.invalid"}), encoding="utf-8")
+            path.chmod(0o600)
             with self.assertRaisesRegex(ValueError, "email"):
                 jira_service.load_jira_config(path)
 
@@ -121,6 +157,49 @@ class JiraNormalisationTests(unittest.TestCase):
         }
 
         self.assertEqual(jira_service.adf_to_text(value), "First\n\n• Second")
+
+    def test_adf_traversal_stops_at_depth_node_and_output_limits(self):
+        value = {"type": "doc", "content": [{"type": "text", "text": "x"}] * 20}
+        for _ in range(10):
+            value = {"type": "paragraph", "content": [value]}
+
+        with mock.patch.multiple(
+            jira_service,
+            MAX_ADF_DEPTH=4,
+            MAX_ADF_NODES=5,
+            MAX_ADF_OUTPUT_CHARS=12,
+        ):
+            result = jira_service.adf_to_text(value)
+
+        self.assertLessEqual(len(result), 12)
+
+    def test_attachment_reference_traversal_stops_at_depth_and_node_limits(self):
+        value = {
+            "type": "inlineCard",
+            "attrs": {"url": "https://jira.example.invalid/rest/api/3/attachment/content/7001"},
+        }
+        for _ in range(10):
+            value = {"type": "paragraph", "content": [value]}
+
+        with mock.patch.multiple(jira_service, MAX_ADF_DEPTH=4, MAX_ADF_NODES=5):
+            attachment_ids, filenames = jira_service._adf_attachment_references(value)
+
+        self.assertEqual(attachment_ids, set())
+        self.assertEqual(filenames, set())
+
+    def test_malformed_attachment_size_does_not_abort_issue_normalisation(self):
+        payload = {
+            "id": "10001",
+            "key": "DEMO-42",
+            "fields": {
+                "summary": "Malformed attachment",
+                "attachment": [{"id": "7001", "filename": "bad.bin", "size": "not-a-size"}],
+            },
+        }
+
+        result = jira_service._normalise_issue(payload, detail=True)
+
+        self.assertEqual(result["attachments"][0]["size"], 0)
 
     def test_normalises_search_issues(self):
         payload = {
@@ -294,6 +373,28 @@ class WorktreeTests(unittest.TestCase):
             self.assertEqual(worktree.parent, root / ".worktrees")
             self.assertIn("locked", git(root, "worktree", "list", "--porcelain"))
 
+    def test_existing_branch_attached_to_new_worktree_is_not_created(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "repo"
+            root.mkdir()
+            git(root, "init", "-q", "-b", "main")
+            git(root, "config", "user.name", "Test User")
+            git(root, "config", "user.email", "test@example.com")
+            (root / "README.md").write_text("seed\\n", encoding="utf-8")
+            git(root, "add", "README.md")
+            git(root, "commit", "-qm", "seed")
+            git(root, "branch", "jira/DEMO-77")
+
+            result = jira_service.create_worktree(
+                repo_path=root,
+                issue_key="DEMO-77",
+                summary="Existing branch",
+            )
+
+            self.assertFalse(result["created"])
+            self.assertTrue((root / ".worktrees" / "jira-DEMO-77").is_dir())
+            self.assertEqual(git(root / ".worktrees" / "jira-DEMO-77", "branch", "--show-current"), "jira/DEMO-77")
+
     def test_rejects_option_like_base_ref_and_disables_checkout_hooks(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "repo"
@@ -321,6 +422,18 @@ class WorktreeTests(unittest.TestCase):
 
 
 class StoreTests(unittest.TestCase):
+    def test_store_hardens_existing_directory_and_database_permissions(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp) / "jira-browser"
+            directory.mkdir(mode=0o755)
+            database = directory / "state.sqlite3"
+            database.touch(mode=0o644)
+
+            jira_service.JiraStore(database)
+
+            self.assertEqual(stat.S_IMODE(directory.stat().st_mode), 0o700)
+            self.assertEqual(stat.S_IMODE(database.stat().st_mode), 0o600)
+
     def test_maps_project_and_links_chat_and_worktree(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = jira_service.JiraStore(Path(tmp) / "jira.sqlite3")

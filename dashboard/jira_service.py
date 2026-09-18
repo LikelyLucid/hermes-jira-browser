@@ -11,6 +11,7 @@ import json
 import os
 import re
 import sqlite3
+import stat
 import subprocess
 import tempfile
 import threading
@@ -20,7 +21,7 @@ import urllib.request
 from collections.abc import Mapping
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, NamedTuple
+from typing import Any, NamedTuple, cast
 
 from hermes_cli._subprocess_compat import noninteractive_git_env
 from hermes_cli.worktree_ops import _ensure_worktrees_gitignored
@@ -35,6 +36,9 @@ DETAIL_FIELDS = f"{SEARCH_FIELDS},parent,subtasks,fixVersions,components,attachm
 MAX_JIRA_JSON_BYTES = 16 * 1024 * 1024
 MAX_ATTACHMENT_PREVIEW_BYTES = 4 * 1024 * 1024
 MAX_ISSUE_COMMENTS = 1_000
+MAX_ADF_DEPTH = 64
+MAX_ADF_NODES = 10_000
+MAX_ADF_OUTPUT_CHARS = 100_000
 SAFE_ATTACHMENT_PREVIEW_TYPES = frozenset({
     "image/avif",
     "image/bmp",
@@ -83,8 +87,50 @@ def default_config_path() -> Path:
     return Path.home() / "jira-config" / "config.json"
 
 
+def _validate_jira_config_file(path: Path) -> None:
+    try:
+        metadata = path.stat()
+    except OSError as exc:
+        raise ValueError(f"Jira config at {path} cannot be inspected safely.") from exc
+    getuid = getattr(os, "getuid", None)
+    if getuid is None:
+        return
+    if stat.S_IMODE(metadata.st_mode) & 0o077:
+        raise ValueError("Jira config file permissions must be owner-only.")
+    if hasattr(metadata, "st_uid") and metadata.st_uid != getuid():
+        raise ValueError("Jira config file must be owned by the current user.")
+
+
+def _clean_jira_base_url(value: str) -> str:
+    base_url = value.strip()
+    if not base_url:
+        return ""
+    if "://" not in base_url:
+        base_url = f"https://{base_url}"
+    try:
+        parsed = urllib.parse.urlsplit(base_url)
+        hostname = parsed.hostname
+        parsed.port
+    except ValueError as exc:
+        raise ValueError("Jira baseUrl must be a clean https:// origin with a hostname.") from exc
+    if (
+        parsed.scheme.casefold() != "https"
+        or not hostname
+        or parsed.username is not None
+        or parsed.password is not None
+        or "@" in parsed.netloc
+        or parsed.query
+        or parsed.fragment
+        or parsed.path.strip("/")
+    ):
+        raise ValueError("Jira baseUrl must be a clean https:// origin with a hostname.")
+    return f"https://{parsed.netloc}".rstrip("/")
+
+
 def load_jira_config(path: str | Path | None = None) -> JiraConfig:
     config_path = Path(path).expanduser() if path is not None else default_config_path()
+    if config_path.exists():
+        _validate_jira_config_file(config_path)
     try:
         raw = json.loads(config_path.read_text(encoding="utf-8"))
     except FileNotFoundError:
@@ -94,16 +140,14 @@ def load_jira_config(path: str | Path | None = None) -> JiraConfig:
     if not isinstance(raw, Mapping):
         raise ValueError("Jira config must be a JSON object.")
 
-    base_url = str(os.environ.get("JIRA_BASE_URL") or os.environ.get("JIRA_SITE") or raw.get("baseUrl") or "").strip().rstrip("/")
-    if base_url and "://" not in base_url:
-        base_url = f"https://{base_url}"
+    base_url = _clean_jira_base_url(
+        str(os.environ.get("JIRA_BASE_URL") or os.environ.get("JIRA_SITE") or raw.get("baseUrl") or "")
+    )
     email = str(os.environ.get("JIRA_EMAIL") or raw.get("email") or "").strip()
     api_token = str(os.environ.get("JIRA_API_TOKEN") or raw.get("token") or raw.get("apiToken") or "").strip()
     missing = [name for name, value in (("baseUrl", base_url), ("email", email), ("token", api_token)) if not value]
     if missing:
         raise ValueError(f"Jira config is missing: {', '.join(missing)}.")
-    if not base_url.startswith("https://"):
-        raise ValueError("Jira baseUrl must use https:// so credentials are not sent in plaintext.")
     return JiraConfig(base_url=base_url, email=email, api_token=api_token)
 
 
@@ -128,9 +172,26 @@ def config_status(path: str | Path | None = None) -> dict[str, Any]:
     }
 
 
-def _flatten_adf(node: Any, *, list_depth: int = 0) -> str:
+def _append_adf_output(current: str, addition: str) -> str:
+    remaining = MAX_ADF_OUTPUT_CHARS - len(current)
+    if remaining <= 0:
+        return current
+    return current + addition[:remaining]
+
+
+def _flatten_adf(
+    node: Any,
+    *,
+    list_depth: int = 0,
+    _depth: int = 0,
+    _state: dict[str, int] | None = None,
+) -> str:
+    state = _state if _state is not None else {"nodes": 0}
+    if _depth >= MAX_ADF_DEPTH or state["nodes"] >= MAX_ADF_NODES:
+        return ""
+    state["nodes"] += 1
     if isinstance(node, str):
-        return node
+        return node[:MAX_ADF_OUTPUT_CHARS]
     if not isinstance(node, Mapping):
         return ""
     node_type = str(node.get("type") or "")
@@ -147,37 +208,60 @@ def _flatten_adf(node: Any, *, list_depth: int = 0) -> str:
             ),
             None,
         )
-        return f"{text} ({link})" if link and link not in text else text
+        return (f"{text} ({link})" if link and link not in text else text)[:MAX_ADF_OUTPUT_CHARS]
     if node_type == "hardBreak":
         return "\n"
 
     children = node.get("content") if isinstance(node.get("content"), list) else []
     if node_type in {"bulletList", "orderedList"}:
-        lines: list[str] = []
+        output = ""
         for index, child in enumerate(children, start=1):
-            value = _flatten_adf(child, list_depth=list_depth + 1).strip()
+            if state["nodes"] >= MAX_ADF_NODES:
+                break
+            value = _flatten_adf(child, list_depth=list_depth + 1, _depth=_depth + 1, _state=state).strip()
             marker = f"{index}." if node_type == "orderedList" else "•"
             if value:
-                lines.append(f"{'  ' * list_depth}{marker} {value}")
-        return "\n".join(lines)
+                output = _append_adf_output(output, f"{'  ' * list_depth}{marker} {value}\n")
+            if len(output) >= MAX_ADF_OUTPUT_CHARS:
+                break
+        return output.rstrip("\n")
     if node_type == "listItem":
-        return " ".join(filter(None, (_flatten_adf(child, list_depth=list_depth).strip() for child in children)))
+        output = ""
+        for child in children:
+            if state["nodes"] >= MAX_ADF_NODES:
+                break
+            output = _append_adf_output(
+                output,
+                _flatten_adf(child, list_depth=list_depth, _depth=_depth + 1, _state=state).strip() + " ",
+            )
+            if len(output) >= MAX_ADF_OUTPUT_CHARS:
+                break
+        return output.strip()
 
-    text = "".join(_flatten_adf(child, list_depth=list_depth) for child in children)
+    output = ""
+    for child in children:
+        if state["nodes"] >= MAX_ADF_NODES:
+            break
+        output = _append_adf_output(
+            output,
+            _flatten_adf(child, list_depth=list_depth, _depth=_depth + 1, _state=state),
+        )
+        if len(output) >= MAX_ADF_OUTPUT_CHARS:
+            break
     if node_type in {"paragraph", "heading", "blockquote", "codeBlock", "panel"}:
-        return text.strip() + "\n\n"
-    return text
+        return (output.strip() + "\n\n")[:MAX_ADF_OUTPUT_CHARS]
+    return output
 
 
 def adf_to_text(value: Any) -> str:
     if value is None:
         return ""
     if isinstance(value, str):
-        return value.strip()
+        return value.strip()[:MAX_ADF_OUTPUT_CHARS]
     text = _flatten_adf(value)
     text = re.sub(r"[ \t]+\n", "\n", text)
     text = re.sub(r"\n{3,}", "\n\n", text)
-    return text.strip()
+    return text.strip()[:MAX_ADF_OUTPUT_CHARS]
 
 
 def _name(value: Any, key: str = "name") -> str | None:
@@ -186,11 +270,15 @@ def _name(value: Any, key: str = "name") -> str | None:
 
 def _normalise_attachment(attachment: Mapping[str, Any]) -> dict[str, Any]:
     mime_type = str(attachment.get("mimeType") or "application/octet-stream").strip().lower()
+    try:
+        size = max(0, int(attachment.get("size") or 0))
+    except (TypeError, ValueError):
+        size = 0
     return {
         "id": str(attachment.get("id") or ""),
         "filename": str(attachment.get("filename") or "Attachment"),
         "mime_type": mime_type,
-        "size": max(0, int(attachment.get("size") or 0)),
+        "size": size,
         "created": attachment.get("created"),
         "author": _name(attachment.get("author"), "displayName"),
         "is_image": mime_type.startswith("image/"),
@@ -200,36 +288,58 @@ def _normalise_attachment(attachment: Mapping[str, Any]) -> dict[str, Any]:
 def _adf_attachment_references(node: Any) -> tuple[set[str], set[str]]:
     ids: set[str] = set()
     filenames: set[str] = set()
+    state = {"nodes": 0, "output": 0}
 
-    def visit(value: Any) -> None:
+    def add_reference(target: set[str], value: str) -> None:
+        remaining = MAX_ADF_OUTPUT_CHARS - state["output"]
+        if remaining <= 0:
+            return
+        bounded = value[:remaining]
+        if bounded:
+            target.add(bounded)
+            state["output"] += len(bounded)
+
+    def visit(value: Any, depth: int) -> None:
+        if depth >= MAX_ADF_DEPTH or state["nodes"] >= MAX_ADF_NODES:
+            return
+        state["nodes"] += 1
         if isinstance(value, list):
             for child in value:
-                visit(child)
+                if state["nodes"] >= MAX_ADF_NODES:
+                    break
+                visit(child, depth + 1)
             return
         if not isinstance(value, Mapping):
             return
         node_type = str(value.get("type") or "")
-        attrs = value.get("attrs") if isinstance(value.get("attrs"), Mapping) else {}
+        attrs_value = value.get("attrs")
+        attrs: Mapping[str, Any] = cast(Mapping[str, Any], attrs_value) if isinstance(attrs_value, Mapping) else {}
         if node_type == "media":
             filename = str(attrs.get("alt") or "").strip().casefold()
             if filename:
-                filenames.add(filename)
+                add_reference(filenames, filename)
         urls: list[str] = []
-        if node_type in {"inlineCard", "blockCard"} and attrs.get("url"):
-            urls.append(str(attrs["url"]))
+        url = attrs.get("url")
+        if node_type in {"inlineCard", "blockCard"} and url:
+            urls.append(str(url)[:MAX_ADF_OUTPUT_CHARS])
         if node_type == "text":
             for mark in value.get("marks") if isinstance(value.get("marks"), list) else []:
-                mark_attrs = mark.get("attrs") if isinstance(mark, Mapping) and isinstance(mark.get("attrs"), Mapping) else {}
-                if mark.get("type") == "link" and mark_attrs.get("href"):
-                    urls.append(str(mark_attrs["href"]))
+                if not isinstance(mark, Mapping):
+                    continue
+                mark_attrs = mark.get("attrs") if isinstance(mark.get("attrs"), Mapping) else {}
+                href = mark_attrs.get("href")
+                if mark.get("type") == "link" and href:
+                    urls.append(str(href)[:MAX_ADF_OUTPUT_CHARS])
         for url in urls:
             match = re.search(r"/attachment/(?:content/)?(\d+)(?:/|$|[?#])", url)
             if match:
-                ids.add(match.group(1))
+                add_reference(ids, match.group(1))
         for child in value.get("content") if isinstance(value.get("content"), list) else []:
-            visit(child)
+            if state["nodes"] >= MAX_ADF_NODES:
+                break
+            visit(child, depth + 1)
 
-    visit(node)
+    visit(node, 0)
     return ids, filenames
 
 
@@ -802,7 +912,7 @@ def create_worktree(
             raise RuntimeError("Git created the worktree on an unexpected branch.")
         _lock_git_worktree(repo, worktree, issue_key)
         return {
-            "created": True,
+            "created": not branch_exists,
             "path": str(worktree),
             "branch": branch,
             "repo_path": str(repo),
@@ -836,10 +946,18 @@ class JiraStore:
     def __init__(self, path: str | Path):
         self.path = Path(path).expanduser()
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._harden_storage()
         self._migrate()
 
+    def _harden_storage(self) -> None:
+        os.chmod(self.path.parent, 0o700)
+        if self.path.exists():
+            os.chmod(self.path, 0o600)
+
     def _connect(self) -> sqlite3.Connection:
+        self._harden_storage()
         connection = sqlite3.connect(self.path)
+        self._harden_storage()
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA foreign_keys = ON")
         return connection
