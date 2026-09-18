@@ -27,7 +27,7 @@ from typing import Any, NamedTuple, cast
 
 from hermes_cli._subprocess_compat import noninteractive_git_env
 from hermes_cli.worktree_ops import _ensure_worktrees_gitignored
-from hermes_constants import get_hermes_home
+from hermes_constants import get_hermes_home, profile_name_for_home
 
 
 SEARCH_FIELDS = (
@@ -84,6 +84,21 @@ class JiraConfig(NamedTuple):
     base_url: str
     email: str
     api_token: str
+
+
+def active_profile_name() -> str | None:
+    """Return the profile owning the active backend home when it is discoverable."""
+    return profile_name_for_home(get_hermes_home())
+
+
+def validate_owner_field(value: Any, *, field_name: str) -> str:
+    """Normalize bounded owner metadata without pretending connection IDs are identities."""
+    if not isinstance(value, str):
+        raise ValueError(f"{field_name} must be a string.")
+    normalized = value.strip()
+    if not normalized or len(normalized) > 200 or any(character.isspace() for character in normalized):
+        raise ValueError(f"{field_name} must be 1-200 non-whitespace characters.")
+    return normalized
 
 
 def default_config_path() -> Path:
@@ -1378,6 +1393,18 @@ class JiraStore:
                 retention_days=MUTATION_RECEIPT_RETENTION_DAYS,
             )
 
+    def claim_legacy_origin(self, configured_origin: str) -> int:
+        """Claim only unqualified legacy rows; later config changes cannot re-home them."""
+        origin = configured_origin.strip().rstrip("/")
+        if not origin:
+            raise ValueError("Jira origin is required to claim legacy links.")
+        with self._connect() as db:
+            cursor = db.execute(
+                "UPDATE session_links SET jira_origin = ? WHERE jira_origin = ''",
+                (origin,),
+            )
+        return cursor.rowcount
+
     @staticmethod
     def _create_session_links_table(db: sqlite3.Connection) -> None:
         db.execute(
@@ -1656,11 +1683,13 @@ class JiraStore:
         return dict(row) if row else {}
 
     def links_for_issue(self, issue_id: str, *, jira_origin: str | None = None) -> list[dict[str, Any]]:
+        origin = jira_origin.strip().rstrip("/") if jira_origin is not None else ""
+        if not origin:
+            raise ValueError("Jira origin is required for link reads.")
         clauses = ["issue_id = ?", "detached = 0"]
         params: list[Any] = [issue_id.strip()]
-        if jira_origin is not None:
-            clauses.append("jira_origin = ?")
-            params.append(jira_origin.strip().rstrip("/"))
+        clauses.append("jira_origin = ?")
+        params.append(origin)
         with self._connect() as db:
             rows = db.execute(
                 f"SELECT * FROM session_links WHERE {' AND '.join(clauses)} ORDER BY created_at DESC",
@@ -1676,6 +1705,9 @@ class JiraStore:
         connection_id: str = "local",
         profile_name: str = "default",
     ) -> set[str]:
+        origin = jira_origin.strip().rstrip("/")
+        if not origin:
+            raise ValueError("Jira origin is required for link reads.")
         with self._connect() as db:
             rows = db.execute(
                 """
@@ -1685,7 +1717,7 @@ class JiraStore:
                 """,
                 (
                     issue_id.strip(),
-                    jira_origin.strip().rstrip("/"),
+                    origin,
                     connection_id.strip() or "local",
                     profile_name.strip() or "default",
                 ),
@@ -1698,11 +1730,13 @@ class JiraStore:
         *,
         jira_origin: str | None = None,
     ) -> list[dict[str, Any]]:
+        origin = jira_origin.strip().rstrip("/") if jira_origin is not None else ""
+        if not origin:
+            raise ValueError("Jira origin is required for link reads.")
         clauses = ["issue_id = ?", "detached = 1"]
         params: list[Any] = [issue_id.strip()]
-        if jira_origin is not None:
-            clauses.append("jira_origin = ?")
-            params.append(jira_origin.strip().rstrip("/"))
+        clauses.append("jira_origin = ?")
+        params.append(origin)
         with self._connect() as db:
             rows = db.execute(
                 f"SELECT * FROM session_links WHERE {' AND '.join(clauses)} ORDER BY created_at DESC",

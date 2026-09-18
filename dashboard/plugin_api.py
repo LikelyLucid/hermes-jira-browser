@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any
 
 from fastapi import APIRouter, HTTPException
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 
 _SERVICE_PATH = Path(__file__).with_name("jira_service.py")
@@ -47,7 +47,20 @@ class SessionLinkRequest(BaseModel):
     session_id: str = Field(min_length=1)
     connection_id: str = Field(default="local", min_length=1, max_length=200)
     profile_name: str = Field(default="default", min_length=1, max_length=200)
-    target_profile: str = Field(default="default", min_length=1, max_length=200)
+    target_profile: str | None = Field(default=None, min_length=1, max_length=200)
+
+    @field_validator("connection_id", "profile_name", "target_profile", mode="before")
+    @classmethod
+    def _validate_owner_field(cls, value: Any, info):
+        if value is None and info.field_name == "target_profile":
+            return None
+        return SERVICE.validate_owner_field(value, field_name=info.field_name)
+
+    @model_validator(mode="after")
+    def _default_target_profile(self):
+        if self.target_profile is None:
+            self.target_profile = self.profile_name
+        return self
 
 
 class CommentRequest(BaseModel):
@@ -77,7 +90,12 @@ class TransitionRequest(BaseModel):
 
 
 def _store():
-    return SERVICE.JiraStore(SERVICE.default_store_path())
+    # Legacy rows have no Jira origin. Claim them once against the loaded config;
+    # connection_id is renderer routing metadata, not a backend identity registry.
+    config = SERVICE.load_jira_config()
+    store = SERVICE.JiraStore(SERVICE.default_store_path())
+    store.claim_legacy_origin(config.base_url)
+    return store
 
 
 def _client():
@@ -126,6 +144,15 @@ async def _run_mutation(
         raise
     await asyncio.to_thread(store.complete_mutation, idempotency_key, result)
     return result
+
+
+def _validate_active_owner(profile_name: str, connection_id: str) -> str:
+    profile = SERVICE.validate_owner_field(profile_name, field_name="profile_name")
+    SERVICE.validate_owner_field(connection_id, field_name="connection_id")
+    active = SERVICE.active_profile_name()
+    if active is not None and profile != active:
+        raise ValueError(f"profile_name must identify the active profile ({active}).")
+    return profile
 
 
 @router.get("/status")
@@ -333,6 +360,7 @@ async def unlink_session(
     profile_name: str = "default",
 ) -> dict[str, bool]:
     try:
+        _validate_active_owner(profile_name, connection_id)
         client = _client()
         unlinked = await asyncio.to_thread(
             _store().unlink_session,
@@ -350,6 +378,7 @@ async def unlink_session(
 @router.post("/links")
 async def link_session(payload: SessionLinkRequest) -> dict[str, Any]:
     try:
+        _validate_active_owner(payload.profile_name, payload.connection_id)
         store = _store()
         client = _client()
         issue = await asyncio.to_thread(client.issue, payload.issue_key)
