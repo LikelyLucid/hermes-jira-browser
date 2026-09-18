@@ -82,7 +82,8 @@ def tracked_files(root: Path = ROOT) -> list[Path]:
 
 
 def is_placeholder_email(address: str) -> bool:
-    return address.rsplit("@", 1)[1].lower() in PLACEHOLDER_DOMAINS
+    domain = address.rsplit("@", 1)[1].lower()
+    return any(domain == placeholder or domain.endswith(f".{placeholder}") for placeholder in PLACEHOLDER_DOMAINS)
 
 
 def is_placeholder_secret(value: str) -> bool:

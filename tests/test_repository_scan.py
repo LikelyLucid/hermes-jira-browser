@@ -64,6 +64,9 @@ class RepositoryScannerTests(unittest.TestCase):
         self.assertNotIn(email, report)
         self.assertNotIn(secret, report)
 
+    def test_example_subdomains_are_safe_placeholders(self) -> None:
+        self.assertEqual(scan.scan_text("https://user:pass@jira.example.invalid/path\n"), [])
+
     def test_skips_symlinks_resolved_outside_root(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory) / "root"
