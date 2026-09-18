@@ -210,8 +210,41 @@ class DesktopPluginTests(unittest.TestCase):
         self.assertIn("data: { path: ROUTE }", source)
         self.assertIn("render: () => jsx(JiraPage, {})", source)
         self.assertIn("run: () => host.navigate(ROUTE)", source)
-        self.assertNotIn("host.openWorkspace", source)
-        self.assertNotIn("area: 'panes'", source)
+
+    def test_exact_ticket_links_round_trip_through_the_hash_route(self):
+        source = PLUGIN.read_text(encoding="utf-8")
+
+        self.assertIn("const ISSUE_QUERY_PARAM = 'issue'", source)
+        self.assertIn("const ISSUE_KEY_PATTERN = /^[A-Z][A-Z0-9]+-\\d+$/", source)
+        self.assertIn("function issueKeyFromHash", source)
+        self.assertIn("window.addEventListener('hashchange', syncFromHash)", source)
+        self.assertIn("params.delete(ISSUE_QUERY_PARAM)", source)
+        self.assertIn("host.navigate(jiraRoute(key))", source)
+        self.assertIn("const key = normaliseIssueKey(issueKey)", source)
+
+    def test_ticket_companion_is_opt_in_deduplicated_and_read_only(self):
+        source = PLUGIN.read_text(encoding="utf-8")
+
+        self.assertIn("const companionDisposers = useRef(new Map())", source)
+        self.assertIn("typeof host.openWorkspace !== 'function'", source)
+        self.assertIn("const companionId = `${ID}:ticket:${issue.key}`", source)
+        self.assertIn("const disposer = host.openWorkspace(companionId", source)
+        self.assertIn("companionDisposers.current.set(companionId, disposer)", source)
+        self.assertIn("readOnly: true", source)
+        self.assertIn("Pin beside chat", source)
+        self.assertIn("host.navigate('/')", source)
+        self.assertIn("host.notify({ kind: 'warning', message: 'Pinning tickets beside chat is not supported", source)
+
+    def test_companion_cleanup_uses_the_native_disposer(self):
+        source = PLUGIN.read_text(encoding="utf-8")
+
+        self.assertIn("for (const disposer of companionDisposers.current.values()) disposer()", source)
+        self.assertIn("companionDisposers.current.delete(companionId)", source)
+
+    def test_ticket_palette_picker_is_not_registered_without_a_safe_sdk_prompt(self):
+        source = PLUGIN.read_text(encoding="utf-8")
+
+        self.assertNotIn("Open Jira ticket…", source)
 
 
 if __name__ == "__main__":

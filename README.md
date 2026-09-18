@@ -14,6 +14,8 @@ A native Jira workspace for Hermes Desktop. It presents Jira issues on a Kanban-
 - Supports explicit **Resume work**, **New chat**, chat attachment, and chat unlinking.
 - Highlights a ticket card with a live ring and **Working** badge while any linked Hermes session is actively running.
 - Opens work sessions without submitting an agent task.
+- Deep-links exact tickets with `/jira?issue=PROJECT-123`; the in-route drawer follows hash navigation.
+- Pins a read-only ticket companion beside chat when the Desktop `host.openWorkspace` contract is available, without opening a session.
 - Drafts Jira updates in a normal Hermes session; posting remains explicit.
 - Suggests transitions but never applies one without a click.
 - Exposes four read-only agent tools: assigned issues, bounded JQL search, fresh issue detail, and available transitions.
@@ -109,6 +111,10 @@ $HERMES_HOME/jira-browser/settings.json
 ```
 
 The drawer provides a form for common settings and a raw JSON editor for complete control. Settings include saved views, JQL, default view, page size, base ref, grouping, and UI preferences. Credentials are never stored there.
+
+## Desktop compatibility
+
+The native companion uses the optional `host.openWorkspace` SDK method and falls back to a warning on older Desktop builds. The SDK's palette contract currently provides a no-argument `run` callback but no safe prompt or ticket-picker surface, so **Open Jira ticket…** is intentionally not registered rather than relying on an invented API.
 
 ## Development
 

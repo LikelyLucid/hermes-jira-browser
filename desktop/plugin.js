@@ -33,6 +33,8 @@ import { Fragment, jsx, jsxs } from 'react/jsx-runtime'
 
 const ID = 'jira-browser'
 const ROUTE = '/jira'
+const ISSUE_QUERY_PARAM = 'issue'
+const ISSUE_KEY_PATTERN = /^[A-Z][A-Z0-9]+-\d+$/
 const DEFAULT_JQL = 'assignee = currentUser() AND statusCategory != Done ORDER BY updated DESC'
 const ISSUE_CACHE_KEY = 'issue-list-cache-v1'
 const ISSUE_CACHE_LIMIT = 6
@@ -52,6 +54,29 @@ function errorText(error, fallback = 'Something went wrong.') {
   if (error && typeof error.message === 'string' && error.message.trim()) return error.message.trim()
   if (typeof error === 'string' && error.trim()) return error.trim()
   return fallback
+}
+
+function normaliseIssueKey(value) {
+  const key = String(value || '').trim()
+  return ISSUE_KEY_PATTERN.test(key) ? key : ''
+}
+
+function issueKeyFromHash(hash = window.location.hash) {
+  const route = String(hash || '').replace(/^#/, '')
+  const [path, query = ''] = route.split('?')
+  if (path !== ROUTE) return ''
+  return normaliseIssueKey(new URLSearchParams(query).get(ISSUE_QUERY_PARAM))
+}
+
+function jiraRoute(issueKey = '') {
+  const current = String(window.location.hash || '').replace(/^#/, '')
+  const [path, query = ''] = current.split('?')
+  const params = new URLSearchParams(path === ROUTE ? query : '')
+  params.delete(ISSUE_QUERY_PARAM)
+  const key = normaliseIssueKey(issueKey)
+  if (key) params.set(ISSUE_QUERY_PARAM, key)
+  const suffix = params.toString()
+  return `${ROUTE}${suffix ? `?${suffix}` : ''}`
 }
 
 function traceWorkOpen(issueKey, phase) {
@@ -830,7 +855,7 @@ function JiraAttachment({ attachment, issueKey }) {
   })
 }
 
-function IssueDetail({ issue, status, projects, mapping, links, baseRef, onOpenIssue, onIssueChanged, onMappingSaved, onLinksChanged }) {
+function IssueDetail({ issue, status, projects, mapping, links, baseRef, onOpenIssue, onIssueChanged, onMappingSaved, onLinksChanged, onPin, readOnly = false }) {
   const [busyAction, setBusyAction] = useState('')
   const [commentDraft, setCommentDraft] = useState('')
   const [error, setError] = useState('')
@@ -864,6 +889,10 @@ function IssueDetail({ issue, status, projects, mapping, links, baseRef, onOpenI
   useEffect(() => {
     let alive = true
     setTransitionId('')
+    if (readOnly) {
+      setTransitions([])
+      return () => { alive = false }
+    }
     api(`/issues/${encodeURIComponent(issue?.key || '')}/transitions`)
       .then(result => {
         if (alive) setTransitions(Array.isArray(result?.transitions) ? result.transitions : [])
@@ -874,7 +903,7 @@ function IssueDetail({ issue, status, projects, mapping, links, baseRef, onOpenI
     return () => {
       alive = false
     }
-  }, [issue?.key])
+  }, [issue?.key, readOnly])
 
   const openExternal = useCallback(() => {
     const url = issueUrl(status, issue?.key)
@@ -1136,9 +1165,9 @@ function IssueDetail({ issue, status, projects, mapping, links, baseRef, onOpenI
   }, [issue?.key])
 
   useEffect(() => {
-    if (!issue?.key) return
+    if (readOnly || !issue?.key) return
     void scanRelatedChats()
-  }, [issue?.key, linkedWorktree?.path, mapping?.repo_path])
+  }, [issue?.key, linkedWorktree?.path, mapping?.repo_path, readOnly])
 
   const suggestedTransition = useMemo(() => {
     if (!links.some(link => link.available !== false) || issue?.status_category !== 'new') return null
@@ -1417,19 +1446,26 @@ function IssueDetail({ issue, status, projects, mapping, links, baseRef, onOpenI
             className: 'flex flex-wrap items-center gap-1',
             children: [
               jsx(PanelAction, { icon: 'link-external', onClick: openExternal, children: 'Open in Jira' }),
-              jsx(PanelAction, {
-                disabled: Boolean(busyAction),
-                icon: 'link',
-                onClick: linkCurrent,
-                children: busyAction === 'link' ? 'Linking…' : 'Link current chat'
-              }),
-              jsx(PanelAction, {
-                disabled: Boolean(busyAction),
-                icon: 'wand',
-                onClick: draftJiraUpdate,
-                children: busyAction === 'draft-update' ? 'Drafting…' : 'Draft update'
-              }),
-              resumableLink
+              onPin && !readOnly
+                ? jsx(PanelAction, { icon: 'pin', onClick: onPin, children: 'Pin beside chat' })
+                : null,
+              !readOnly
+                ? jsx(PanelAction, {
+                    disabled: Boolean(busyAction),
+                    icon: 'link',
+                    onClick: linkCurrent,
+                    children: busyAction === 'link' ? 'Linking…' : 'Link current chat'
+                  })
+                : null,
+              !readOnly
+                ? jsx(PanelAction, {
+                    disabled: Boolean(busyAction),
+                    icon: 'wand',
+                    onClick: draftJiraUpdate,
+                    children: busyAction === 'draft-update' ? 'Drafting…' : 'Draft update'
+                  })
+                : null,
+              resumableLink && !readOnly
                 ? jsx(PanelAction, {
                     disabled: Boolean(busyAction),
                     icon: 'debug-restart',
@@ -1438,13 +1474,15 @@ function IssueDetail({ issue, status, projects, mapping, links, baseRef, onOpenI
                     children: busyAction === 'resume' ? 'Opening…' : 'Resume work'
                   })
                 : null,
-              jsx(PanelAction, {
-                disabled: Boolean(busyAction) || (!mapping && !linkedWorktree?.path),
-                icon: resumableLink ? 'comment-add' : 'git-branch-create',
-                onClick: startWork,
-                primary: !resumableLink,
-                children: busyAction === 'work' ? 'Creating…' : resumableLink ? 'New chat' : 'Open work session'
-              })
+              !readOnly
+                ? jsx(PanelAction, {
+                    disabled: Boolean(busyAction) || (!mapping && !linkedWorktree?.path),
+                    icon: resumableLink ? 'comment-add' : 'git-branch-create',
+                    onClick: startWork,
+                    primary: !resumableLink,
+                    children: busyAction === 'work' ? 'Creating…' : resumableLink ? 'New chat' : 'Open work session'
+                  })
+                : null
             ]
           }),
           jsx('h2', {
@@ -1467,7 +1505,7 @@ function IssueDetail({ issue, status, projects, mapping, links, baseRef, onOpenI
           { label: 'Updated', value: issue.updated ? new Date(issue.updated).toLocaleString() : '—' }
         ]
       }),
-      suggestedTransition
+      !readOnly && suggestedTransition
         ? jsxs('section', {
             className: 'space-y-2 rounded-md border border-(--ui-stroke-tertiary) bg-foreground/[0.03] p-3',
             children: [
@@ -1485,7 +1523,7 @@ function IssueDetail({ issue, status, projects, mapping, links, baseRef, onOpenI
             ]
           })
         : null,
-      transitions.length > 0
+      !readOnly && transitions.length > 0
         ? jsxs('section', {
             className: 'space-y-2',
             children: [
@@ -1521,8 +1559,8 @@ function IssueDetail({ issue, status, projects, mapping, links, baseRef, onOpenI
             ]
           })
         : null,
-      jsx(MappingEditor, { issue, mapping, projects, onSaved: onMappingSaved }),
-      jsxs('section', {
+      !readOnly ? jsx(MappingEditor, { issue, mapping, projects, onSaved: onMappingSaved }) : null,
+      !readOnly ? jsxs('section', {
         className: 'space-y-2',
         children: [
           jsx(PanelSectionLabel, { children: 'Hermes worktree' }),
@@ -1591,7 +1629,7 @@ function IssueDetail({ issue, status, projects, mapping, links, baseRef, onOpenI
             ]
           })
         ]
-      }),
+      }) : null,
       issue.parent || issue.subtasks?.length
         ? jsxs('section', {
             className: 'space-y-2',
@@ -1654,7 +1692,7 @@ function IssueDetail({ issue, status, projects, mapping, links, baseRef, onOpenI
             ]
           })
         : null,
-      jsx(LinkedChats, {
+      !readOnly && jsx(LinkedChats, {
         links,
         onAttach: attachRelatedChat,
         onOpen: openLinked,
@@ -1664,7 +1702,7 @@ function IssueDetail({ issue, status, projects, mapping, links, baseRef, onOpenI
         scanning: scanningChats,
         unlinking: unlinkingChatId
       }),
-      jsxs('section', {
+      !readOnly ? jsxs('section', {
         className: 'space-y-2',
         children: [
           jsx(PanelSectionLabel, { children: 'Add comment' }),
@@ -1686,7 +1724,7 @@ function IssueDetail({ issue, status, projects, mapping, links, baseRef, onOpenI
             })
           })
         ]
-      }),
+      }) : null,
       Array.isArray(issue.comments) && issue.comments.length > 0
         ? jsxs('section', {
             className: 'space-y-2',
@@ -1928,7 +1966,7 @@ function JiraPage() {
   const [projects, setProjects] = useState([])
   const [issues, setIssues] = useState([])
   const [detectedLanes, setDetectedLanes] = useState([])
-  const [selectedKey, setSelectedKey] = useState('')
+  const [selectedKey, setSelectedKey] = useState(() => issueKeyFromHash())
   const [drawerWidth, setDrawerWidth] = useState(() =>
     clampDrawerWidth(readDrawerWidth(), window.innerWidth - BOARD_MIN_WIDTH)
   )
@@ -1960,6 +1998,25 @@ function JiraPage() {
   const saveTimer = useRef(null)
   const settingsSaveGeneration = useRef(0)
   const workStateGeneration = useRef(0)
+  const companionDisposers = useRef(new Map())
+
+  useEffect(() => {
+    const syncFromHash = () => setSelectedKey(issueKeyFromHash())
+    syncFromHash()
+    window.addEventListener('hashchange', syncFromHash)
+    return () => window.removeEventListener('hashchange', syncFromHash)
+  }, [])
+
+  useEffect(() => {
+    if (!selectedKey && issueKeyFromHash()) host.navigate(jiraRoute(''))
+  }, [selectedKey])
+
+  useEffect(() => {
+    return () => {
+      for (const disposer of companionDisposers.current.values()) disposer()
+      companionDisposers.current.clear()
+    }
+  }, [])
 
   useEffect(() => {
     let alive = true
@@ -2002,7 +2059,6 @@ function JiraPage() {
     } else if (cached) {
       setIssues(cached.issues)
       setNextPageToken(String(cached.nextPageToken || ''))
-      setSelectedKey(selected => (cached.issues.some(issue => issue.key === selected) ? selected : ''))
       setLoading(false)
       setCacheState('Cached · refreshing…')
     } else {
@@ -2026,7 +2082,6 @@ function JiraPage() {
         })
       } else {
         setIssues(rows)
-        setSelectedKey(selected => (rows.some(issue => issue.key === selected) ? selected : ''))
         writeIssueCache(nextJql, pageSize, rows, nextToken)
       }
     } catch (cause) {
@@ -2396,9 +2451,57 @@ function JiraPage() {
   }, [loadIssues, settings])
 
   const openTicket = useCallback(issueKey => {
+    const key = normaliseIssueKey(issueKey)
+    if (!key) return
     setShowSettings(false)
-    setSelectedKey(issueKey)
+    setSelectedKey(key)
+    host.navigate(jiraRoute(key))
   }, [])
+
+  const pinTicket = useCallback(() => {
+    const issue = detail
+    if (!issue?.key) return
+    if (typeof host.openWorkspace !== 'function') {
+      host.notify({ kind: 'warning', message: 'Pinning tickets beside chat is not supported by this Desktop version.' })
+      return
+    }
+    const companionId = `${ID}:ticket:${issue.key}`
+    if (companionDisposers.current.has(companionId)) {
+      host.navigate('/')
+      return
+    }
+    try {
+      const disposer = host.openWorkspace(companionId, {
+        title: `${issue.key} · ${issue.summary || 'Jira ticket'}`,
+        minWidth: '28rem',
+        render: () => jsx('div', {
+          className: 'h-full overflow-y-auto bg-(--ui-surface-background) px-4 py-4 text-foreground',
+          children: jsx(IssueDetail, {
+            issue,
+            status,
+            projects,
+            mapping,
+            links,
+            baseRef: settings?.baseRef || 'HEAD',
+            onOpenIssue: undefined,
+            onIssueChanged: undefined,
+            onMappingSaved: undefined,
+            onLinksChanged: undefined,
+            readOnly: true
+          })
+        }),
+        onClose: () => companionDisposers.current.delete(companionId)
+      })
+      if (typeof disposer !== 'function') {
+        host.notify({ kind: 'warning', message: 'Pinning tickets beside chat is unavailable on this Desktop version.' })
+        return
+      }
+      companionDisposers.current.set(companionId, disposer)
+      host.navigate('/')
+    } catch (cause) {
+      host.notify({ kind: 'warning', message: errorText(cause, 'Could not pin the Jira ticket beside chat.') })
+    }
+  }, [detail, links, mapping, projects, settings?.baseRef, status])
 
   const moveIssueToLane = useCallback(async (issueKey, targetStatus) => {
     const current = issues.find(issue => issue.key === issueKey)
@@ -2736,7 +2839,8 @@ function JiraPage() {
                       onOpenIssue: openTicket,
                       onIssueChanged: setDetail,
                       onMappingSaved: setMapping,
-                      onLinksChanged: reloadLinks
+                      onLinksChanged: reloadLinks,
+                      onPin: pinTicket
                     })
               })
             ]
