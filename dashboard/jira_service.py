@@ -37,6 +37,7 @@ SEARCH_FIELDS = (
 DETAIL_FIELDS = f"{SEARCH_FIELDS},parent,subtasks,fixVersions,components,attachment"
 MAX_JIRA_JSON_BYTES = 16 * 1024 * 1024
 MAX_JIRA_CONFIG_BYTES = 1 * 1024 * 1024
+MAX_JIRA_COMMENT_ID_BYTES = 256
 MAX_JIRA_COMMENT_BODY_BYTES = 64 * 1024
 MAX_ATTACHMENT_PREVIEW_BYTES = 4 * 1024 * 1024
 MAX_ISSUE_COMMENTS = 1_000
@@ -497,6 +498,7 @@ def _validate_comment_response(payload: Any) -> Mapping[str, Any]:
     if not isinstance(payload, Mapping):
         raise JiraAmbiguousError("Jira returned an invalid comment response; the write outcome is unknown.")
     comment_id = str(payload.get("id") or "").strip()
+    comment_id_bytes = len(comment_id.encode("utf-8"))
     body = payload.get("body")
     if isinstance(body, str):
         valid_body = bool(body.strip())
@@ -513,7 +515,12 @@ def _validate_comment_response(payload: Any) -> Mapping[str, Any]:
         body_bytes = len(json.dumps(body, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
     except (TypeError, ValueError):
         body_bytes = MAX_JIRA_COMMENT_BODY_BYTES + 1
-    if not comment_id or not valid_body or body_bytes > MAX_JIRA_COMMENT_BODY_BYTES:
+    if (
+        not comment_id
+        or comment_id_bytes > MAX_JIRA_COMMENT_ID_BYTES
+        or not valid_body
+        or body_bytes > MAX_JIRA_COMMENT_BODY_BYTES
+    ):
         raise JiraAmbiguousError("Jira returned an invalid comment response; the write outcome is unknown.")
     return payload
 

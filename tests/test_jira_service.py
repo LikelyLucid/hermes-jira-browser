@@ -1260,6 +1260,10 @@ class JiraClientTests(unittest.TestCase):
             {"id": "9001"},
             {"id": "9001", "body": {}},
             {"id": "9001", "body": {"type": "doc", "content": [{}]}},
+            {
+                "id": "9" * 257,
+                "body": "Implemented and verified.",
+            },
         ):
             class Response:
                 def __enter__(self):
