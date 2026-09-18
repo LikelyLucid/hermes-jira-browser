@@ -7,6 +7,16 @@ WORK_DIR="$(mktemp -d "${TMPDIR:-/tmp}/hermes-jira-browser-quality.XXXXXX")"
 trap 'rm -rf "$WORK_DIR"' EXIT
 cd "$ROOT_DIR"
 
+export HOME="$WORK_DIR/home"
+export HERMES_HOME="$WORK_DIR/hermes-home"
+export XDG_CACHE_HOME="$WORK_DIR/cache"
+unset HERMES_JIRA_CONFIG_FILE JIRA_BASE_URL JIRA_SITE JIRA_EMAIL JIRA_API_TOKEN || true
+while IFS= read -r variable; do
+  case "$variable" in
+    JIRA_*|HERMES_JIRA_*) unset "$variable" ;;
+  esac
+done < <(compgen -v)
+
 printf '%s\n' '== Isolated Python environment =='
 "$PYTHON_BIN" -m venv "$WORK_DIR/venv"
 VENV_PYTHON="$WORK_DIR/venv/bin/python"
@@ -14,16 +24,8 @@ VENV_PYTHON="$WORK_DIR/venv/bin/python"
   --disable-pip-version-check \
   --no-input \
   --only-binary=:all: \
-  annotated-types==0.7.0 \
-  anyio==4.8.0 \
-  fastapi==0.115.6 \
-  idna==3.10 \
-  pydantic==2.12.5 \
-  pydantic-core==2.41.5 \
-  sniffio==1.3.1 \
-  starlette==0.41.3 \
-  typing-extensions==4.15.0 \
-  typing-inspection==0.4.2
+  --require-hashes \
+  --requirement "$ROOT_DIR/scripts/requirements-ci.txt"
 
 # The plugin imports a few small Hermes APIs, but this repository is intentionally
 # tested without checking out the private Hermes source tree. These compatibility
@@ -71,8 +73,6 @@ def get_hermes_home() -> Path:
     return Path(os.environ.get("HERMES_HOME", Path.home() / ".hermes")).expanduser()
 PY
 
-export HERMES_HOME="$WORK_DIR/hermes-home"
-unset HERMES_JIRA_CONFIG_FILE JIRA_BASE_URL JIRA_SITE JIRA_EMAIL JIRA_API_TOKEN || true
 export PYTHONPATH="$WORK_DIR/shims${PYTHONPATH:+:$PYTHONPATH}"
 
 printf '%s\n' '== JavaScript syntax =='
