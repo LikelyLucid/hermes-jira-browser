@@ -7,6 +7,7 @@ leave this process.
 from __future__ import annotations
 
 import base64
+import errno
 import json
 import os
 import re
@@ -95,25 +96,86 @@ def _validate_jira_config_metadata(metadata: os.stat_result) -> None:
         raise ValueError("Jira config file must not be a symlink.")
     if not stat.S_ISREG(metadata.st_mode):
         raise ValueError("Jira config file must be a regular file.")
-    getuid = getattr(os, "getuid", None)
-    if getuid is None:
-        return
     if stat.S_IMODE(metadata.st_mode) & 0o077:
         raise ValueError("Jira config file permissions must be owner-only.")
-    if hasattr(metadata, "st_uid") and metadata.st_uid != getuid():
+    if metadata.st_uid != os.getuid():
         raise ValueError("Jira config file must be owned by the current user.")
 
 
+def _require_safe_jira_config_open() -> tuple[int, int]:
+    nofollow = getattr(os, "O_NOFOLLOW", None)
+    directory = getattr(os, "O_DIRECTORY", None)
+    supports_dir_fd = getattr(os, "supports_dir_fd", ())
+    if (
+        not isinstance(nofollow, int)
+        or nofollow == 0
+        or not isinstance(directory, int)
+        or directory == 0
+        or not callable(getattr(os, "getuid", None))
+        or os.open not in supports_dir_fd
+    ):
+        raise ValueError(
+            "File-based Jira credentials cannot be opened safely on this platform; "
+            "set JIRA_BASE_URL, JIRA_EMAIL, and JIRA_API_TOKEN environment variables instead."
+        )
+    return nofollow, directory
+
+
 def _read_jira_config_file(path: Path) -> dict[str, Any]:
-    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    nofollow, directory = _require_safe_jira_config_open()
+    components = list(path.parts)
+    if any(component == ".." for component in components):
+        raise ValueError(
+            "Jira config path traversal is not allowed; set JIRA_BASE_URL, JIRA_EMAIL, and JIRA_API_TOKEN instead."
+        )
+    if path.is_absolute():
+        root = os.open("/", os.O_RDONLY | directory | nofollow)
+        components = components[1:]
+    else:
+        root = os.open(".", os.O_RDONLY | directory | nofollow)
+    parent_descriptor = root
     try:
-        descriptor = os.open(path, flags)
-    except FileNotFoundError:
-        return {}
-    except OSError as exc:
-        if getattr(exc, "errno", None) in {getattr(os, "ELOOP", 40), 40}:
-            raise ValueError("Jira config file must not be a symlink.") from exc
-        raise ValueError(f"Jira config at {path} cannot be inspected safely.") from exc
+        if not components:
+            raise ValueError("Jira config path must name a file.")
+        for component in components[:-1]:
+            if component == ".":
+                continue
+            try:
+                next_descriptor = os.open(
+                    component,
+                    os.O_RDONLY | directory | nofollow | getattr(os, "O_CLOEXEC", 0),
+                    dir_fd=parent_descriptor,
+                )
+            except FileNotFoundError:
+                return {}
+            except OSError as exc:
+                if exc.errno == errno.ELOOP:
+                    raise ValueError("Jira config parent must not be a symlink.") from exc
+                if exc.errno == errno.ENOTDIR:
+                    try:
+                        metadata = os.stat(component, dir_fd=parent_descriptor, follow_symlinks=False)
+                    except OSError:
+                        metadata = None
+                    if metadata is not None and stat.S_ISLNK(metadata.st_mode):
+                        raise ValueError("Jira config parent must not be a symlink.") from exc
+                raise ValueError(f"Jira config at {path} cannot be inspected safely.") from exc
+            os.close(parent_descriptor)
+            parent_descriptor = next_descriptor
+
+        filename = components[-1]
+        if filename == ".":
+            raise ValueError("Jira config path must name a file.")
+        flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | nofollow
+        try:
+            descriptor = os.open(filename, flags, dir_fd=parent_descriptor)
+        except FileNotFoundError:
+            return {}
+        except OSError as exc:
+            if exc.errno == errno.ELOOP:
+                raise ValueError("Jira config file must not be a symlink.") from exc
+            raise ValueError(f"Jira config at {path} cannot be inspected safely.") from exc
+    finally:
+        os.close(parent_descriptor)
 
     try:
         metadata = os.fstat(descriptor)
@@ -699,11 +761,12 @@ class JiraClient:
                 f"/rest/api/3/issue/{safe_key}/comment",
                 {"startAt": start_at, "maxResults": min(100, MAX_ISSUE_COMMENTS - len(comments))},
             )
-            raw_comments = page.get("comments") if isinstance(page.get("comments"), list) else []
+            raw_comments = cast(list[Any], page.get("comments")) if isinstance(page.get("comments"), list) else []
             total = max(total, int(page.get("total") or 0))
+            remaining = MAX_ISSUE_COMMENTS - len(comments)
             comments.extend(
                 _normalise_comment(comment, attachments)
-                for comment in raw_comments
+                for comment in raw_comments[:remaining]
                 if isinstance(comment, Mapping)
             )
             if not raw_comments or start_at + len(raw_comments) >= total:
@@ -875,6 +938,25 @@ def _worktree_lock(repo: Path, branch: str) -> threading.Lock:
         return _WORKTREE_LOCKS.setdefault(key, threading.Lock())
 
 
+def _validate_worktree_paths(repo: Path, worktree: Path) -> None:
+    canonical_repo = repo.resolve(strict=True)
+    worktrees = worktree.parent
+    for candidate, label in ((worktrees, ".worktrees directory"), (worktree, "worktree destination")):
+        try:
+            metadata = os.lstat(candidate)
+        except FileNotFoundError:
+            metadata = None
+        if metadata is not None and stat.S_ISLNK(metadata.st_mode):
+            raise ValueError(f"Worktree {label} must not be a symlink.")
+        if metadata is not None and not stat.S_ISDIR(metadata.st_mode):
+            raise ValueError(f"Worktree {label} must be a directory.")
+        canonical_target = candidate.resolve(strict=False)
+        try:
+            canonical_target.relative_to(canonical_repo)
+        except ValueError as exc:
+            raise ValueError(f"Worktree {label} must remain under the project repository.") from exc
+
+
 def _lock_git_worktree(repo: Path, worktree: Path, issue_key: str) -> None:
     result = _git(
         repo,
@@ -901,6 +983,7 @@ def create_worktree(
     branch = branch_name(issue_key, summary)
     directory_name = branch.replace("/", "-")
     worktree = repo / ".worktrees" / directory_name
+    _validate_worktree_paths(repo, worktree)
     requested_ref = base_ref.strip() or "HEAD"
     if requested_ref.startswith("-"):
         raise ValueError("base_ref must be a Git ref, not an option.")
@@ -912,6 +995,7 @@ def create_worktree(
     with _worktree_lock(repo, branch):
         _ensure_worktrees_gitignored(repo)
         worktree.parent.mkdir(parents=True, exist_ok=True)
+        _validate_worktree_paths(repo, worktree)
 
         if worktree.exists():
             if not (worktree / ".git").exists():
@@ -929,6 +1013,7 @@ def create_worktree(
             }
 
         branch_exists = _git(repo, "show-ref", "--verify", "--quiet", f"refs/heads/{branch}", check=False).returncode == 0
+        _validate_worktree_paths(repo, worktree)
         if branch_exists:
             result = _git(repo, "worktree", "add", str(worktree), branch, check=False)
         else:
@@ -964,7 +1049,9 @@ def cleanup_worktree(*, repo_path: str | Path, issue_key: str) -> dict[str, Any]
     repo = _repo_root(repo_path)
     branch = branch_name(issue_key)
     worktree = repo / ".worktrees" / branch.replace("/", "-")
+    _validate_worktree_paths(repo, worktree)
     with _worktree_lock(repo, branch):
+        _validate_worktree_paths(repo, worktree)
         if not worktree.exists():
             return {"removed": False, "path": str(worktree), "branch": branch}
         if not (worktree / ".git").exists() or _worktree_branch(worktree) != branch:
@@ -1055,9 +1142,45 @@ class JiraStore:
             raise ValueError("Jira store database must be owner-only.")
 
     def _connect(self) -> sqlite3.Connection:
+        nofollow = getattr(os, "O_NOFOLLOW", None)
+        if not isinstance(nofollow, int) or nofollow == 0:
+            raise ValueError("Jira store cannot be opened safely on this platform.")
         self._harden_storage()
-        connection = sqlite3.connect(self.path)
-        self._harden_storage()
+        flags = os.O_RDWR | nofollow | getattr(os, "O_CLOEXEC", 0)
+        try:
+            descriptor = os.open(self.path, flags)
+        except OSError as exc:
+            if exc.errno == errno.ELOOP:
+                raise ValueError("Jira store database must not be a symlink.") from exc
+            raise ValueError("Jira store database cannot be opened safely.") from exc
+
+        try:
+            before = os.fstat(descriptor)
+            if not stat.S_ISREG(before.st_mode):
+                raise ValueError("Jira store database must be a regular file.")
+            if stat.S_IMODE(before.st_mode) != 0o600:
+                os.fchmod(descriptor, 0o600)
+                before = os.fstat(descriptor)
+            if stat.S_IMODE(before.st_mode) != 0o600:
+                raise ValueError("Jira store database must be owner-only.")
+            uri = f"file:{urllib.parse.quote(str(self.path), safe='/')}?nofollow=1"
+            try:
+                connection = sqlite3.connect(uri, uri=True)
+            except sqlite3.Error as exc:
+                raise ValueError("Jira store database cannot be opened safely.") from exc
+            try:
+                after = os.stat(self.path, follow_symlinks=False)
+                if (
+                    not stat.S_ISREG(after.st_mode)
+                    or (after.st_dev, after.st_ino) != (before.st_dev, before.st_ino)
+                ):
+                    raise ValueError("Jira store database changed while it was being opened.")
+            except BaseException:
+                connection.close()
+                raise
+        finally:
+            os.close(descriptor)
+
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA foreign_keys = ON")
         return connection

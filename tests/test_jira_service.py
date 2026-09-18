@@ -116,6 +116,37 @@ class JiraConfigTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "symlink"):
                     jira_service.load_jira_config(config_path)
 
+    def test_rejects_symlinked_credential_parent(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            actual_parent = root / "actual"
+            actual_parent.mkdir()
+            config_path = actual_parent / "config.json"
+            config_path.write_text(
+                json.dumps({"baseUrl": "https://jira.example.invalid", "email": "dev@example.com", "token": "secret"}),
+                encoding="utf-8",
+            )
+            config_path.chmod(0o600)
+            linked_parent = root / "linked"
+            linked_parent.symlink_to(actual_parent, target_is_directory=True)
+
+            with mock.patch.dict(os.environ, {}, clear=True):
+                with self.assertRaisesRegex(ValueError, "symlink"):
+                    jira_service.load_jira_config(linked_parent / "config.json")
+
+    def test_file_credentials_fail_closed_without_safe_open_primitives(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "config.json"
+            config_path.write_text(
+                json.dumps({"baseUrl": "https://jira.example.invalid", "email": "dev@example.com", "token": "secret"}),
+                encoding="utf-8",
+            )
+            config_path.chmod(0o600)
+            with mock.patch.dict(os.environ, {}, clear=True):
+                with mock.patch.object(jira_service.os, "O_NOFOLLOW", None, create=True):
+                    with self.assertRaisesRegex(ValueError, "JIRA_BASE_URL"):
+                        jira_service.load_jira_config(config_path)
+
     def test_rejects_non_regular_credential_file(self):
         with tempfile.TemporaryDirectory() as tmp:
             config_path = Path(tmp) / "config.json"
@@ -518,6 +549,59 @@ class WorktreeTests(unittest.TestCase):
             jira_service.create_worktree(repo_path=root, issue_key="DEMO-99", summary="Safe")
             self.assertFalse(marker.exists())
 
+    def test_create_rejects_symlinked_worktrees_directory_before_git(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "repo"
+            outside = Path(tmp) / "outside"
+            root.mkdir()
+            outside.mkdir()
+            git(root, "init", "-q", "-b", "main")
+            git(root, "config", "user.name", "Test User")
+            git(root, "config", "user.email", "test@example.com")
+            (root / "README.md").write_text("seed\n", encoding="utf-8")
+            git(root, "add", "README.md")
+            git(root, "commit", "-qm", "seed")
+            (root / ".worktrees").symlink_to(outside, target_is_directory=True)
+
+            with self.assertRaisesRegex(ValueError, "symlink"):
+                jira_service.create_worktree(repo_path=root, issue_key="DEMO-88", summary="Unsafe")
+            self.assertFalse((outside / "jira-DEMO-88").exists())
+
+    def test_cleanup_rejects_symlinked_worktrees_directory(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "repo"
+            outside = Path(tmp) / "outside"
+            root.mkdir()
+            outside.mkdir()
+            git(root, "init", "-q", "-b", "main")
+            git(root, "config", "user.name", "Test User")
+            git(root, "config", "user.email", "test@example.com")
+            (root / "README.md").write_text("seed\n", encoding="utf-8")
+            git(root, "add", "README.md")
+            git(root, "commit", "-qm", "seed")
+            (root / ".worktrees").symlink_to(outside, target_is_directory=True)
+
+            with self.assertRaisesRegex(ValueError, "symlink"):
+                jira_service.cleanup_worktree(repo_path=root, issue_key="DEMO-88")
+
+    def test_create_rejects_symlinked_worktree_destination(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "repo"
+            outside = Path(tmp) / "outside"
+            root.mkdir()
+            outside.mkdir()
+            git(root, "init", "-q", "-b", "main")
+            git(root, "config", "user.name", "Test User")
+            git(root, "config", "user.email", "test@example.com")
+            (root / "README.md").write_text("seed\n", encoding="utf-8")
+            git(root, "add", "README.md")
+            git(root, "commit", "-qm", "seed")
+            (root / ".worktrees").mkdir()
+            (root / ".worktrees" / "jira-DEMO-89").symlink_to(outside, target_is_directory=True)
+
+            with self.assertRaisesRegex(ValueError, "symlink"):
+                jira_service.create_worktree(repo_path=root, issue_key="DEMO-89", summary="Unsafe")
+
 
 class StoreTests(unittest.TestCase):
     def test_store_hardens_existing_directory_and_database_permissions(self):
@@ -553,6 +637,39 @@ class StoreTests(unittest.TestCase):
             database_directory.mkdir(mode=0o700)
             with self.assertRaisesRegex(ValueError, "regular"):
                 jira_service.JiraStore(database_directory)
+
+    def test_store_connects_through_nofollow_uri_and_rejects_post_preopen_swap(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            database = root / "state.sqlite3"
+            store = jira_service.JiraStore(database)
+            captured = {}
+            real_connect = jira_service.sqlite3.connect
+
+            def capture_connect(*args, **kwargs):
+                captured["database"] = args[0]
+                captured["kwargs"] = kwargs
+                return real_connect(*args, **kwargs)
+
+            with mock.patch.object(jira_service.sqlite3, "connect", side_effect=capture_connect):
+                with store._connect() as connection:
+                    connection.execute("SELECT 1")
+
+            self.assertTrue(captured["kwargs"]["uri"])
+            self.assertIn("nofollow=1", captured["database"])
+
+            replacement = root / "replacement.sqlite3"
+            replacement.touch(mode=0o600)
+            original_connect = jira_service.sqlite3.connect
+
+            def swap_then_connect(*args, **kwargs):
+                database.unlink()
+                database.symlink_to(replacement)
+                return original_connect(*args, **kwargs)
+
+            with mock.patch.object(jira_service.sqlite3, "connect", side_effect=swap_then_connect):
+                with self.assertRaises(ValueError):
+                    store._connect()
 
     def test_maps_project_and_links_chat_and_worktree(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -760,6 +877,37 @@ class JiraClientTests(unittest.TestCase):
         self.assertEqual(
             [params["startAt"] for path, params in calls if path.endswith("/comment")],
             [0, 2],
+        )
+
+    def test_issue_caps_a_page_that_ignores_max_results(self):
+        client = jira_service.JiraClient(jira_service.JiraConfig(
+            base_url="https://jira.example.invalid",
+            email="dev@example.com",
+            api_token="very-secret",
+        ))
+        calls = []
+
+        def fake_request(path, params=None, **_kwargs):
+            calls.append((path, params or {}))
+            if path == "/rest/api/3/issue/DEMO-43":
+                return {"id": "10002", "key": "DEMO-43", "fields": {"summary": "Many comments"}}
+            return {
+                "startAt": 0,
+                "maxResults": 1_500,
+                "total": 2_000,
+                "comments": [{"id": str(index), "body": "Comment"} for index in range(1_501)],
+            }
+
+        with mock.patch.object(client, "_request", side_effect=fake_request):
+            result = client.issue("DEMO-43")
+
+        self.assertEqual(len(result["comments"]), jira_service.MAX_ISSUE_COMMENTS)
+        self.assertEqual(result["comments"][0]["id"], "0")
+        self.assertEqual(result["comments"][-1]["id"], "999")
+        self.assertTrue(result["comments_truncated"])
+        self.assertEqual(
+            [params["maxResults"] for path, params in calls if path.endswith("/comment")],
+            [100],
         )
 
     def test_attachment_bytes_accepts_jira_thumbnail_response(self):
