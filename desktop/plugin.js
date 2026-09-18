@@ -195,12 +195,106 @@ function flattenProjectSessions(project) {
   return sessions
 }
 
-async function listCurrentProfileSessions(projectId = '', jiraProjectKey = '') {
-  const profile = String(host.state?.profile?.get?.() || 'default')
+function readFocusedSessionOwner() {
+  const focused = host.state?.focusedSessionOwner?.get?.()
+  if ((focused?.connectionId || focused?.connection_id) && (focused?.profile || focused?.profile_name)) {
+    const profileName = String(focused.profile || focused.profile_name).trim() || 'default'
+    return {
+      connectionId: String(focused.connectionId || focused.connection_id).trim(),
+      profileName,
+      targetProfile: String(focused.targetProfile || focused.target_profile || profileName).trim() || profileName
+    }
+  }
+  const profileName = String(
+    host.state?.focusedSessionProfile?.get?.()
+      || 'default'
+  ).trim() || 'default'
+  return { connectionId: 'local', profileName, targetProfile: profileName }
+}
+
+function ownerFromLink(link) {
+  const hasConnectionOwner = Boolean(link?.connection_id)
+  const profileName = String(
+    link?.profile_name
+      || link?.profile
+      || (hasConnectionOwner ? '' : host.state?.focusedSessionProfile?.get?.())
+      || 'default'
+  ).trim() || 'default'
+  return {
+    connectionId: String(link?.connection_id || 'local').trim(),
+    profileName,
+    targetProfile: String(link?.target_profile || profileName).trim() || profileName
+  }
+}
+
+function ownerFromRoute(route) {
+  const profileName = String(route?.profile || '').trim()
+  return {
+    connectionId: String(route?.connectionId || '').trim(),
+    profileName,
+    targetProfile: String(route?.targetProfile || profileName).trim() || profileName
+  }
+}
+
+function sessionLinkIdentity(link) {
+  const owner = link?.connectionId || link?.profileName ? link : ownerFromLink(link)
+  const sessionId = String(link?.session_id || link?.sessionId || link?.id || '').trim()
+  return `${owner.connectionId}::${owner.profileName}::${owner.targetProfile}::${sessionId}`
+}
+
+function sessionOwnerFields(owner) {
+  return {
+    connection_id: owner.connectionId,
+    profile_name: owner.profileName,
+    target_profile: owner.targetProfile
+  }
+}
+
+async function resolveSessionRoute(value) {
+  const owner = value?.connectionId || value?.profileName ? value : ownerFromLink(value)
+  if (typeof host.profileRoutes !== 'function') throw new Error('Hermes Desktop connection routing is unavailable.')
+  const routes = await host.profileRoutes()
+  const route = (Array.isArray(routes) ? routes : []).find(candidate => {
+    const candidateOwner = ownerFromRoute(candidate)
+    return candidateOwner.connectionId === owner.connectionId
+      && candidateOwner.profileName === owner.profileName
+      && candidateOwner.targetProfile === owner.targetProfile
+  })
+  if (!route) throw new Error(`The connection/profile owner ${owner.connectionId}::${owner.profileName} is unavailable.`)
+  return route
+}
+
+function sessionIdFromRow(session) {
+  return String(session?.id || session?.stored_session_id || '').trim()
+}
+
+async function verifySessionOwner(sessionId, route) {
+  const profile = String(route.targetProfile || route.profile || '').trim()
+  const listed = await host.listPersistedSessions(route, { profile, limit: 500 })
+  const sessions = Array.isArray(listed?.sessions) ? listed.sessions : []
+  const match = sessions.find(session => sessionIdFromRow(session) === sessionId)
+  if (match) return match
+  if (typeof host.requestProfile === 'function') {
+    const result = await host.requestProfile(route, 'session.list', {
+      profile,
+      include_hidden: true,
+      limit: 500
+    })
+    const fallback = (Array.isArray(result?.sessions) ? result.sessions : [])
+      .find(session => sessionIdFromRow(session) === sessionId)
+    if (fallback) return fallback
+  }
+  throw new Error('The selected chat is not persisted by its owning profile.')
+}
+
+async function listCurrentProfileSessions(projectId = '', jiraProjectKey = '', route = null) {
+  const focusedOwner = readFocusedSessionOwner()
+  const ownerRoute = route || await resolveSessionRoute(focusedOwner)
+  const profile = String(ownerRoute.targetProfile || ownerRoute.profile || focusedOwner.profileName).trim()
   const [recentResult, projectResult, storedResult] = await Promise.all([
-    host.listPersistedSessions(null, { profile, limit: 500 }),
+    host.listPersistedSessions(ownerRoute, { profile, limit: 500 }),
     projectId
-      ? host.request('projects.project_sessions', {
+      ? host.requestProfile(ownerRoute, 'projects.project_sessions', {
           profile,
           project_id: projectId,
           session_limit: 20_000
@@ -215,7 +309,10 @@ async function listCurrentProfileSessions(projectId = '', jiraProjectKey = '') {
     ...flattenProjectSessions(projectResult?.project),
     ...(Array.isArray(storedResult?.sessions) ? storedResult.sessions : [])
   ]
-  return [...new Map(sessions.filter(session => session?.id).map(session => [session.id, session])).values()]
+  return [...new Map(sessions
+    .filter(session => sessionIdFromRow(session))
+    .map(session => [sessionIdFromRow(session), session])
+  ).values()]
 }
 
 function issueCacheId(jql, pageSize) {
@@ -309,21 +406,61 @@ function readDetachedChatIds(issueKey) {
   return new Set(Array.isArray(values) ? values.map(String) : [])
 }
 
-function writeChatDetached(issueKey, sessionId, value) {
-  if (!pluginContext || !issueKey || !sessionId) return
+function writeChatDetached(issueKey, link, value) {
+  if (!pluginContext || !issueKey || !link?.session_id) return
   const detached = pluginContext.storage.get(DETACHED_CHAT_LINKS_KEY, {}) || {}
   const key = String(issueKey).toUpperCase()
   const ids = new Set(Array.isArray(detached[key]) ? detached[key].map(String) : [])
-  if (value) ids.add(String(sessionId))
-  else ids.delete(String(sessionId))
+  const identity = sessionLinkIdentity(link)
+  if (value) ids.add(identity)
+  else ids.delete(identity)
   if (ids.size > 0) detached[key] = [...ids]
   else delete detached[key]
   pluginContext.storage.set(DETACHED_CHAT_LINKS_KEY, detached)
 }
 
-function filterDetachedLinks(issueKey, links) {
+function mergeBackendDetachedLinks(issueKey, links) {
   const detached = readDetachedChatIds(issueKey)
-  return (Array.isArray(links) ? links : []).filter(link => !detached.has(String(link?.session_id || '')))
+  for (const link of Array.isArray(links) ? links : []) {
+    if ((link?.detached || link?.is_detached || link?.tombstone || link?.deleted || link?.detached_at || link?.deleted_at)
+      && link?.connection_id && link?.profile_name && link?.session_id) {
+      detached.add(sessionLinkIdentity(link))
+    }
+  }
+  if (detached.size > 0 && pluginContext) {
+    const current = pluginContext.storage.get(DETACHED_CHAT_LINKS_KEY, {}) || {}
+    current[String(issueKey).toUpperCase()] = [...detached]
+    pluginContext.storage.set(DETACHED_CHAT_LINKS_KEY, current)
+  }
+  return detached
+}
+
+function linkAvailability(link) {
+  if (link?.available !== false) return link
+  const owner = ownerFromLink(link)
+  const focused = readFocusedSessionOwner()
+  const isFocusedOwner = owner.connectionId === focused.connectionId
+    && owner.profileName === focused.profileName
+    && owner.targetProfile === focused.targetProfile
+  return isFocusedOwner ? link : { ...link, available: undefined }
+}
+
+function filterDetachedLinks(issueKey, links) {
+  const detached = mergeBackendDetachedLinks(issueKey, links)
+  return (Array.isArray(links) ? links : []).filter(link => {
+    const sessionId = String(link?.session_id || '').trim()
+    const identity = sessionLinkIdentity(link)
+    const legacyLocalDetach = !link?.connection_id && detached.has(sessionId)
+    if (legacyLocalDetach && pluginContext) {
+      detached.delete(sessionId)
+      detached.add(identity)
+      const current = pluginContext.storage.get(DETACHED_CHAT_LINKS_KEY, {}) || {}
+      current[String(issueKey).toUpperCase()] = [...detached]
+      pluginContext.storage.set(DETACHED_CHAT_LINKS_KEY, current)
+    }
+    return !link?.detached && !link?.is_detached && !link?.tombstone && !link?.deleted
+      && !link?.detached_at && !link?.deleted_at && !detached.has(identity) && !legacyLocalDetach
+  }).map(linkAvailability)
 }
 
 function clampDrawerWidth(value, maximum = DRAWER_MAX_WIDTH) {
@@ -431,7 +568,7 @@ function JiraCard({ issue, active, attentionReasons = [], onOpen, workState, wor
   const tone = statusColor(issue)
   const linkedWork = Array.isArray(workState?.links) ? workState.links : []
   const branch = linkedWork.find(link => link.branch)?.branch || ''
-  const working = linkedWork.some(link => workingSessionIds?.has(String(link.session_id || '')))
+  const working = linkedWork.some(link => workingSessionIds?.has(sessionLinkIdentity(link)))
   return jsxs('div', {
     className: `group relative flex cursor-grab flex-col gap-2 rounded-md border border-(--ui-stroke-tertiary) border-l-2 bg-(--ui-bg-elevated) p-2.5 transition-colors hover:bg-primary/[0.06] active:cursor-grabbing${working ? ' border-(--dt-composer-ring) ring-1 ring-(--dt-composer-ring) bg-[color-mix(in_srgb,var(--dt-composer-ring)_10%,transparent)]' : active ? ' border-(--dt-composer-ring) bg-[color-mix(in_srgb,var(--dt-composer-ring)_7%,transparent)]' : ''}`,
     draggable: true,
@@ -757,17 +894,17 @@ function LinkedChats({ links, onAttach, onOpen, onScan, onUnlink, relatedChats, 
                   }),
                   jsx(Button, {
                     'aria-label': 'Unlink chat from Jira ticket',
-                    disabled: unlinking === link.session_id,
+                    disabled: unlinking === sessionLinkIdentity(link),
                     onClick: () => onUnlink(link),
                     size: 'icon',
                     title: 'Unlink only — the Hermes chat is kept',
                     variant: 'ghost',
-                    children: unlinking === link.session_id
+                    children: unlinking === sessionLinkIdentity(link)
                       ? jsx(GlyphSpinner, { className: 'size-3.5' })
                       : jsx(Codicon, { name: 'link-break', size: '0.875rem' })
                   })
                 ]
-              }, `${link.issue_id}:${link.session_id}`)
+              }, `${link.issue_id}:${sessionLinkIdentity(link)}`)
             )
           }),
       relatedChats.length > 0
@@ -794,7 +931,7 @@ function LinkedChats({ links, onAttach, onOpen, onScan, onUnlink, relatedChats, 
                       children: 'Attach'
                     })
                   ]
-                }, chat.session_id)
+                }, sessionLinkIdentity(chat))
               )
             ]
           })
@@ -914,7 +1051,7 @@ function IssueDetail({ issue, status, projects, mapping, links, baseRef, onOpenI
   const [availableWorktrees, setAvailableWorktrees] = useState([])
   const [linkedWorktree, setLinkedWorktree] = useState(() => readTicketWorktree(issue?.key))
   const [scanningChats, setScanningChats] = useState(false)
-  const [unlinkingChatId, setUnlinkingChatId] = useState('')
+  const [unlinkingChatKey, setUnlinkingChatKey] = useState('')
   const scanGeneration = useRef(0)
   const commentAttachmentIds = useMemo(() => new Set(
     (Array.isArray(issue?.comments) ? issue.comments : [])
@@ -962,7 +1099,14 @@ function IssueDetail({ issue, status, projects, mapping, links, baseRef, onOpenI
   const openLinked = useCallback(async link => {
     traceWorkOpen(issue?.key, 'resume-requested')
     try {
-      await host.openSession(link.session_id, { awaitHydration: true, expectHistory: true, forceResume: true })
+      const route = await resolveSessionRoute(link)
+      await host.openSession(link.session_id, {
+        awaitHydration: true,
+        expectHistory: true,
+        forceResume: true,
+        profile: route.targetProfile || route.profile,
+        route
+      })
       traceWorkOpen(issue?.key, 'resume-complete')
     } catch (cause) {
       traceWorkOpen(issue?.key, 'resume-error')
@@ -995,12 +1139,17 @@ function IssueDetail({ issue, status, projects, mapping, links, baseRef, onOpenI
     setBusyAction('link')
     setError('')
     try {
+      const focusedOwner = readFocusedSessionOwner()
+      const route = await resolveSessionRoute(focusedOwner)
+      await verifySessionOwner(sessionId, route)
+      const owner = ownerFromRoute(route)
       await api('/links', {
         method: 'POST',
         body: {
           issue_id: issue.id,
           issue_key: issue.key,
-          session_id: sessionId
+          session_id: sessionId,
+          ...sessionOwnerFields(owner)
         }
       })
       await onLinksChanged()
@@ -1030,15 +1179,19 @@ function IssueDetail({ issue, status, projects, mapping, links, baseRef, onOpenI
     setBusyAction(`attach:${sessionId}`)
     setError('')
     try {
+      const route = await resolveSessionRoute(chat)
+      await verifySessionOwner(sessionId, route)
+      const owner = ownerFromRoute(route)
       await api('/links', {
         method: 'POST',
         body: {
           issue_id: issue.id,
           issue_key: issue.key,
-          session_id: sessionId
+          session_id: sessionId,
+          ...sessionOwnerFields(owner)
         }
       })
-      writeChatDetached(issue.key, sessionId, false)
+      writeChatDetached(issue.key, { session_id: sessionId, ...sessionOwnerFields(owner) }, false)
       setRelatedChats(current => current.filter(candidate => candidate.session_id !== sessionId))
       await onLinksChanged()
       host.notify({ kind: 'success', message: `Attached the chat to ${issue.key}.` })
@@ -1052,12 +1205,15 @@ function IssueDetail({ issue, status, projects, mapping, links, baseRef, onOpenI
   const unlinkChat = useCallback(async link => {
     const sessionId = String(link?.session_id || '').trim()
     if (!sessionId || !issue?.id || !issue?.key) return
-    setUnlinkingChatId(sessionId)
+    const owner = ownerFromLink(link)
+    const unlinkKey = sessionLinkIdentity(link)
+    setUnlinkingChatKey(unlinkKey)
     setError('')
-    writeChatDetached(issue.key, sessionId, true)
+    writeChatDetached(issue.key, link, true)
     try {
       try {
-        await api(`/links/${encodeURIComponent(issue.id)}/${encodeURIComponent(sessionId)}`, { method: 'DELETE' })
+        const query = new URLSearchParams({ connection_id: owner.connectionId, profile_name: owner.profileName })
+        await api(`/links/${encodeURIComponent(issue.id)}/${encodeURIComponent(sessionId)}?${query.toString()}`, { method: 'DELETE' })
       } catch {
         // Older running backends do not have the DELETE route yet. The persisted
         // local detachment still hides the link and prevents worktree scans from
@@ -1066,10 +1222,10 @@ function IssueDetail({ issue, status, projects, mapping, links, baseRef, onOpenI
       await onLinksChanged()
       host.notify({ kind: 'success', message: `Unlinked the chat from ${issue.key}. The Hermes chat was kept.` })
     } catch (cause) {
-      writeChatDetached(issue.key, sessionId, false)
+      writeChatDetached(issue.key, link, false)
       setError(errorText(cause, 'Could not unlink the chat.'))
     } finally {
-      setUnlinkingChatId('')
+      setUnlinkingChatKey('')
     }
   }, [issue?.id, issue?.key, onLinksChanged])
 
@@ -1080,9 +1236,12 @@ function IssueDetail({ issue, status, projects, mapping, links, baseRef, onOpenI
     setScanningChats(true)
     setError('')
     try {
-      const sessions = await listCurrentProfileSessions(mapping?.hermes_project_id, issue?.project_key)
+      const focusedOwner = readFocusedSessionOwner()
+      const route = await resolveSessionRoute(focusedOwner)
+      const owner = ownerFromRoute(route)
+      const sessions = await listCurrentProfileSessions(mapping?.hermes_project_id, issue?.project_key, route)
       if (!isCurrent()) return
-      const linkedIds = new Set(links.map(link => String(link.session_id || '')))
+      const linkedIds = new Set(links.map(link => sessionLinkIdentity(link)))
       const detachedIds = readDetachedChatIds(issue.key)
       const repoPath = String(mapping?.repo_path || '').replace(/\/$/, '')
       const worktreeMap = new Map()
@@ -1108,16 +1267,19 @@ function IssueDetail({ issue, status, projects, mapping, links, baseRef, onOpenI
       let failedCount = 0
       for (const session of worktreeSessions) {
         if (!isCurrent()) return
-        const sessionId = String(session.id || '').trim()
-        const shouldAttach = sessionId && !detachedIds.has(sessionId)
-        if (!shouldAttach || linkedIds.has(sessionId)) continue
+        const sessionId = sessionIdFromRow(session)
+        const linkCandidate = { session_id: sessionId, ...sessionOwnerFields(owner) }
+        const linkIdentity = sessionLinkIdentity(linkCandidate)
+        const shouldAttach = sessionId && !detachedIds.has(linkIdentity)
+        if (!shouldAttach || linkedIds.has(linkIdentity)) continue
         try {
           await api('/links', {
             method: 'POST',
             body: {
               issue_id: issue.id,
               issue_key: issue.key,
-              session_id: sessionId
+              session_id: sessionId,
+              ...sessionOwnerFields(owner)
             }
           })
         } catch {
@@ -1125,7 +1287,7 @@ function IssueDetail({ issue, status, projects, mapping, links, baseRef, onOpenI
           continue
         }
         if (!isCurrent()) return
-        linkedIds.add(sessionId)
+        linkedIds.add(linkIdentity)
         attachedCount += 1
       }
       if (attachedCount > 0) {
@@ -1138,12 +1300,13 @@ function IssueDetail({ issue, status, projects, mapping, links, baseRef, onOpenI
       if (!isCurrent()) return
 
       const related = sessions
-        .filter(session => !linkedIds.has(String(session.id || '')))
+        .filter(session => !linkedIds.has(sessionLinkIdentity({ session_id: sessionIdFromRow(session), ...sessionOwnerFields(owner) })))
         .map(session => {
           const reason = chatMatchReason(session, issue)
           if (!reason) return null
           return {
-            session_id: String(session.id || ''),
+            session_id: sessionIdFromRow(session),
+            ...sessionOwnerFields(owner),
             chat_title: String(session.title || `Chat ${String(session.id || '').slice(0, 8)}`),
             worktree_path: sessionWorktreePath(session),
             branch: String(session.git_branch || ''),
@@ -1186,8 +1349,10 @@ function IssueDetail({ issue, status, projects, mapping, links, baseRef, onOpenI
     setError('')
     try {
       const focusedId = String(host.state?.focusedStoredSessionId?.get?.() || '')
-      const sessions = await listCurrentProfileSessions(mapping?.hermes_project_id, issue?.project_key)
-      const session = sessions.find(candidate => String(candidate.id || '') === focusedId)
+      const focusedOwner = readFocusedSessionOwner()
+      const route = await resolveSessionRoute(focusedOwner)
+      const sessions = await listCurrentProfileSessions(mapping?.hermes_project_id, issue?.project_key, route)
+      const session = sessions.find(candidate => sessionIdFromRow(candidate) === focusedId)
       const path = sessionWorktreePath(session)
       if (!session || !path) throw new Error('Open a persisted chat in the worktree first, then return to this ticket.')
       const repoPath = String(mapping?.repo_path || '').replace(/\/$/, '')
@@ -1366,7 +1531,10 @@ function IssueDetail({ issue, status, projects, mapping, links, baseRef, onOpenI
     let worktree = null
     let storedId = ''
     let linked = false
+    let ownerRoute = null
     try {
+      ownerRoute = await resolveSessionRoute(readFocusedSessionOwner())
+      const owner = ownerFromRoute(ownerRoute)
       worktree = linkedWorktree?.path
         ? {
             created: false,
@@ -1399,7 +1567,8 @@ function IssueDetail({ issue, status, projects, mapping, links, baseRef, onOpenI
         description: String(issue.description || '').slice(0, 12_000),
         url
       }, null, 2)
-      const created = await host.request('session.create', {
+      const created = await host.requestProfile(ownerRoute, 'session.create', {
+        profile: owner.targetProfile,
         source: 'desktop',
         cwd: worktree.path,
         title: `${issue.key}: ${String(issue.summary || '').slice(0, 160)}${links.length ? ` · Chat ${links.length + 1}` : ''}`,
@@ -1418,13 +1587,15 @@ function IssueDetail({ issue, status, projects, mapping, links, baseRef, onOpenI
       })
       storedId = String(created?.stored_session_id || '').trim()
       if (!storedId) throw new Error('Hermes did not return a stored session id.')
+      await verifySessionOwner(storedId, ownerRoute)
       traceWorkOpen(issue.key, 'session-created')
       await api('/links', {
         method: 'POST',
         body: {
           issue_id: issue.id,
           issue_key: issue.key,
-          session_id: storedId
+          session_id: storedId,
+          ...sessionOwnerFields(owner)
         }
       })
       linked = true
@@ -1434,7 +1605,13 @@ function IssueDetail({ issue, status, projects, mapping, links, baseRef, onOpenI
       setLinkedWorktree(createdWorktree)
       try {
         traceWorkOpen(issue.key, 'open-requested')
-        await host.openSession(storedId, { awaitHydration: true, expectHistory: true, forceResume: true })
+        await host.openSession(storedId, {
+          awaitHydration: true,
+          expectHistory: true,
+          forceResume: true,
+          profile: ownerRoute.targetProfile || ownerRoute.profile,
+          route: ownerRoute
+        })
         traceWorkOpen(issue.key, 'open-complete')
       } catch (cause) {
         traceWorkOpen(issue.key, 'open-error')
@@ -1451,7 +1628,11 @@ function IssueDetail({ issue, status, projects, mapping, links, baseRef, onOpenI
       traceWorkOpen(issue.key, 'start-error')
       if (storedId && !linked) {
         try {
-          await host.request('session.delete', { session_id: storedId })
+          if (ownerRoute && typeof host.requestProfile === 'function') {
+            await host.requestProfile(ownerRoute, 'session.delete', { session_id: storedId })
+          } else {
+            await host.request('session.delete', { session_id: storedId })
+          }
           storedId = ''
         } catch {
           // Keep the session if Hermes refuses cleanup; it still points at the worktree.
@@ -1758,7 +1939,7 @@ function IssueDetail({ issue, status, projects, mapping, links, baseRef, onOpenI
         onUnlink: unlinkChat,
         relatedChats,
         scanning: scanningChats,
-        unlinking: unlinkingChatId
+        unlinking: unlinkingChatKey
       }),
       !readOnly ? jsxs('section', {
         className: 'space-y-2',
@@ -2076,13 +2257,18 @@ function JiraPage() {
       if (refreshing) return
       refreshing = true
       try {
-        const result = await host.request('session.active_list', {})
+        const focusedOwner = readFocusedSessionOwner()
+        const route = await resolveSessionRoute(focusedOwner)
+        const result = await host.requestProfile(route, 'session.active_list', { profile: route.targetProfile || route.profile })
         if (!alive) return
         setWorkingSessionIds(new Set(
           (Array.isArray(result?.sessions) ? result.sessions : [])
             .filter(session => session.status === 'working')
-            .map(session => String(session.session_key || ''))
-            .filter(Boolean)
+            .map(session => sessionLinkIdentity({
+              session_id: session.stored_session_id || session.session_id || session.session_key,
+              ...sessionOwnerFields(ownerFromRoute(route))
+            }))
+            .filter(identity => !identity.endsWith('::::'))
         ))
       } catch {
         // Retain the last live snapshot through a transient gateway failure.

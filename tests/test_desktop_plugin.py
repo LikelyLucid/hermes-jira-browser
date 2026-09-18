@@ -112,7 +112,7 @@ class DesktopPluginTests(unittest.TestCase):
     def test_working_linked_session_highlights_the_ticket_card(self):
         source = PLUGIN.read_text(encoding="utf-8")
 
-        self.assertIn("host.request('session.active_list'", source)
+        self.assertIn("host.requestProfile(route, 'session.active_list'", source)
         self.assertIn("session.status === 'working'", source)
         self.assertIn("const [workingSessionIds, setWorkingSessionIds]", source)
         self.assertIn("const working = linkedWork.some", source)
@@ -132,14 +132,16 @@ class DesktopPluginTests(unittest.TestCase):
         source = PLUGIN.read_text(encoding="utf-8")
 
         self.assertIn("No agent task has been submitted.", source)
-        self.assertIn("await host.openSession(storedId, { awaitHydration: true, expectHistory: true, forceResume: true })", source)
-        self.assertIn("await host.openSession(link.session_id, { awaitHydration: true, expectHistory: true, forceResume: true })", source)
+        self.assertIn("profile: ownerRoute.targetProfile || ownerRoute.profile", source)
+        self.assertIn("route: ownerRoute", source)
+        self.assertIn("profile: route.targetProfile || route.profile", source)
+        self.assertIn("route", source)
         self.assertNotIn("expectHistory: false", source)
         start_work = source[source.index("const startWork = useCallback"):source.index("if (!issue) return")]
         self.assertNotIn("if (resumableLink)", start_work)
         self.assertIn("linkedWorktree?.path", start_work)
         self.assertNotIn("await onLinksChanged()", start_work)
-        open_call = "await host.openSession(storedId, { awaitHydration: true, expectHistory: true, forceResume: true })"
+        open_call = "await host.openSession(storedId, {"
         self.assertLess(start_work.index(open_call), start_work.index("void onLinksChanged()"))
         self.assertIn("traceWorkOpen(issue.key, 'session-created')", start_work)
         self.assertIn("traceWorkOpen(issue.key, 'open-complete')", start_work)
@@ -147,8 +149,8 @@ class DesktopPluginTests(unittest.TestCase):
     def test_related_chats_are_discovered_and_attachable(self):
         source = PLUGIN.read_text(encoding="utf-8")
 
-        self.assertIn("host.listPersistedSessions(null, { profile, limit: 500 })", source)
-        self.assertIn("host.request('projects.project_sessions'", source)
+        self.assertIn("host.listPersistedSessions(ownerRoute, { profile, limit: 500 })", source)
+        self.assertIn("host.requestProfile(ownerRoute, 'projects.project_sessions'", source)
         self.assertIn("session_limit: 20_000", source)
         self.assertIn("api(`/sessions/${encodeURIComponent(jiraProjectKey)}`)", source)
         self.assertIn("Likely related chats", source)
@@ -163,7 +165,7 @@ class DesktopPluginTests(unittest.TestCase):
         self.assertIn("method: 'DELETE'", source)
         self.assertIn("onUnlink: unlinkChat", source)
         self.assertIn("name: 'link-break'", source)
-        self.assertIn("!detachedIds.has(sessionId)", source)
+        self.assertIn("!detachedIds.has(linkIdentity)", source)
 
     def test_linked_worktree_auto_attaches_its_chats(self):
         source = PLUGIN.read_text(encoding="utf-8")
@@ -308,6 +310,39 @@ class DesktopPluginTests(unittest.TestCase):
         source = PLUGIN.read_text(encoding="utf-8")
 
         self.assertNotIn("Open Jira ticket…", source)
+
+    def test_session_link_identity_includes_connection_and_profile_owner(self):
+        source = PLUGIN.read_text(encoding="utf-8")
+
+        self.assertIn("function sessionLinkIdentity", source)
+        self.assertIn("owner.connectionId", source)
+        self.assertIn("owner.profileName", source)
+        self.assertIn("return `${owner.connectionId}::${owner.profileName}::${owner.targetProfile}::${sessionId}`", source)
+        self.assertIn("sessionLinkIdentity(link)", source)
+        self.assertIn("`${link.issue_id}:${sessionLinkIdentity(link)}`", source)
+
+    def test_session_links_resolve_saved_owner_for_open_and_unlink(self):
+        source = PLUGIN.read_text(encoding="utf-8")
+
+        self.assertIn("const route = await resolveSessionRoute(link)", source)
+        self.assertIn("route,", source[source.index("const route = await resolveSessionRoute(link)") :])
+        self.assertIn("connection_id: owner.connectionId", source)
+        self.assertIn("profile_name: owner.profileName", source)
+        self.assertIn("target_profile: owner.targetProfile", source)
+        self.assertIn("new URLSearchParams({ connection_id: owner.connectionId, profile_name: owner.profileName })", source)
+
+    def test_session_link_scans_and_verifies_through_the_owner_route(self):
+        source = PLUGIN.read_text(encoding="utf-8")
+
+        self.assertIn("host.profileRoutes()", source)
+        self.assertIn("host.listPersistedSessions(route", source)
+        self.assertIn("host.requestProfile(route, 'session.list'", source)
+        self.assertIn("const focusedOwner = readFocusedSessionOwner()", source)
+        self.assertIn("mergeBackendDetachedLinks", source)
+        self.assertIn("const linkIdentity = sessionLinkIdentity(linkCandidate)", source)
+        self.assertIn("detachedIds.has(linkIdentity)", source)
+        self.assertIn("link?.detached_at", source)
+        self.assertIn("available: undefined", source)
 
 
 if __name__ == "__main__":
