@@ -149,9 +149,6 @@ async def _run_mutation(
 def _validate_active_owner(profile_name: str, connection_id: str) -> tuple[str, str]:
     profile = SERVICE.validate_owner_field(profile_name, field_name="profile_name")
     connection = SERVICE.validate_owner_field(connection_id, field_name="connection_id")
-    active = SERVICE.active_profile_name()
-    if active is not None and profile != active:
-        raise ValueError(f"profile_name must identify the active profile ({active}).")
     return profile, connection
 
 
@@ -384,12 +381,22 @@ async def link_session(payload: SessionLinkRequest) -> dict[str, Any]:
         issue = await asyncio.to_thread(client.issue, payload.issue_key)
         if str(issue.get("id") or "") != payload.issue_id.strip() or str(issue.get("key") or "").upper() != payload.issue_key.strip().upper():
             raise ValueError("The Jira issue id and key do not identify the same issue.")
-        metadata = await asyncio.to_thread(
-            SERVICE.validated_link_metadata,
-            store,
-            issue_key=payload.issue_key,
-            session_id=payload.session_id,
-        )
+        active_profile = SERVICE.active_profile_name()
+        if connection_id == "local" and (active_profile is None or profile_name == active_profile):
+            metadata = await asyncio.to_thread(
+                SERVICE.validated_link_metadata,
+                store,
+                issue_key=payload.issue_key,
+                session_id=payload.session_id,
+            )
+        else:
+            jira_project_key = payload.issue_key.strip().upper().rsplit("-", 1)[0]
+            mapping = await asyncio.to_thread(store.get_project_mapping, jira_project_key)
+            metadata = {
+                "project_id": mapping.get("hermes_project_id") if mapping else None,
+                "worktree_path": None,
+                "branch": None,
+            }
         link = await asyncio.to_thread(
             store.link_session,
             issue_id=payload.issue_id,

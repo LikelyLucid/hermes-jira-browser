@@ -868,6 +868,34 @@ class StoreTests(unittest.TestCase):
         self.assertTrue(result[0]["archived"])
         self.assertTrue(result[0]["available"])
 
+    def test_foreign_owner_links_do_not_resolve_against_active_session_db(self):
+        class FakeSessionDB:
+            def __init__(self, read_only=False):
+                self.read_only = read_only
+
+            def get_session(self, session_id):
+                raise AssertionError("foreign owner must not query active SessionDB")
+
+            def close(self):
+                pass
+
+        module = types.ModuleType("hermes_state")
+        setattr(module, "SessionDB", FakeSessionDB)
+        links = [{
+            "session_id": "same-id",
+            "connection_id": "work-vps",
+            "profile_name": "coder",
+            "target_profile": "coder",
+        }]
+        with mock.patch.dict(sys.modules, {"hermes_state": module}), mock.patch.object(
+            jira_service, "active_profile_name", return_value="default"
+        ):
+            result = jira_service.enrich_session_links(links)
+
+        self.assertIsNone(result[0]["chat_title"])
+        self.assertIsNone(result[0]["archived"])
+        self.assertIsNone(result[0]["available"])
+
     def test_project_session_scan_pages_and_keeps_archived_worktree_chats(self):
         calls = []
         rows = [

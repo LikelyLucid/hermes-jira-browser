@@ -1780,10 +1780,19 @@ def enrich_session_links(links: list[Mapping[str, Any]]) -> list[dict[str, Any]]
     from hermes_state import SessionDB
 
     session_db = SessionDB(read_only=True)
+    active_profile = active_profile_name()
     enriched: list[dict[str, Any]] = []
     try:
         for value in links:
             link = dict(value)
+            connection_id = str(link.get("connection_id") or "local").strip() or "local"
+            profile_name = str(link.get("profile_name") or active_profile or "default").strip() or "default"
+            if connection_id != "local" or (active_profile is not None and profile_name != active_profile):
+                link["chat_title"] = None
+                link["archived"] = None
+                link["available"] = None
+                enriched.append(link)
+                continue
             try:
                 session = session_db.get_session(str(link.get("session_id") or "").strip())
             except Exception:
