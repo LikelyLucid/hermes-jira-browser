@@ -131,13 +131,18 @@ The backend resolves the repository from the stored Jira project mapping and the
 
 ## Development
 
-Run syntax checks and tests from the repository root in an environment where Hermes Agent is installed:
+Run the complete local quality gate from the repository root:
 
 ```bash
-node --check desktop/plugin.js
-python -m compileall -q dashboard tests
-python -m unittest discover -s tests -v
+./scripts/test.sh
 ```
+
+The script creates a disposable Python virtual environment, installs the pinned public
+FastAPI/Pydantic test dependencies, supplies test-only compatibility shims for the small
+Hermes APIs imported by this plugin, then runs JavaScript syntax checking, Python
+`compileall`, full `unittest` discovery, and a repository secret/PII-pattern scan. It
+clears Jira configuration variables and never contacts Jira. The temporary environment
+is removed when the script exits.
 
 The suite covers Jira normalization and security, attachment handling, settings, worktree behavior, session links, API routes, and Desktop integration contracts.
 
