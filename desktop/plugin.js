@@ -1222,13 +1222,13 @@ function IssueDetail({ issue, status, projects, mapping, links, baseRef, onOpenI
         method: 'POST',
         body: { transition_id: suggestedTransition.id, idempotency_key: mutationKey }
       })
-      forgetMutationKey('suggestion', issue.key, { transition_id: suggestedTransition.id }, mutationKey)
       const [updated, choices] = await Promise.all([
         api(`/issues/${encodeURIComponent(issue.key)}`, { timeoutMs: 30_000 }),
         api(`/issues/${encodeURIComponent(issue.key)}/transitions`)
       ])
       onIssueChanged?.(updated)
       setTransitions(Array.isArray(choices?.transitions) ? choices.transitions : [])
+      forgetMutationKey('suggestion', issue.key, { transition_id: suggestedTransition.id }, mutationKey)
       host.notify({ kind: 'success', message: `${issue.key} moved to ${updated.status}.` })
     } catch (cause) {
       setError(errorText(cause, 'Could not apply the suggested status.'))
@@ -1325,7 +1325,6 @@ function IssueDetail({ issue, status, projects, mapping, links, baseRef, onOpenI
         method: 'POST',
         body: { transition_id: transitionId, idempotency_key: mutationKey }
       })
-      forgetMutationKey('transition', issue.key, { transition_id: transitionId }, mutationKey)
       const [updated, choices] = await Promise.all([
         api(`/issues/${encodeURIComponent(issue.key)}`, { timeoutMs: 30_000 }),
         api(`/issues/${encodeURIComponent(issue.key)}/transitions`)
@@ -1333,6 +1332,7 @@ function IssueDetail({ issue, status, projects, mapping, links, baseRef, onOpenI
       onIssueChanged?.(updated)
       setTransitions(Array.isArray(choices?.transitions) ? choices.transitions : [])
       setTransitionId('')
+      forgetMutationKey('transition', issue.key, { transition_id: transitionId }, mutationKey)
       host.notify({ kind: 'success', message: `${issue.key} moved to ${updated.status}.` })
     } catch (cause) {
       setError(errorText(cause, 'Could not change the Jira status.'))
@@ -2554,10 +2554,10 @@ function JiraPage() {
         method: 'POST',
         body: { transition_id: transition.id, idempotency_key: mutationKey }
       })
-      forgetMutationKey('drag', issueKey, { transition_id: transition.id }, mutationKey)
       const updated = await api(`/issues/${encodeURIComponent(issueKey)}`, { timeoutMs: 30_000 })
       setIssues(rows => rows.map(issue => issue.key === issueKey ? { ...issue, ...updated } : issue))
       if (selectedKey === issueKey) setDetail(updated)
+      forgetMutationKey('drag', issueKey, { transition_id: transition.id }, mutationKey)
       host.notify({ kind: 'success', message: `${issueKey} moved to ${updated.status}.` })
     } catch (cause) {
       setError(errorText(cause, `Could not move ${issueKey}.`))

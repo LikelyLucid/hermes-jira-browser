@@ -215,6 +215,16 @@ class DesktopPluginTests(unittest.TestCase):
         self.assertIn("mutationKeyFor('drag'", source)
         self.assertNotIn("const mutationKey = newMutationKey()", source)
 
+    def test_transition_retry_keys_survive_until_followup_refresh_succeeds(self):
+        source = PLUGIN.read_text(encoding="utf-8")
+        suggestion = source[source.index("const applySuggestedTransition"):source.index("const draftJiraUpdate")]
+        manual = source[source.index("const moveIssue = useCallback"):source.index("const startWork = useCallback")]
+        drag = source[source.index("const moveIssueToLane"):source.index("const beginDrawerResize")]
+
+        self.assertLess(suggestion.index("const [updated, choices]"), suggestion.index("forgetMutationKey('suggestion'"))
+        self.assertLess(manual.index("const [updated, choices]"), manual.index("forgetMutationKey('transition'"))
+        self.assertLess(drag.index("const updated = await api"), drag.index("forgetMutationKey('drag'"))
+
     def test_explicit_jira_mutations_send_high_entropy_idempotency_keys(self):
         source = PLUGIN.read_text(encoding="utf-8")
 
