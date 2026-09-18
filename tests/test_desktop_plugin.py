@@ -390,9 +390,30 @@ class DesktopPluginTests(unittest.TestCase):
         source = PLUGIN.read_text(encoding="utf-8")
         resolver = source[source.index("async function resolveSessionRoute"):source.index("async function resolveFocusedSessionRoute")]
 
-        self.assertIn("const matches = (Array.isArray(routes) ? routes : []).filter", resolver)
-        self.assertIn("if (matches.length > 1) throw new Error", resolver)
+        self.assertIn("const ownerMatches = (Array.isArray(routes) ? routes : []).filter", resolver)
+        self.assertIn("if (ownerMatches.length > 1) throw new Error", resolver)
         self.assertNotIn(").find(candidate =>", resolver)
+
+    def test_owner_route_resolution_rejects_duplicate_owner_before_target_matching(self):
+        source = PLUGIN.read_text(encoding="utf-8")
+        resolver = source[source.index("async function resolveSessionRoute"):source.index("async function resolveFocusedSessionRoute")]
+
+        self.assertIn("const ownerMatches = (Array.isArray(routes) ? routes : []).filter", resolver)
+        self.assertIn("if (ownerMatches.length > 1) throw new Error", resolver)
+        self.assertIn("const matches = ownerMatches.filter", resolver)
+        self.assertLess(
+            resolver.index("if (ownerMatches.length > 1) throw new Error"),
+            resolver.index("const matches = ownerMatches.filter"),
+        )
+
+    def test_working_session_snapshot_clears_when_focused_owner_cannot_be_resolved(self):
+        source = PLUGIN.read_text(encoding="utf-8")
+        refresh = source[source.index("const refreshWorkingSessions"):source.index("const timer = window.setInterval", source.index("const refreshWorkingSessions"))]
+
+        self.assertIn("route = await resolveFocusedSessionRoute()", refresh)
+        self.assertIn("if (alive && !isConfirmedTransientRpcFailure(cause)) setWorkingSessionIds(new Set())", refresh)
+        self.assertIn("function isConfirmedTransientRpcFailure", source)
+        self.assertIn("error?.transient === true", source)
 
     def test_raw_legacy_detach_tombstones_suppress_all_owner_qualified_matches(self):
         source = PLUGIN.read_text(encoding="utf-8")

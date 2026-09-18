@@ -268,14 +268,17 @@ async function resolveSessionRoute(value, options = {}) {
   const matchTarget = options.matchTarget !== false
   if (typeof host.profileRoutes !== 'function') throw new Error('Hermes Desktop connection routing is unavailable.')
   const routes = await host.profileRoutes()
-  const matches = (Array.isArray(routes) ? routes : []).filter(candidate => {
+  const ownerMatches = (Array.isArray(routes) ? routes : []).filter(candidate => {
     const candidateOwner = ownerFromRoute(candidate)
     return candidateOwner.connectionId === owner.connectionId
       && candidateOwner.profileName === owner.profileName
-      && (!matchTarget || candidateOwner.targetProfile === owner.targetProfile)
+  })
+  if (ownerMatches.length > 1) throw new Error(`The connection/profile owner ${owner.connectionId}::${owner.profileName} is ambiguous.`)
+  const matches = ownerMatches.filter(candidate => {
+    const candidateOwner = ownerFromRoute(candidate)
+    return !matchTarget || candidateOwner.targetProfile === owner.targetProfile
   })
   if (matches.length === 0) throw new Error(`The connection/profile owner ${owner.connectionId}::${owner.profileName} is unavailable.`)
-  if (matches.length > 1) throw new Error(`The connection/profile owner ${owner.connectionId}::${owner.profileName} is ambiguous.`)
   return matches[0]
 }
 
@@ -284,6 +287,10 @@ async function resolveFocusedSessionRoute() {
   if (!owner) throw new Error('The focused chat owner is ambiguous or unavailable.')
   const route = await resolveSessionRoute(owner, { matchTarget: false })
   return route
+}
+
+function isConfirmedTransientRpcFailure(error) {
+  return error?.transient === true || error?.code === 'TRANSIENT_RPC_FAILURE'
 }
 
 function isAmbientOwnerRoute(route) {
@@ -2351,20 +2358,28 @@ function JiraPage() {
       if (refreshing) return
       refreshing = true
       try {
-        const route = await resolveFocusedSessionRoute()
-        const result = await host.requestProfile(route, 'session.active_list', { profile: route.targetProfile || route.profile })
-        if (!alive) return
-        setWorkingSessionIds(new Set(
-          (Array.isArray(result?.sessions) ? result.sessions : [])
-            .filter(session => session.status === 'working')
-            .map(session => sessionLinkIdentity({
-              session_id: session.stored_session_id || session.session_id || session.session_key,
-              ...sessionOwnerFields(ownerFromRoute(route))
-            }))
-            .filter(identity => !identity.endsWith('::::'))
-        ))
-      } catch {
-        // Retain the last live snapshot through a transient gateway failure.
+        let route
+        try {
+          route = await resolveFocusedSessionRoute()
+        } catch (cause) {
+          if (alive && !isConfirmedTransientRpcFailure(cause)) setWorkingSessionIds(new Set())
+          return
+        }
+        try {
+          const result = await host.requestProfile(route, 'session.active_list', { profile: route.targetProfile || route.profile })
+          if (!alive) return
+          setWorkingSessionIds(new Set(
+            (Array.isArray(result?.sessions) ? result.sessions : [])
+              .filter(session => session.status === 'working')
+              .map(session => sessionLinkIdentity({
+                session_id: session.stored_session_id || session.session_id || session.session_key,
+                ...sessionOwnerFields(ownerFromRoute(route))
+              }))
+              .filter(identity => !identity.endsWith('::::'))
+          ))
+        } catch (cause) {
+          if (alive && !isConfirmedTransientRpcFailure(cause)) setWorkingSessionIds(new Set())
+        }
       } finally {
         refreshing = false
       }
