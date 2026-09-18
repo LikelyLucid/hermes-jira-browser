@@ -118,6 +118,16 @@ class RepositoryContextResolutionTests(unittest.TestCase):
         self.assertEqual(result["reason"], "base_ref_invalid")
         store.get_project_mapping.assert_not_called()
 
+    def test_revision_expressions_are_not_accepted_as_base_refs(self):
+        store = mock.Mock()
+
+        for value in ("HEAD^", "HEAD~2", "main:other", "main^{commit}"):
+            with self.subTest(value=value):
+                result = repository_context.get_repository_context(store, "DEMO-42", base_ref=value)
+                self.assertEqual(result["reason"], "base_ref_invalid")
+
+        store.get_project_mapping.assert_not_called()
+
     def test_missing_git_base_ref_is_explicitly_unavailable(self):
         with tempfile.TemporaryDirectory() as tmp:
             repo = Path(tmp)
@@ -223,10 +233,32 @@ class RepositoryContextResolutionTests(unittest.TestCase):
         self.assertEqual(result.stdout, "ok")
         args, kwargs = run.call_args
         self.assertEqual(args[0][:2], ["git", "-c"])
+        self.assertIn("core.fsmonitor=false", args[0])
         self.assertEqual(kwargs["cwd"], Path("/repo"))
         self.assertEqual(kwargs["timeout"], repository_context.GIT_TIMEOUT_SECONDS)
         self.assertEqual(kwargs["environment"]["GIT_TERMINAL_PROMPT"], "0")
         self.assertEqual(kwargs["environment"]["GIT_CONFIG_NOSYSTEM"], "1")
+        self.assertEqual(kwargs["environment"]["GIT_OPTIONAL_LOCKS"], "0")
+
+    def test_repository_fsmonitor_command_is_not_executed(self):
+        import subprocess
+
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            marker = repo / "fsmonitor-ran"
+            hook = repo / "fsmonitor.sh"
+            hook.write_text(
+                f"#!/bin/sh\ntouch {marker}\nprintf 'token\\n'\n",
+                encoding="utf-8",
+            )
+            hook.chmod(0o700)
+            subprocess.run(["git", "init", "-q", "-b", "main"], cwd=repo, check=True)
+            subprocess.run(["git", "config", "core.fsmonitor", str(hook)], cwd=repo, check=True)
+
+            result = repository_context._run_git(repo, "status", "--short")
+
+            self.assertEqual(result.returncode, 0)
+            self.assertFalse(marker.exists())
 
     def test_authenticated_gh_adapter_reads_bounded_pr_json_without_network_library(self):
         adapter = repository_context.GhGitHubAdapter(executable="/usr/bin/gh")
@@ -258,6 +290,18 @@ class RepositoryContextResolutionTests(unittest.TestCase):
         self.assertTrue(result["available"])
         self.assertEqual(result["reason"], "no_pull_request")
         self.assertIsNone(result["pull_request"])
+
+    def test_gh_adapter_does_not_misreport_network_failure_as_no_pull_request(self):
+        adapter = repository_context.GhGitHubAdapter(executable="/usr/bin/gh")
+        adapter._run = mock.Mock(side_effect=[
+            mock.Mock(returncode=0, stdout="authenticated", stderr=""),
+            mock.Mock(returncode=1, stdout="", stderr="HTTP 503 service unavailable"),
+        ])
+
+        result = adapter.context(repository=Path("/repo"), branch="jira/DEMO-42")
+
+        self.assertFalse(result["available"])
+        self.assertEqual(result["reason"], "gh_query_failed")
 
 
 if __name__ == "__main__":

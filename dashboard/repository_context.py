@@ -46,21 +46,30 @@ def _validated_base_ref(base_ref: str) -> str:
     value = str(base_ref or "HEAD").strip()
     if not value or len(value) > 200 or value.startswith("-") or any(char.isspace() or ord(char) < 32 for char in value):
         raise ValueError("base_ref must be a non-empty Git ref without whitespace or options")
+    if value == "HEAD":
+        return value
+    if not re.fullmatch(r"(?:refs/(?:heads|remotes)/)?[A-Za-z0-9][A-Za-z0-9._/-]*", value):
+        raise ValueError("base_ref is not a valid branch or ref name")
     if "\x00" in value or ".." in value or "@{" in value or value.endswith(".") or value.endswith("/"):
         raise ValueError("base_ref is not a valid Git ref")
-    if value.endswith(".lock") or "//" in value:
+    if value.endswith(".lock") or "//" in value or any(part.startswith(".") or part.endswith(".") for part in value.split("/")):
         raise ValueError("base_ref is not a valid Git ref")
     return value
 
 
 def _git_environment() -> dict[str, str]:
     environment = os.environ.copy()
+    for key in list(environment):
+        if key in {"GIT_CONFIG_PARAMETERS", "GIT_CONFIG_COUNT", "GIT_DIR", "GIT_WORK_TREE", "GIT_OBJECT_DIRECTORY", "GIT_ALTERNATE_OBJECT_DIRECTORIES"} or key.startswith(("GIT_CONFIG_KEY_", "GIT_CONFIG_VALUE_")):
+            environment.pop(key, None)
     environment.update(
         {
             "GIT_TERMINAL_PROMPT": "0",
             "GIT_ASKPASS": os.devnull,
             "GIT_CONFIG_NOSYSTEM": "1",
             "GIT_CONFIG_GLOBAL": os.devnull,
+            "GIT_OPTIONAL_LOCKS": "0",
+            "GIT_ATTR_NOSYSTEM": "1",
         }
     )
     return environment
@@ -99,7 +108,7 @@ def _run_bounded(
 def _run_git(cwd: Path, *args: str) -> subprocess.CompletedProcess[str]:
     try:
         return _run_bounded(
-            ["git", "-c", f"core.hooksPath={os.devnull}", *args],
+            ["git", "-c", f"core.hooksPath={os.devnull}", "-c", "core.fsmonitor=false", *args],
             cwd=cwd,
             timeout=GIT_TIMEOUT_SECONDS,
             environment=_git_environment(),
@@ -179,7 +188,7 @@ def _local_context(worktree: Path, *, repository: Path, branch: str, base_ref: s
         reason = str(exc) if str(exc) in {"git_not_installed", "git_timeout"} else "base_ref_unavailable"
         raise RuntimeError(reason) from exc
     try:
-        status_output = _git_success(worktree, "status", "--short", "--untracked-files=all").stdout
+        status_output = _git_success(worktree, "status", "--short", "--untracked-files=all", "--ignore-submodules=all").stdout
         branch_output = _git_success(worktree, "branch", "--show-current").stdout.strip()
         commits_output = _git_success(
             worktree,
@@ -205,7 +214,7 @@ def _local_context(worktree: Path, *, repository: Path, branch: str, base_ref: s
     changed_files, changed_truncated = _parse_changed_files(status_output)
     recent_commits, recent_commits_truncated = _parse_recent_commits(commits_output)
     return {
-        "repo_path": str(worktree.parent.parent),
+        "repo_path": str(repository),
         "worktree_path": str(worktree),
         "branch": branch_output,
         "base_ref": base_ref,
@@ -298,7 +307,10 @@ class GhGitHubAdapter:
             "url,number,title,state,reviewDecision,statusCheckRollup",
         )
         if result.returncode != 0:
-            return {"available": True, "reason": "no_pull_request", "pull_request": None, "checks": []}
+            detail = (result.stderr or result.stdout or "").casefold()
+            if any(marker in detail for marker in ("no pull request", "no pull requests", "could not find pull request")):
+                return {"available": True, "reason": "no_pull_request", "pull_request": None, "checks": []}
+            return {"available": False, "reason": "gh_query_failed", "pull_request": None, "checks": []}
         try:
             payload = json.loads((result.stdout or "")[:MAX_COMMAND_OUTPUT])
         except json.JSONDecodeError:
