@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Editors and operating systems
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# Local environments
+.env
+.env.*
+.venv/
+venv/
+
+# Jira credentials and local plugin state
+jira-config.json
+config.local.json
+settings.json
+state.sqlite3
+*.sqlite
+*.sqlite3
+
+# Build output
+build/
+dist/

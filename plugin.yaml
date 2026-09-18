@@ -1,0 +1,5 @@
+name: jira-browser
+version: 0.1.0
+description: Native Hermes Jira browser with project-aware worktree and chat handoff.
+author: Hermes Jira Browser contributors
+kind: backend

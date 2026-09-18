@@ -1,0 +1,4 @@
+{
+  "name": "jira-browser",
+  "api": "plugin_api.py"
+}
