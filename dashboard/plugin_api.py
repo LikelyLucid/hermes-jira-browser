@@ -18,6 +18,13 @@ if _SPEC is None or _SPEC.loader is None:
 SERVICE = importlib.util.module_from_spec(_SPEC)
 _SPEC.loader.exec_module(SERVICE)
 
+_CONTEXT_PATH = Path(__file__).with_name("repository_context.py")
+_CONTEXT_SPEC = importlib.util.spec_from_file_location("hermes_jira_browser_repository_context", _CONTEXT_PATH)
+if _CONTEXT_SPEC is None or _CONTEXT_SPEC.loader is None:
+    raise RuntimeError(f"Could not load repository context from {_CONTEXT_PATH}")
+REPOSITORY_CONTEXT = importlib.util.module_from_spec(_CONTEXT_SPEC)
+_CONTEXT_SPEC.loader.exec_module(REPOSITORY_CONTEXT)
+
 router = APIRouter()
 
 
@@ -106,6 +113,19 @@ async def issue(issue_key: str) -> dict[str, Any]:
         return await asyncio.to_thread(_client().issue, issue_key)
     except Exception as exc:
         raise _safe_http_error(exc, status_code=502) from exc
+
+
+@router.get("/issues/{issue_key}/repository-context")
+async def issue_repository_context(issue_key: str, base_ref: str = "HEAD") -> dict[str, Any]:
+    try:
+        return await asyncio.to_thread(
+            REPOSITORY_CONTEXT.get_repository_context,
+            _store(),
+            issue_key,
+            base_ref=base_ref,
+        )
+    except Exception:
+        return REPOSITORY_CONTEXT.unavailable_context(issue_key)
 
 
 @router.get("/issues/{issue_key}/attachments/{attachment_id}/preview")

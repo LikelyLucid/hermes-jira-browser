@@ -16,6 +16,7 @@ A native Jira workspace for Hermes Desktop. It presents Jira issues on a Kanban-
 - Opens work sessions without submitting an agent task.
 - Deep-links exact tickets with `/jira?issue=PROJECT-123`; the in-route drawer follows hash navigation.
 - Pins a read-only ticket companion beside chat when the Desktop `host.openWorkspace` contract is available, without opening a session.
+- Provides read-only repository, branch, diff, commit, ahead/behind, pull-request, and CI context for a ticket when its mapped Jira worktree exists.
 - Drafts Jira updates in a normal Hermes session; posting remains explicit.
 - Suggests transitions but never applies one without a click.
 - Exposes four read-only agent tools: assigned issues, bounded JQL search, fresh issue detail, and available transitions.
@@ -30,6 +31,8 @@ A native Jira workspace for Hermes Desktop. It presents Jira issues on a Kanban-
 - Jira descriptions and comments are treated as untrusted data.
 - Attachment metadata is validated against the requested issue before a bounded thumbnail is fetched.
 - Worktree creation is noninteractive and disables repository hooks and injected global Git configuration.
+- Repository context is resolved only from the server-side Jira project mapping and the canonical `jira/<ISSUE-KEY>` worktree; renderer-supplied paths are ignored.
+- Repository and `gh` commands use argv execution, closed stdin, noninteractive environments, timeouts, and bounded output. GitHub context is unavailable when `gh` is missing, unauthenticated, or no pull request exists.
 - Unlinking a Jira association never deletes or archives the Hermes session.
 
 See [SECURITY.md](SECURITY.md) for reporting guidance and operational notes.
@@ -115,6 +118,16 @@ The drawer provides a form for common settings and a raw JSON editor for complet
 ## Desktop compatibility
 
 The native companion uses the optional `host.openWorkspace` SDK method and falls back to a warning on older Desktop builds. The SDK's palette contract currently provides a no-argument `run` callback but no safe prompt or ticket-picker surface, so **Open Jira ticket…** is intentionally not registered rather than relying on an invented API.
+
+## Repository context API
+
+The read-only endpoint:
+
+```text
+GET /issues/{issue_key}/repository-context?base_ref=main
+```
+
+The backend resolves the repository from the stored Jira project mapping and then checks the canonical `.worktrees/jira-{ISSUE-KEY}` worktree. It returns an explicit `unavailable` state when the mapping, repository, worktree, Git base ref, or GitHub CLI context is absent. The optional `base_ref` is validated before Git compares ahead/behind state. No renderer-provided filesystem path is accepted.
 
 ## Development
 

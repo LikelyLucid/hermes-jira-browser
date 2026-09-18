@@ -24,6 +24,7 @@ class JiraBrowserApiTests(unittest.TestCase):
         self.assertIn("/settings", paths)
         self.assertIn("/issues", paths)
         self.assertIn("/issues/{issue_key}", paths)
+        self.assertIn("/issues/{issue_key}/repository-context", paths)
         self.assertIn("/issues/{issue_key}/attachments/{attachment_id}/preview", paths)
         self.assertIn("/issues/{issue_key}/comments", paths)
         self.assertIn("/issues/{issue_key}/transitions", paths)
@@ -50,6 +51,31 @@ class JiraBrowserApiTests(unittest.TestCase):
 
         self.assertTrue(result["configured"])
         self.assertNotIn("token", str(result).lower())
+
+    def test_repository_context_is_read_only_and_uses_server_side_store(self):
+        store = mock.Mock()
+        expected = {"status": "unavailable", "available": False, "reason": "worktree_missing"}
+        with mock.patch.object(plugin_api, "_store", return_value=store), mock.patch.object(
+            plugin_api.REPOSITORY_CONTEXT,
+            "get_repository_context",
+            return_value=expected,
+        ) as context:
+            result = asyncio.run(plugin_api.issue_repository_context("DEMO-42", base_ref="main"))
+
+        self.assertEqual(result, expected)
+        context.assert_called_once_with(store, "DEMO-42", base_ref="main")
+
+    def test_repository_context_failures_become_renderer_safe_unavailable_payloads(self):
+        with mock.patch.object(plugin_api, "_store", side_effect=RuntimeError("secret path")), mock.patch.object(
+            plugin_api.REPOSITORY_CONTEXT,
+            "unavailable_context",
+            return_value={"status": "unavailable", "available": False, "reason": "repository_context_unavailable"},
+        ) as unavailable:
+            result = asyncio.run(plugin_api.issue_repository_context("DEMO-42"))
+
+        self.assertEqual(result["status"], "unavailable")
+        self.assertNotIn("secret path", str(result))
+        unavailable.assert_called_once_with("DEMO-42")
 
     def test_settings_are_loaded_and_saved_through_service(self):
         settings = {
