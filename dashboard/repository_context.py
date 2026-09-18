@@ -5,9 +5,11 @@ from __future__ import annotations
 import json
 import os
 import re
+import signal
 import shutil
 import subprocess
-import tempfile
+import threading
+import time
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -82,27 +84,73 @@ def _run_bounded(
     timeout: int,
     environment: dict[str, str],
 ) -> subprocess.CompletedProcess[str]:
-    """Capture command output through temporary files so memory stays bounded."""
-    with tempfile.TemporaryFile() as stdout_file, tempfile.TemporaryFile() as stderr_file:
-        process = subprocess.Popen(
-            argv,
-            cwd=cwd,
-            stdin=subprocess.DEVNULL,
-            stdout=stdout_file,
-            stderr=stderr_file,
-            env=environment,
-        )
+    """Capture output in bounded memory and kill the process group on overflow."""
+    process = subprocess.Popen(
+        argv,
+        cwd=cwd,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env=environment,
+        start_new_session=os.name == "posix",
+    )
+    buffers = {"stdout": bytearray(), "stderr": bytearray()}
+    overflow = threading.Event()
+
+    def drain(stream, key: str) -> None:
         try:
-            returncode = process.wait(timeout=timeout)
-        except subprocess.TimeoutExpired:
+            while chunk := stream.read(64 * 1024):
+                remaining = MAX_COMMAND_OUTPUT - len(buffers[key])
+                if remaining > 0:
+                    buffers[key].extend(chunk[:remaining])
+                if len(chunk) > remaining:
+                    overflow.set()
+                    return
+        finally:
+            stream.close()
+
+    threads = [
+        threading.Thread(target=drain, args=(process.stdout, "stdout"), daemon=True),
+        threading.Thread(target=drain, args=(process.stderr, "stderr"), daemon=True),
+    ]
+    for thread in threads:
+        thread.start()
+
+    def kill_group() -> None:
+        if process.poll() is not None:
+            return
+        if os.name == "posix":
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        else:
             process.kill()
-            process.wait()
-            raise
-        stdout_file.seek(0)
-        stderr_file.seek(0)
-        stdout = stdout_file.read(MAX_COMMAND_OUTPUT).decode("utf-8", errors="replace")
-        stderr = stderr_file.read(MAX_COMMAND_OUTPUT).decode("utf-8", errors="replace")
-    return subprocess.CompletedProcess(argv, returncode, stdout, stderr)
+
+    deadline = time.monotonic() + timeout
+    timed_out = False
+    while process.poll() is None:
+        if overflow.is_set():
+            kill_group()
+            break
+        if time.monotonic() >= deadline:
+            timed_out = True
+            kill_group()
+            break
+        time.sleep(0.01)
+    process.wait()
+    for thread in threads:
+        thread.join(timeout=1)
+    if timed_out:
+        raise subprocess.TimeoutExpired(argv, timeout)
+    if overflow.is_set():
+        raise RuntimeError("command_output_too_large")
+    return subprocess.CompletedProcess(
+        argv,
+        process.returncode,
+        bytes(buffers["stdout"]).decode("utf-8", errors="replace"),
+        bytes(buffers["stderr"]).decode("utf-8", errors="replace"),
+    )
 
 
 def _run_git(cwd: Path, *args: str) -> subprocess.CompletedProcess[str]:
@@ -141,9 +189,31 @@ def _parse_changed_files(output: str) -> tuple[list[dict[str, str]], bool]:
     return changed, truncated
 
 
-def _parse_recent_commits(output: str) -> tuple[list[dict[str, str]], bool]:
+def _changed_files(worktree: Path) -> tuple[list[dict[str, str]], bool]:
+    """Read index/stat state without invoking repository filter processes."""
+    commands = (
+        ("S", ("diff", "--cached", "--name-only", "-z", "--no-renames", "--no-ext-diff", "--no-textconv", "HEAD", "--")),
+        ("M", ("ls-files", "--modified", "-z", "--")),
+        ("D", ("ls-files", "--deleted", "-z", "--")),
+        ("??", ("ls-files", "--others", "--exclude-standard", "-z", "--")),
+    )
+    by_path: dict[str, str] = {}
+    for status, args in commands:
+        output = _git_success(worktree, *args).stdout
+        for path in output.split("\0"):
+            path = path.strip()
+            if path and path not in by_path:
+                by_path[path] = status
+    truncated = len(by_path) > MAX_CHANGED_FILES
+    return [
+        {"status": status, "path": path}
+        for path, status in list(by_path.items())[:MAX_CHANGED_FILES]
+    ], truncated
+
+
+def _parse_recent_commits(output: str) -> tuple[list[dict[str, Any]], bool]:
     lines = output.splitlines()
-    commits: list[dict[str, str]] = []
+    commits: list[dict[str, Any]] = []
     for line in lines[:MAX_RECENT_COMMITS]:
         sha, separator, rest = line.partition("\t")
         if not separator:
@@ -154,7 +224,14 @@ def _parse_recent_commits(output: str) -> tuple[list[dict[str, str]], bool]:
         subject, separator, authored_at = tail.partition("\t")
         if not separator:
             authored_at = ""
-        commits.append({"sha": sha, "subject": subject, "author": author, "authored_at": authored_at})
+        normalized_subject = subject.strip()
+        commits.append({
+            "sha": sha.strip(),
+            "subject": normalized_subject,
+            "subject_truncated": len(subject) >= 500 and normalized_subject.endswith(".."),
+            "author": author.strip(),
+            "authored_at": authored_at.strip(),
+        })
     return commits, len(lines) > MAX_RECENT_COMMITS
 
 
@@ -188,13 +265,13 @@ def _local_context(worktree: Path, *, repository: Path, branch: str, base_ref: s
         reason = str(exc) if str(exc) in {"git_not_installed", "git_timeout"} else "base_ref_unavailable"
         raise RuntimeError(reason) from exc
     try:
-        status_output = _git_success(worktree, "status", "--short", "--untracked-files=all", "--ignore-submodules=all").stdout
+        changed_files, changed_truncated = _changed_files(worktree)
         branch_output = _git_success(worktree, "branch", "--show-current").stdout.strip()
         commits_output = _git_success(
             worktree,
             "log",
             f"-n{MAX_RECENT_COMMITS + 1}",
-            "--format=%H%x09%an%x09%s%x09%aI",
+            "--format=%H%x09%<(120,trunc)%an%x09%<(500,trunc)%s%x09%aI",
         ).stdout
         ahead_behind = _git_success(
             worktree,
@@ -211,7 +288,6 @@ def _local_context(worktree: Path, *, repository: Path, branch: str, base_ref: s
         raise RuntimeError("worktree_branch_mismatch")
     if len(ahead_behind) != 2 or not all(value.isdigit() for value in ahead_behind):
         raise RuntimeError("git_unavailable")
-    changed_files, changed_truncated = _parse_changed_files(status_output)
     recent_commits, recent_commits_truncated = _parse_recent_commits(commits_output)
     return {
         "repo_path": str(repository),
@@ -219,7 +295,7 @@ def _local_context(worktree: Path, *, repository: Path, branch: str, base_ref: s
         "branch": branch_output,
         "base_ref": base_ref,
         "base_commit": resolved_base,
-        "clean": not bool(status_output.strip()),
+        "clean": not bool(changed_files),
         "changed_files": changed_files,
         "changed_files_truncated": changed_truncated,
         "recent_commits": recent_commits,
@@ -280,7 +356,7 @@ class GhGitHubAdapter:
     def _run(self, cwd: Path, *args: str) -> subprocess.CompletedProcess[str]:
         if not self.executable:
             raise RuntimeError("gh_not_installed")
-        environment = os.environ.copy()
+        environment = _git_environment()
         environment.update({"GH_PROMPT_DISABLED": "1", "GIT_TERMINAL_PROMPT": "0"})
         try:
             return _run_bounded(

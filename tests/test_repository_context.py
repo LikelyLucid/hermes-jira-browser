@@ -66,15 +66,13 @@ class RepositoryContextResolutionTests(unittest.TestCase):
         self.assertEqual(result["reason"], "worktree_repository_mismatch")
 
     def test_generic_subprocess_runner_bounds_captured_output_before_returning(self):
-        result = repository_context._run_bounded(
-            [sys.executable, "-c", f"print('x' * {repository_context.MAX_COMMAND_OUTPUT * 2})"],
-            cwd=Path.cwd(),
-            timeout=repository_context.GIT_TIMEOUT_SECONDS,
-            environment=repository_context._git_environment(),
-        )
-
-        self.assertEqual(result.returncode, 0)
-        self.assertEqual(len(result.stdout), repository_context.MAX_COMMAND_OUTPUT)
+        with self.assertRaisesRegex(RuntimeError, "command_output_too_large"):
+            repository_context._run_bounded(
+                [sys.executable, "-c", f"print('x' * {repository_context.MAX_COMMAND_OUTPUT * 2})"],
+                cwd=Path.cwd(),
+                timeout=repository_context.GIT_TIMEOUT_SECONDS,
+                environment=repository_context._git_environment(),
+            )
 
     def test_missing_project_mapping_is_an_explicit_unavailable_state(self):
         store = mock.Mock()
@@ -258,6 +256,37 @@ class RepositoryContextResolutionTests(unittest.TestCase):
             result = repository_context._run_git(repo, "status", "--short")
 
             self.assertEqual(result.returncode, 0)
+            self.assertFalse(marker.exists())
+
+    def test_repository_clean_filter_process_is_not_executed(self):
+        import subprocess
+
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            marker = repo / "filter-ran"
+            hook = repo / "filter.sh"
+            hook.write_text(
+                f"#!/bin/sh\ntouch {marker}\ncat\n",
+                encoding="utf-8",
+            )
+            hook.chmod(0o700)
+            subprocess.run(["git", "init", "-q", "-b", "main"], cwd=repo, check=True)
+            subprocess.run(["git", "config", "user.name", "Test User"], cwd=repo, check=True)
+            subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=repo, check=True)
+            subprocess.run(["git", "config", "filter.evil.clean", str(hook)], cwd=repo, check=True)
+            (repo / ".gitattributes").write_text("payload.txt filter=evil\n", encoding="utf-8")
+            (repo / "payload.txt").write_text("seed\n", encoding="utf-8")
+            # Seed without the malicious attribute active, then enable it only
+            # for the read-only inspection path under test.
+            subprocess.run(["git", "-c", "filter.evil.clean=cat", "add", ".gitattributes", "payload.txt"], cwd=repo, check=True)
+            subprocess.run(["git", "-c", "filter.evil.clean=cat", "commit", "-qm", "seed"], cwd=repo, check=True)
+            marker.unlink(missing_ok=True)
+            (repo / "payload.txt").write_text("changed\n", encoding="utf-8")
+
+            changed, truncated = repository_context._changed_files(repo)
+
+            self.assertTrue(any(item["path"] == "payload.txt" for item in changed))
+            self.assertFalse(truncated)
             self.assertFalse(marker.exists())
 
     def test_authenticated_gh_adapter_reads_bounded_pr_json_without_network_library(self):
