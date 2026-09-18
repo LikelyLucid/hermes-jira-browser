@@ -495,34 +495,40 @@ def _adf_node_has_content(node: Any) -> bool:
 
 
 def _validate_comment_response(payload: Any) -> Mapping[str, Any]:
-    if not isinstance(payload, Mapping):
-        raise JiraAmbiguousError("Jira returned an invalid comment response; the write outcome is unknown.")
-    comment_id = str(payload.get("id") or "").strip()
-    comment_id_bytes = len(comment_id.encode("utf-8"))
-    body = payload.get("body")
-    if isinstance(body, str):
-        valid_body = bool(body.strip())
-    elif isinstance(body, Mapping):
-        content = body.get("content")
-        valid_body = (
-            str(body.get("type") or "").strip() == "doc"
-            and isinstance(content, list)
-            and any(_adf_node_has_content(node) for node in content)
-        )
-    else:
-        valid_body = False
+    invalid_response = "Jira returned an invalid comment response; the write outcome is unknown."
     try:
-        body_bytes = len(json.dumps(body, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
-    except (TypeError, ValueError):
-        body_bytes = MAX_JIRA_COMMENT_BODY_BYTES + 1
-    if (
-        not comment_id
-        or comment_id_bytes > MAX_JIRA_COMMENT_ID_BYTES
-        or not valid_body
-        or body_bytes > MAX_JIRA_COMMENT_BODY_BYTES
-    ):
-        raise JiraAmbiguousError("Jira returned an invalid comment response; the write outcome is unknown.")
-    return payload
+        if not isinstance(payload, Mapping):
+            raise JiraAmbiguousError(invalid_response)
+        comment_id = str(payload.get("id") or "").strip()
+        comment_id_bytes = len(comment_id.encode("utf-8"))
+        body = payload.get("body")
+        if isinstance(body, str):
+            valid_body = bool(body.strip())
+        elif isinstance(body, Mapping):
+            content = body.get("content")
+            valid_body = (
+                str(body.get("type") or "").strip() == "doc"
+                and isinstance(content, list)
+                and any(_adf_node_has_content(node) for node in content)
+            )
+        else:
+            valid_body = False
+        try:
+            body_bytes = len(json.dumps(body, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
+        except UnicodeEncodeError:
+            raise
+        except (TypeError, ValueError):
+            body_bytes = MAX_JIRA_COMMENT_BODY_BYTES + 1
+        if (
+            not comment_id
+            or comment_id_bytes > MAX_JIRA_COMMENT_ID_BYTES
+            or not valid_body
+            or body_bytes > MAX_JIRA_COMMENT_BODY_BYTES
+        ):
+            raise JiraAmbiguousError(invalid_response)
+        return payload
+    except UnicodeEncodeError as exc:
+        raise JiraAmbiguousError(invalid_response) from exc
 
 
 def _normalise_issue(issue: Mapping[str, Any], *, detail: bool = False) -> dict[str, Any]:
