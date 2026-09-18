@@ -34,11 +34,14 @@ SEARCH_FIELDS = (
 )
 DETAIL_FIELDS = f"{SEARCH_FIELDS},parent,subtasks,fixVersions,components,attachment"
 MAX_JIRA_JSON_BYTES = 16 * 1024 * 1024
+MAX_JIRA_CONFIG_BYTES = 1 * 1024 * 1024
 MAX_ATTACHMENT_PREVIEW_BYTES = 4 * 1024 * 1024
 MAX_ISSUE_COMMENTS = 1_000
 MAX_ADF_DEPTH = 64
 MAX_ADF_NODES = 10_000
 MAX_ADF_OUTPUT_CHARS = 100_000
+MAX_ADF_REFERENCE_CHARS = 4_096
+MAX_ADF_REFERENCE_COUNT = 1_000
 SAFE_ATTACHMENT_PREVIEW_TYPES = frozenset({
     "image/avif",
     "image/bmp",
@@ -87,11 +90,11 @@ def default_config_path() -> Path:
     return Path.home() / "jira-config" / "config.json"
 
 
-def _validate_jira_config_file(path: Path) -> None:
-    try:
-        metadata = path.stat()
-    except OSError as exc:
-        raise ValueError(f"Jira config at {path} cannot be inspected safely.") from exc
+def _validate_jira_config_metadata(metadata: os.stat_result) -> None:
+    if stat.S_ISLNK(metadata.st_mode):
+        raise ValueError("Jira config file must not be a symlink.")
+    if not stat.S_ISREG(metadata.st_mode):
+        raise ValueError("Jira config file must be a regular file.")
     getuid = getattr(os, "getuid", None)
     if getuid is None:
         return
@@ -99,6 +102,42 @@ def _validate_jira_config_file(path: Path) -> None:
         raise ValueError("Jira config file permissions must be owner-only.")
     if hasattr(metadata, "st_uid") and metadata.st_uid != getuid():
         raise ValueError("Jira config file must be owned by the current user.")
+
+
+def _read_jira_config_file(path: Path) -> dict[str, Any]:
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags)
+    except FileNotFoundError:
+        return {}
+    except OSError as exc:
+        if getattr(exc, "errno", None) in {getattr(os, "ELOOP", 40), 40}:
+            raise ValueError("Jira config file must not be a symlink.") from exc
+        raise ValueError(f"Jira config at {path} cannot be inspected safely.") from exc
+
+    try:
+        metadata = os.fstat(descriptor)
+        _validate_jira_config_metadata(metadata)
+        with os.fdopen(descriptor, "rb", closefd=True) as handle:
+            descriptor = -1
+            raw_bytes = handle.read(MAX_JIRA_CONFIG_BYTES + 1)
+    except ValueError:
+        raise
+    except OSError as exc:
+        raise ValueError(f"Jira config at {path} cannot be read safely.") from exc
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+
+    if len(raw_bytes) > MAX_JIRA_CONFIG_BYTES:
+        raise ValueError("Jira config file is too large.")
+    try:
+        raw = json.loads(raw_bytes.decode("utf-8"))
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+        raise ValueError(f"Jira config at {path} is not valid JSON.") from exc
+    if not isinstance(raw, Mapping):
+        raise ValueError("Jira config must be a JSON object.")
+    return dict(raw)
 
 
 def _clean_jira_base_url(value: str) -> str:
@@ -129,16 +168,17 @@ def _clean_jira_base_url(value: str) -> str:
 
 def load_jira_config(path: str | Path | None = None) -> JiraConfig:
     config_path = Path(path).expanduser() if path is not None else default_config_path()
-    if config_path.exists():
-        _validate_jira_config_file(config_path)
-    try:
-        raw = json.loads(config_path.read_text(encoding="utf-8"))
-    except FileNotFoundError:
-        raw = {}
-    except (OSError, json.JSONDecodeError) as exc:
-        raise ValueError(f"Jira config at {config_path} is not valid JSON.") from exc
-    if not isinstance(raw, Mapping):
-        raise ValueError("Jira config must be a JSON object.")
+    env_base_url = os.environ.get("JIRA_BASE_URL") or os.environ.get("JIRA_SITE") or ""
+    env_email = os.environ.get("JIRA_EMAIL") or ""
+    env_api_token = os.environ.get("JIRA_API_TOKEN") or ""
+    if all(value.strip() for value in (env_base_url, env_email, env_api_token)):
+        return JiraConfig(
+            base_url=_clean_jira_base_url(env_base_url),
+            email=env_email.strip(),
+            api_token=env_api_token.strip(),
+        )
+
+    raw = _read_jira_config_file(config_path)
 
     base_url = _clean_jira_base_url(
         str(os.environ.get("JIRA_BASE_URL") or os.environ.get("JIRA_SITE") or raw.get("baseUrl") or "")
@@ -288,16 +328,15 @@ def _normalise_attachment(attachment: Mapping[str, Any]) -> dict[str, Any]:
 def _adf_attachment_references(node: Any) -> tuple[set[str], set[str]]:
     ids: set[str] = set()
     filenames: set[str] = set()
-    state = {"nodes": 0, "output": 0}
+    state = {"nodes": 0, "references": 0}
 
     def add_reference(target: set[str], value: str) -> None:
-        remaining = MAX_ADF_OUTPUT_CHARS - state["output"]
-        if remaining <= 0:
+        if state["references"] >= MAX_ADF_REFERENCE_COUNT:
             return
-        bounded = value[:remaining]
+        bounded = value[:MAX_ADF_REFERENCE_CHARS]
         if bounded:
             target.add(bounded)
-            state["output"] += len(bounded)
+            state["references"] += 1
 
     def visit(value: Any, depth: int) -> None:
         if depth >= MAX_ADF_DEPTH or state["nodes"] >= MAX_ADF_NODES:
@@ -321,7 +360,7 @@ def _adf_attachment_references(node: Any) -> tuple[set[str], set[str]]:
         urls: list[str] = []
         url = attrs.get("url")
         if node_type in {"inlineCard", "blockCard"} and url:
-            urls.append(str(url)[:MAX_ADF_OUTPUT_CHARS])
+            urls.append(str(url))
         if node_type == "text":
             for mark in value.get("marks") if isinstance(value.get("marks"), list) else []:
                 if not isinstance(mark, Mapping):
@@ -329,7 +368,7 @@ def _adf_attachment_references(node: Any) -> tuple[set[str], set[str]]:
                 mark_attrs = mark.get("attrs") if isinstance(mark.get("attrs"), Mapping) else {}
                 href = mark_attrs.get("href")
                 if mark.get("type") == "link" and href:
-                    urls.append(str(href)[:MAX_ADF_OUTPUT_CHARS])
+                    urls.append(str(href))
         for url in urls:
             match = re.search(r"/attachment/(?:content/)?(\d+)(?:/|$|[?#])", url)
             if match:
@@ -934,7 +973,6 @@ def cleanup_worktree(*, repo_path: str | Path, issue_key: str) -> dict[str, Any]
             raise ValueError("Refusing to remove a worktree with uncommitted changes.")
         _git(repo, "worktree", "unlock", str(worktree), check=False)
         _git(repo, "worktree", "remove", str(worktree))
-        _git(repo, "branch", "-D", branch, check=False)
         return {"removed": True, "path": str(worktree), "branch": branch}
 
 
@@ -944,15 +982,77 @@ def _utc_now() -> str:
 
 class JiraStore:
     def __init__(self, path: str | Path):
-        self.path = Path(path).expanduser()
-        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.path = Path(path).expanduser().absolute()
         self._harden_storage()
         self._migrate()
 
     def _harden_storage(self) -> None:
-        os.chmod(self.path.parent, 0o700)
-        if self.path.exists():
-            os.chmod(self.path, 0o600)
+        parent = self.path.parent
+        current = Path(parent.anchor)
+        for part in parent.parts[1:]:
+            candidate = current / part
+            try:
+                metadata = os.lstat(candidate)
+            except FileNotFoundError:
+                try:
+                    os.mkdir(candidate, 0o700)
+                except FileExistsError:
+                    pass
+                try:
+                    metadata = os.lstat(candidate)
+                except OSError as exc:
+                    raise ValueError("Jira store parent cannot be inspected safely.") from exc
+            if stat.S_ISLNK(metadata.st_mode):
+                raise ValueError("Jira store parent must not contain symlinks.")
+            if not stat.S_ISDIR(metadata.st_mode):
+                raise ValueError("Jira store parent must be a directory.")
+            current = candidate
+
+        if parent != Path(parent.anchor):
+            try:
+                os.chmod(parent, 0o700, follow_symlinks=False)
+                parent_metadata = os.lstat(parent)
+            except OSError as exc:
+                raise ValueError("Jira store parent cannot be secured.") from exc
+            if stat.S_IMODE(parent_metadata.st_mode) != 0o700:
+                raise ValueError("Jira store parent must be owner-only.")
+
+        database_metadata: os.stat_result | None = None
+        try:
+            database_metadata = os.lstat(self.path)
+        except FileNotFoundError:
+            flags = os.O_RDWR | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+            try:
+                descriptor = os.open(self.path, flags, 0o600)
+            except FileExistsError:
+                descriptor = -1
+            else:
+                try:
+                    database_metadata = os.fstat(descriptor)
+                    if stat.S_ISLNK(database_metadata.st_mode) or not stat.S_ISREG(database_metadata.st_mode):
+                        raise ValueError("Jira store database must be a regular file.")
+                    os.fchmod(descriptor, 0o600)
+                finally:
+                    os.close(descriptor)
+            if descriptor < 0:
+                try:
+                    database_metadata = os.lstat(self.path)
+                except OSError as exc:
+                    raise ValueError("Jira store database cannot be inspected safely.") from exc
+
+        if database_metadata is None:
+            raise ValueError("Jira store database cannot be inspected safely.")
+        if stat.S_ISLNK(database_metadata.st_mode):
+            raise ValueError("Jira store database must not be a symlink.")
+        if not stat.S_ISREG(database_metadata.st_mode):
+            raise ValueError("Jira store database must be a regular file.")
+        try:
+            os.chmod(self.path, 0o600, follow_symlinks=False)
+            database_metadata = os.lstat(self.path)
+        except OSError as exc:
+            raise ValueError("Jira store database cannot be secured.") from exc
+        if stat.S_IMODE(database_metadata.st_mode) != 0o600:
+            raise ValueError("Jira store database must be owner-only.")
 
     def _connect(self) -> sqlite3.Connection:
         self._harden_storage()

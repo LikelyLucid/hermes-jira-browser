@@ -85,6 +85,54 @@ class JiraConfigTests(unittest.TestCase):
                 config = jira_service.load_jira_config(missing_path)
             self.assertEqual(config.base_url, "https://jira.example.invalid")
 
+    def test_complete_environment_config_does_not_read_existing_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "config.json"
+            config_path.write_text("not-json", encoding="utf-8")
+            config_path.chmod(0o600)
+            with mock.patch.dict(
+                os.environ,
+                {
+                    "JIRA_BASE_URL": "https://jira.example.invalid",
+                    "JIRA_EMAIL": "dev@example.com",
+                    "JIRA_API_TOKEN": "from-env",
+                },
+                clear=False,
+            ):
+                config = jira_service.load_jira_config(config_path)
+            self.assertEqual(config.api_token, "from-env")
+
+    def test_rejects_symlinked_credential_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "target.json"
+            target.write_text(
+                json.dumps({"baseUrl": "https://jira.example.invalid", "email": "dev@example.com", "token": "secret"}),
+                encoding="utf-8",
+            )
+            target.chmod(0o600)
+            config_path = Path(tmp) / "config.json"
+            config_path.symlink_to(target)
+            with mock.patch.dict(os.environ, {}, clear=True):
+                with self.assertRaisesRegex(ValueError, "symlink"):
+                    jira_service.load_jira_config(config_path)
+
+    def test_rejects_non_regular_credential_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "config.json"
+            config_path.mkdir(mode=0o700)
+            with mock.patch.dict(os.environ, {}, clear=True):
+                with self.assertRaisesRegex(ValueError, "regular"):
+                    jira_service.load_jira_config(config_path)
+
+    def test_rejects_oversized_credential_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "config.json"
+            config_path.write_bytes(b"{" + b"x" * jira_service.MAX_JIRA_CONFIG_BYTES)
+            config_path.chmod(0o600)
+            with mock.patch.dict(os.environ, {}, clear=True):
+                with self.assertRaisesRegex(ValueError, "large"):
+                    jira_service.load_jira_config(config_path)
+
     def test_accepts_only_clean_https_origins(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "config.json"
@@ -336,6 +384,38 @@ class JiraNormalisationTests(unittest.TestCase):
 
         self.assertEqual([value["id"] for value in result["attachments"]], ["7002"])
 
+    def test_long_media_alt_does_not_suppress_later_attachment_id(self):
+        body = {
+            "type": "doc",
+            "content": [
+                {"type": "media", "attrs": {"alt": "x" * (jira_service.MAX_ADF_OUTPUT_CHARS + 1)}},
+                {
+                    "type": "inlineCard",
+                    "attrs": {"url": "https://jira.example.invalid/rest/api/3/attachment/content/7002"},
+                },
+            ],
+        }
+
+        attachment_ids, _ = jira_service._adf_attachment_references(body)
+
+        self.assertEqual(attachment_ids, {"7002"})
+
+    def test_attachment_references_have_a_count_limit(self):
+        body = {
+            "type": "doc",
+            "content": [
+                {
+                    "type": "inlineCard",
+                    "attrs": {"url": f"https://jira.example.invalid/rest/api/3/attachment/content/{index}"},
+                }
+                for index in range(1_001)
+            ],
+        }
+
+        attachment_ids, _ = jira_service._adf_attachment_references(body)
+
+        self.assertEqual(len(attachment_ids), 1_000)
+
 
 class WorktreeTests(unittest.TestCase):
     def test_branch_is_stable_when_summary_changes(self):
@@ -395,6 +475,24 @@ class WorktreeTests(unittest.TestCase):
             self.assertTrue((root / ".worktrees" / "jira-DEMO-77").is_dir())
             self.assertEqual(git(root / ".worktrees" / "jira-DEMO-77", "branch", "--show-current"), "jira/DEMO-77")
 
+    def test_cleanup_does_not_delete_a_reused_branch(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "repo"
+            root.mkdir()
+            git(root, "init", "-q", "-b", "main")
+            git(root, "config", "user.name", "Test User")
+            git(root, "config", "user.email", "test@example.com")
+            (root / "README.md").write_text("seed\n", encoding="utf-8")
+            git(root, "add", "README.md")
+            git(root, "commit", "-qm", "seed")
+            git(root, "branch", "jira/DEMO-77")
+
+            jira_service.create_worktree(repo_path=root, issue_key="DEMO-77", summary="Existing branch")
+            result = jira_service.cleanup_worktree(repo_path=root, issue_key="DEMO-77")
+
+            self.assertTrue(result["removed"])
+            self.assertEqual(git(root, "rev-parse", "--verify", "refs/heads/jira/DEMO-77"), git(root, "rev-parse", "main"))
+
     def test_rejects_option_like_base_ref_and_disables_checkout_hooks(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "repo"
@@ -433,6 +531,28 @@ class StoreTests(unittest.TestCase):
 
             self.assertEqual(stat.S_IMODE(directory.stat().st_mode), 0o700)
             self.assertEqual(stat.S_IMODE(database.stat().st_mode), 0o600)
+
+    def test_store_rejects_symlinked_or_non_regular_storage_paths(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            actual_parent = root / "actual"
+            actual_parent.mkdir()
+            linked_parent = root / "linked-parent"
+            linked_parent.symlink_to(actual_parent, target_is_directory=True)
+            with self.assertRaisesRegex(ValueError, "symlink"):
+                jira_service.JiraStore(linked_parent / "state.sqlite3")
+
+            actual_database = actual_parent / "actual.sqlite3"
+            actual_database.touch(mode=0o600)
+            linked_database = actual_parent / "linked.sqlite3"
+            linked_database.symlink_to(actual_database)
+            with self.assertRaisesRegex(ValueError, "symlink"):
+                jira_service.JiraStore(linked_database)
+
+            database_directory = actual_parent / "database-directory"
+            database_directory.mkdir(mode=0o700)
+            with self.assertRaisesRegex(ValueError, "regular"):
+                jira_service.JiraStore(database_directory)
 
     def test_maps_project_and_links_chat_and_worktree(self):
         with tempfile.TemporaryDirectory() as tmp:
