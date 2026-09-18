@@ -1345,20 +1345,44 @@ class JiraStore:
                 "target_profile",
                 "detached",
             }
-            if columns and not required.issubset(columns):
+            table_row = db.execute(
+                "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'session_links'"
+            ).fetchone()
+            table_sql = "".join(str(table_row[0] or "").lower().split()) if table_row else ""
+            target_qualified_identity = (
+                "unique(jira_origin,issue_id,connection_id,profile_name,target_profile,session_id)"
+            )
+            needs_rebuild = bool(columns) and (
+                not required.issubset(columns) or target_qualified_identity not in table_sql
+            )
+            if needs_rebuild:
                 db.execute("ALTER TABLE session_links RENAME TO session_links_legacy")
                 self._create_session_links_table(db)
-                db.execute(
-                    """
-                    INSERT INTO session_links
-                        (issue_id, issue_key, jira_origin, connection_id, profile_name,
-                         target_profile, session_id, project_id, worktree_path, branch,
-                         detached, created_at)
-                    SELECT issue_id, issue_key, '', 'local', 'default', 'default',
-                           session_id, project_id, worktree_path, branch, 0, created_at
-                    FROM session_links_legacy
-                    """
-                )
+                if required.issubset(columns):
+                    db.execute(
+                        """
+                        INSERT INTO session_links
+                            (issue_id, issue_key, jira_origin, connection_id, profile_name,
+                             target_profile, session_id, project_id, worktree_path, branch,
+                             detached, created_at)
+                        SELECT issue_id, issue_key, jira_origin, connection_id, profile_name,
+                               target_profile, session_id, project_id, worktree_path, branch,
+                               detached, created_at
+                        FROM session_links_legacy
+                        """
+                    )
+                else:
+                    db.execute(
+                        """
+                        INSERT INTO session_links
+                            (issue_id, issue_key, jira_origin, connection_id, profile_name,
+                             target_profile, session_id, project_id, worktree_path, branch,
+                             detached, created_at)
+                        SELECT issue_id, issue_key, '', 'local', 'default', 'default',
+                               session_id, project_id, worktree_path, branch, 0, created_at
+                        FROM session_links_legacy
+                        """
+                    )
                 db.execute("DROP TABLE session_links_legacy")
             elif not columns:
                 self._create_session_links_table(db)
@@ -1651,7 +1675,7 @@ class JiraStore:
                      target_profile, session_id, project_id, worktree_path, branch,
                      detached, created_at)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?)
-                ON CONFLICT(jira_origin, issue_id, connection_id, profile_name, session_id) DO UPDATE SET
+                ON CONFLICT(jira_origin, issue_id, connection_id, profile_name, target_profile, session_id) DO UPDATE SET
                     issue_key=excluded.issue_key,
                     target_profile=excluded.target_profile,
                     project_id=excluded.project_id,
@@ -1678,9 +1702,9 @@ class JiraStore:
                 """
                 SELECT * FROM session_links
                 WHERE jira_origin = ? AND issue_id = ? AND connection_id = ?
-                  AND profile_name = ? AND session_id = ?
+                  AND profile_name = ? AND target_profile = ? AND session_id = ?
                 """,
-                (origin, issue_id.strip(), connection, profile, session_id.strip()),
+                (origin, issue_id.strip(), connection, profile, target, session_id.strip()),
             ).fetchone()
         return dict(row) if row else {}
 
@@ -1706,22 +1730,26 @@ class JiraStore:
         jira_origin: str = "",
         connection_id: str = "local",
         profile_name: str = "default",
+        target_profile: str | None = None,
     ) -> set[str]:
         origin = jira_origin.strip().rstrip("/")
         if not origin:
             raise ValueError("Jira origin is required for link reads.")
+        profile = profile_name.strip() or "default"
+        target = (target_profile or profile).strip() or profile
         with self._connect() as db:
             rows = db.execute(
                 """
                 SELECT session_id FROM session_links
                 WHERE issue_id = ? AND jira_origin = ? AND connection_id = ?
-                  AND profile_name = ? AND detached = 1
+                  AND profile_name = ? AND target_profile = ? AND detached = 1
                 """,
                 (
                     issue_id.strip(),
                     origin,
                     connection_id.strip() or "local",
-                    profile_name.strip() or "default",
+                    profile,
+                    target,
                 ),
             ).fetchall()
         return {str(row["session_id"]) for row in rows}
@@ -1754,9 +1782,12 @@ class JiraStore:
         jira_origin: str = "",
         connection_id: str = "local",
         profile_name: str = "default",
+        target_profile: str | None = None,
     ) -> bool:
         issue = issue_id.strip()
         session = session_id.strip()
+        profile = profile_name.strip() or "default"
+        target = (target_profile or profile).strip() or profile
         if not issue or not session:
             raise ValueError("Issue id and session id are required.")
         with self._connect() as db:
@@ -1764,14 +1795,15 @@ class JiraStore:
                 """
                 UPDATE session_links SET detached = 1
                 WHERE issue_id = ? AND session_id = ? AND jira_origin = ?
-                  AND connection_id = ? AND profile_name = ? AND detached = 0
+                  AND connection_id = ? AND profile_name = ? AND target_profile = ? AND detached = 0
                 """,
                 (
                     issue,
                     session,
                     jira_origin.strip().rstrip("/"),
                     connection_id.strip() or "local",
-                    profile_name.strip() or "default",
+                    profile,
+                    target,
                 ),
             )
         return cursor.rowcount > 0
@@ -1779,24 +1811,39 @@ class JiraStore:
 
 def enrich_session_links(links: list[Mapping[str, Any]]) -> list[dict[str, Any]]:
     """Attach live chat titles/availability without hiding archived sessions."""
-    from hermes_state import SessionDB
-
-    session_db = SessionDB(read_only=True)
     active_profile = active_profile_name()
+    session_db = None
     enriched: list[dict[str, Any]] = []
     try:
         for value in links:
             link = dict(value)
-            connection_id = str(link.get("connection_id") or "local").strip() or "local"
-            profile_name = str(link.get("profile_name") or active_profile or "default").strip() or "default"
-            if connection_id != "local" or (active_profile is not None and profile_name != active_profile):
+            connection_id = str(link.get("connection_id") or "").strip()
+            profile_name = str(link.get("profile_name") or "").strip()
+            target_profile = str(link.get("target_profile") or "").strip()
+            session_id = str(link.get("session_id") or "").strip()
+            if not connection_id or not profile_name or not target_profile or not session_id:
+                link["chat_title"] = None
+                link["archived"] = None
+                link["available"] = False
+                enriched.append(link)
+                continue
+            if (
+                active_profile is None
+                or connection_id != "local"
+                or profile_name != active_profile
+                or target_profile != active_profile
+            ):
                 link["chat_title"] = None
                 link["archived"] = None
                 link["available"] = None
                 enriched.append(link)
                 continue
+            if session_db is None:
+                from hermes_state import SessionDB
+
+                session_db = SessionDB(read_only=True)
             try:
-                session = session_db.get_session(str(link.get("session_id") or "").strip())
+                session = session_db.get_session(session_id)
             except Exception:
                 session = None
             link["chat_title"] = str(session.get("title") or "").strip() if session else None
@@ -1804,7 +1851,8 @@ def enrich_session_links(links: list[Mapping[str, Any]]) -> list[dict[str, Any]]
             link["available"] = session is not None
             enriched.append(link)
     finally:
-        session_db.close()
+        if session_db is not None:
+            session_db.close()
     return enriched
 
 

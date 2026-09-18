@@ -356,9 +356,14 @@ async def unlink_session(
     session_id: str,
     connection_id: str = "local",
     profile_name: str = "default",
+    target_profile: str | None = None,
 ) -> dict[str, bool]:
     try:
         profile_name, connection_id = _validate_active_owner(profile_name, connection_id)
+        target_profile = SERVICE.validate_owner_field(
+            target_profile or profile_name,
+            field_name="target_profile",
+        )
         client = _client()
         unlinked = await asyncio.to_thread(
             _store().unlink_session,
@@ -367,6 +372,7 @@ async def unlink_session(
             jira_origin=client.config.base_url,
             connection_id=connection_id,
             profile_name=profile_name,
+            target_profile=target_profile,
         )
         return {"unlinked": unlinked}
     except Exception as exc:
@@ -377,13 +383,22 @@ async def unlink_session(
 async def link_session(payload: SessionLinkRequest) -> dict[str, Any]:
     try:
         profile_name, connection_id = _validate_active_owner(payload.profile_name, payload.connection_id)
+        target_profile = SERVICE.validate_owner_field(
+            payload.target_profile or profile_name,
+            field_name="target_profile",
+        )
         store = _store()
         client = _client()
         issue = await asyncio.to_thread(client.issue, payload.issue_key)
         if str(issue.get("id") or "") != payload.issue_id.strip() or str(issue.get("key") or "").upper() != payload.issue_key.strip().upper():
             raise ValueError("The Jira issue id and key do not identify the same issue.")
         active_profile = SERVICE.active_profile_name()
-        if connection_id == "local" and (active_profile is None or profile_name == active_profile):
+        if (
+            connection_id == "local"
+            and active_profile is not None
+            and profile_name == active_profile
+            and target_profile == active_profile
+        ):
             metadata = await asyncio.to_thread(
                 SERVICE.validated_link_metadata,
                 store,
@@ -406,7 +421,7 @@ async def link_session(payload: SessionLinkRequest) -> dict[str, Any]:
             jira_origin=client.config.base_url,
             connection_id=connection_id,
             profile_name=profile_name,
-            target_profile=payload.target_profile,
+            target_profile=target_profile,
             project_id=metadata["project_id"],
             worktree_path=metadata["worktree_path"],
             branch=metadata["branch"],
