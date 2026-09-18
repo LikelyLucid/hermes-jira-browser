@@ -203,6 +203,18 @@ class DesktopPluginTests(unittest.TestCase):
         self.assertIn("Suggested next step", source)
         self.assertIn("Apply suggestion", source)
 
+    def test_explicit_jira_mutations_reuse_bounded_retry_keys(self):
+        source = PLUGIN.read_text(encoding="utf-8")
+
+        self.assertIn("const MUTATION_KEY_CACHE_LIMIT = 32", source)
+        self.assertIn("function mutationKeyFor", source)
+        self.assertIn("function forgetMutationKey", source)
+        self.assertIn("mutationKeyFor('comment'", source)
+        self.assertIn("mutationKeyFor('suggestion'", source)
+        self.assertIn("mutationKeyFor('transition'", source)
+        self.assertIn("mutationKeyFor('drag'", source)
+        self.assertNotIn("const mutationKey = newMutationKey()", source)
+
     def test_explicit_jira_mutations_send_high_entropy_idempotency_keys(self):
         source = PLUGIN.read_text(encoding="utf-8")
 

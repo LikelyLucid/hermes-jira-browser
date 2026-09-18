@@ -205,19 +205,41 @@ class JiraBrowserApiTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             store = plugin_api.SERVICE.JiraStore(Path(tmp) / "state.sqlite3")
             with mock.patch.object(plugin_api, "_store", return_value=store), mock.patch.object(
-                plugin_api, "_client", side_effect=RuntimeError("not configured")
+                plugin_api, "_client", side_effect=plugin_api.SERVICE.JiraPreRequestError("not configured")
             ):
                 with self.assertRaises(plugin_api.HTTPException):
                     asyncio.run(plugin_api.add_comment("DEMO-42", payload))
-            self.assertEqual(
-                store.reserve_mutation(
-                    idempotency_key=payload.idempotency_key,
-                    action="comment",
-                    issue_key="DEMO-42",
-                    payload={"body": "Done"},
-                )["status"],
-                "claimed",
-            )
+            self.assertIsNone(store.get_mutation_receipt(payload.idempotency_key))
+
+    def test_definitive_jira_rejection_releases_idempotency_claim(self):
+        payload = plugin_api.CommentRequest(body="Done", idempotency_key="comment-key-123461")
+        rejected = mock.Mock()
+        rejected.add_comment.side_effect = plugin_api.SERVICE.JiraDefinitiveRejectionError("Jira rejected the comment.")
+        accepted = mock.Mock()
+        accepted.add_comment.return_value = {"id": "9002", "body": "Done"}
+        with tempfile.TemporaryDirectory() as tmp:
+            store = plugin_api.SERVICE.JiraStore(Path(tmp) / "state.sqlite3")
+            with mock.patch.object(plugin_api, "_store", return_value=store), mock.patch.object(
+                plugin_api, "_client", side_effect=[rejected, accepted]
+            ):
+                with self.assertRaises(plugin_api.HTTPException):
+                    asyncio.run(plugin_api.add_comment("DEMO-42", payload))
+                result = asyncio.run(plugin_api.add_comment("DEMO-42", payload))
+
+        self.assertEqual(result["comment"]["id"], "9002")
+        rejected.add_comment.assert_called_once_with("DEMO-42", "Done")
+        accepted.add_comment.assert_called_once_with("DEMO-42", "Done")
+
+    def test_local_pre_request_failure_releases_idempotency_claim(self):
+        payload = plugin_api.CommentRequest(body="Done", idempotency_key="comment-key-123462")
+        client = mock.Mock()
+        client.add_comment.side_effect = plugin_api.SERVICE.JiraPreRequestError("invalid request")
+        with tempfile.TemporaryDirectory() as tmp:
+            store = plugin_api.SERVICE.JiraStore(Path(tmp) / "state.sqlite3")
+            with mock.patch.object(plugin_api, "_store", return_value=store), mock.patch.object(plugin_api, "_client", return_value=client):
+                with self.assertRaises(plugin_api.HTTPException):
+                    asyncio.run(plugin_api.add_comment("DEMO-42", payload))
+            self.assertIsNone(store.get_mutation_receipt(payload.idempotency_key))
 
     def test_attachment_preview_uses_jira_client_without_exposing_credentials(self):
         client = mock.Mock()

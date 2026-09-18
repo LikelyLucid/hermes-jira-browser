@@ -89,6 +89,10 @@ def _safe_http_error(exc: Exception, *, status_code: int = 500) -> HTTPException
     return HTTPException(status_code=status_code, detail=str(exc))
 
 
+def _mutation_failure_releases_claim(exc: Exception) -> bool:
+    return isinstance(exc, (SERVICE.JiraPreRequestError, SERVICE.JiraDefinitiveRejectionError, ValueError))
+
+
 async def _run_mutation(
     *,
     action: str,
@@ -97,6 +101,8 @@ async def _run_mutation(
     payload: dict[str, Any],
     operation,
 ) -> dict[str, Any]:
+    # Resolve configuration and endpoint syntax before reserving a mutation key.
+    client = await asyncio.to_thread(_client)
     store = _store()
     reservation = await asyncio.to_thread(
         store.reserve_mutation,
@@ -108,14 +114,13 @@ async def _run_mutation(
     if reservation["status"] == "completed":
         return reservation["result"]
     try:
-        client = await asyncio.to_thread(_client)
-    except Exception:
-        await asyncio.to_thread(store.release_mutation, idempotency_key)
+        result = await asyncio.to_thread(operation, client)
+    except Exception as exc:
+        if _mutation_failure_releases_claim(exc):
+            await asyncio.to_thread(store.release_mutation, idempotency_key)
+        # Ambiguous transport/outcome errors retain the pending receipt so a
+        # later retry cannot issue a possibly-duplicating Jira write.
         raise
-    # Once the Jira call begins, retain a pending receipt on every failure:
-    # the remote side may have accepted the request even if this process did not
-    # receive a response, so retrying automatically could duplicate the write.
-    result = await asyncio.to_thread(operation, client)
     await asyncio.to_thread(store.complete_mutation, idempotency_key, result)
     return result
 

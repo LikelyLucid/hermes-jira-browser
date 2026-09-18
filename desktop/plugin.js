@@ -57,8 +57,35 @@ function errorText(error, fallback = 'Something went wrong.') {
   return fallback
 }
 
+const MUTATION_KEY_CACHE_LIMIT = 32
+const mutationKeyCache = new Map()
+
 function newMutationKey() {
   return crypto.randomUUID()
+}
+
+function mutationKeyFor(action, logicalId, payload) {
+  const cacheKey = `${String(action)}:${String(logicalId)}`
+  const fingerprint = JSON.stringify(payload)
+  const existing = mutationKeyCache.get(cacheKey)
+  if (existing?.fingerprint === fingerprint) {
+    mutationKeyCache.delete(cacheKey)
+    mutationKeyCache.set(cacheKey, existing)
+    return existing.key
+  }
+  const entry = { fingerprint, key: newMutationKey() }
+  mutationKeyCache.delete(cacheKey)
+  mutationKeyCache.set(cacheKey, entry)
+  while (mutationKeyCache.size > MUTATION_KEY_CACHE_LIMIT) {
+    mutationKeyCache.delete(mutationKeyCache.keys().next().value)
+  }
+  return entry.key
+}
+
+function forgetMutationKey(action, logicalId, payload, key) {
+  const cacheKey = `${String(action)}:${String(logicalId)}`
+  const entry = mutationKeyCache.get(cacheKey)
+  if (entry?.key === key && entry.fingerprint === JSON.stringify(payload)) mutationKeyCache.delete(cacheKey)
 }
 
 function normaliseIssueKey(value) {
@@ -1187,7 +1214,7 @@ function IssueDetail({ issue, status, projects, mapping, links, baseRef, onOpenI
 
   const applySuggestedTransition = useCallback(async () => {
     if (!suggestedTransition) return
-    const mutationKey = newMutationKey()
+    const mutationKey = mutationKeyFor('suggestion', issue.key, { transition_id: suggestedTransition.id })
     setBusyAction('suggestion')
     setError('')
     try {
@@ -1195,6 +1222,7 @@ function IssueDetail({ issue, status, projects, mapping, links, baseRef, onOpenI
         method: 'POST',
         body: { transition_id: suggestedTransition.id, idempotency_key: mutationKey }
       })
+      forgetMutationKey('suggestion', issue.key, { transition_id: suggestedTransition.id }, mutationKey)
       const [updated, choices] = await Promise.all([
         api(`/issues/${encodeURIComponent(issue.key)}`, { timeoutMs: 30_000 }),
         api(`/issues/${encodeURIComponent(issue.key)}/transitions`)
@@ -1265,7 +1293,7 @@ function IssueDetail({ issue, status, projects, mapping, links, baseRef, onOpenI
   const postComment = useCallback(async () => {
     const body = commentDraft.trim()
     if (!body) return
-    const mutationKey = newMutationKey()
+    const mutationKey = mutationKeyFor('comment', issue.key, { body })
     setBusyAction('comment')
     setError('')
     try {
@@ -1273,6 +1301,7 @@ function IssueDetail({ issue, status, projects, mapping, links, baseRef, onOpenI
         method: 'POST',
         body: { body, idempotency_key: mutationKey }
       })
+      forgetMutationKey('comment', issue.key, { body }, mutationKey)
       setCommentDraft('')
       onIssueChanged?.({
         ...issue,
@@ -1288,7 +1317,7 @@ function IssueDetail({ issue, status, projects, mapping, links, baseRef, onOpenI
 
   const moveIssue = useCallback(async () => {
     if (!transitionId) return
-    const mutationKey = newMutationKey()
+    const mutationKey = mutationKeyFor('transition', issue.key, { transition_id: transitionId })
     setBusyAction('transition')
     setError('')
     try {
@@ -1296,6 +1325,7 @@ function IssueDetail({ issue, status, projects, mapping, links, baseRef, onOpenI
         method: 'POST',
         body: { transition_id: transitionId, idempotency_key: mutationKey }
       })
+      forgetMutationKey('transition', issue.key, { transition_id: transitionId }, mutationKey)
       const [updated, choices] = await Promise.all([
         api(`/issues/${encodeURIComponent(issue.key)}`, { timeoutMs: 30_000 }),
         api(`/issues/${encodeURIComponent(issue.key)}/transitions`)
@@ -2512,17 +2542,19 @@ function JiraPage() {
     if (!current || !targetStatus || current.status === targetStatus || movingKey) return
     setMovingKey(issueKey)
     setError('')
-    const mutationKey = newMutationKey()
+    let mutationKey = ''
     try {
       const choices = await api(`/issues/${encodeURIComponent(issueKey)}/transitions`)
       const transition = (choices?.transitions || []).find(candidate =>
         String(candidate.to || candidate.name || '').toLowerCase() === String(targetStatus).toLowerCase()
       )
       if (!transition) throw new Error(`${issueKey} cannot move directly to ${targetStatus}.`)
+      mutationKey = mutationKeyFor('drag', issueKey, { transition_id: transition.id })
       await api(`/issues/${encodeURIComponent(issueKey)}/transitions`, {
         method: 'POST',
         body: { transition_id: transition.id, idempotency_key: mutationKey }
       })
+      forgetMutationKey('drag', issueKey, { transition_id: transition.id }, mutationKey)
       const updated = await api(`/issues/${encodeURIComponent(issueKey)}`, { timeoutMs: 30_000 })
       setIssues(rows => rows.map(issue => issue.key === issueKey ? { ...issue, ...updated } : issue))
       if (selectedKey === issueKey) setDetail(updated)
