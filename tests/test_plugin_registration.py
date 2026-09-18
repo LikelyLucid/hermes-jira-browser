@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 import unittest
 from unittest import mock
 
@@ -67,9 +68,10 @@ class PluginRegistrationTests(unittest.TestCase):
     def test_assigned_issues_uses_current_user_active_jql(self):
         client = FakeJiraClient()
         with mock.patch.object(plugin, "_load_client", return_value=client):
-            result = plugin.jira_assigned_issues({"max_results": 25})
+            result = json.loads(plugin.jira_assigned_issues({"max_results": 25}))
 
-        self.assertEqual(result["issues"][0]["key"], "DEMO-1")
+        self.assertTrue(result["untrusted_jira_data"])
+        self.assertEqual(result["data"]["issues"][0]["key"], "DEMO-1")
         self.assertEqual(
             client.calls,
             [("search", "assignee = currentUser() AND statusCategory != Done ORDER BY updated DESC", 25, None)],
@@ -88,12 +90,34 @@ class PluginRegistrationTests(unittest.TestCase):
     def test_read_only_handlers_call_fresh_client_methods(self):
         client = FakeJiraClient()
         with mock.patch.object(plugin, "_load_client", return_value=client):
-            detail = plugin.jira_issue_detail({"issue_key": "DEMO-42"})
-            transitions = plugin.jira_issue_transitions({"issue_key": "DEMO-42"})
+            detail = json.loads(plugin.jira_issue_detail({"issue_key": "DEMO-42"}))
+            transitions = json.loads(plugin.jira_issue_transitions({"issue_key": "DEMO-42"}))
 
-        self.assertEqual(detail["summary"], "Fresh normalized detail")
-        self.assertEqual(transitions[0]["id"], "31")
+        self.assertEqual(detail["data"]["summary"], "Fresh normalized detail")
+        self.assertEqual(transitions["data"][0]["id"], "31")
         self.assertEqual(client.calls, [("issue", "DEMO-42"), ("transitions", "DEMO-42")])
+
+    def test_tool_results_are_strings_and_bound_oversized_jira_data(self):
+        client = FakeJiraClient()
+        client.issue = mock.Mock(return_value={"key": "DEMO-42", "description": "x" * 200_000})
+        with mock.patch.object(plugin, "_load_client", return_value=client):
+            raw = plugin.jira_issue_detail({"issue_key": "DEMO-42"})
+
+        self.assertIsInstance(raw, str)
+        self.assertLessEqual(len(raw), plugin.MAX_TOOL_RESULT_CHARS)
+        result = json.loads(raw)
+        self.assertTrue(result["untrusted_jira_data"])
+        self.assertTrue(result["truncated"])
+
+    def test_issue_key_is_bounded_and_validated_before_contacting_jira(self):
+        client = FakeJiraClient()
+        with mock.patch.object(plugin, "_load_client", return_value=client):
+            with self.assertRaisesRegex(ValueError, "issue_key"):
+                plugin.jira_issue_detail({"issue_key": "../../secret"})
+            with self.assertRaisesRegex(ValueError, "issue_key"):
+                plugin.jira_issue_detail({"issue_key": "A" * 101})
+
+        self.assertEqual(client.calls, [])
 
     def test_unconfigured_jira_is_a_clear_handler_error(self):
         service = mock.Mock()
