@@ -16,6 +16,8 @@ A native Jira workspace for Hermes Desktop. It presents Jira issues on a Kanban-
 - Opens work sessions without submitting an agent task.
 - Drafts Jira updates in a normal Hermes session; posting remains explicit.
 - Suggests transitions but never applies one without a click.
+- Exposes four read-only agent tools: assigned issues, bounded JQL search, fresh issue detail, and available transitions.
+- Agent tool results are treated as untrusted Jira reference data; no write or attachment-download tool is registered.
 - Stores human-editable, credential-free settings as JSON.
 
 ## Security model
