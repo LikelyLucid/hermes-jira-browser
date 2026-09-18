@@ -333,12 +333,20 @@ class JiraBrowserApiTests(unittest.TestCase):
     def test_link_derives_metadata_in_backend(self):
         store = mock.Mock()
         store.link_session.return_value = {"session_id": "session-1", "project_id": "p_1"}
+        client = mock.Mock()
+        client.config.base_url = "https://jira.example.invalid"
+        client.issue.return_value = {"id": "10001", "key": "DEMO-42"}
         payload = plugin_api.SessionLinkRequest(
             issue_id="10001",
             issue_key="DEMO-42",
             session_id="session-1",
+            connection_id="work-vps",
+            profile_name="coder",
+            target_profile="coder",
         )
         with mock.patch.object(plugin_api, "_store", return_value=store), mock.patch.object(
+            plugin_api, "_client", return_value=client
+        ), mock.patch.object(
             plugin_api.SERVICE,
             "validated_link_metadata",
             return_value={
@@ -350,11 +358,16 @@ class JiraBrowserApiTests(unittest.TestCase):
             result = asyncio.run(plugin_api.link_session(payload))
 
         self.assertEqual(result["link"]["project_id"], "p_1")
+        client.issue.assert_called_once_with("DEMO-42")
         validate.assert_called_once_with(store, issue_key="DEMO-42", session_id="session-1")
         store.link_session.assert_called_once_with(
             issue_id="10001",
             issue_key="DEMO-42",
             session_id="session-1",
+            jira_origin="https://jira.example.invalid",
+            connection_id="work-vps",
+            profile_name="coder",
+            target_profile="coder",
             project_id="p_1",
             worktree_path="/trusted/repo/.worktrees/jira-DEMO-42",
             branch="jira/DEMO-42",
@@ -363,18 +376,39 @@ class JiraBrowserApiTests(unittest.TestCase):
     def test_unlink_removes_only_the_ticket_session_association(self):
         store = mock.Mock()
         store.unlink_session.return_value = True
-        with mock.patch.object(plugin_api, "_store", return_value=store):
-            result = asyncio.run(plugin_api.unlink_session("10001", "session-1"))
+        client = mock.Mock()
+        client.config.base_url = "https://jira.example.invalid"
+        with mock.patch.object(plugin_api, "_store", return_value=store), mock.patch.object(
+            plugin_api, "_client", return_value=client
+        ):
+            result = asyncio.run(plugin_api.unlink_session(
+                "10001",
+                "session-1",
+                connection_id="work-vps",
+                profile_name="coder",
+            ))
 
         self.assertEqual(result, {"unlinked": True})
-        store.unlink_session.assert_called_once_with(issue_id="10001", session_id="session-1")
+        store.unlink_session.assert_called_once_with(
+            issue_id="10001",
+            session_id="session-1",
+            jira_origin="https://jira.example.invalid",
+            connection_id="work-vps",
+            profile_name="coder",
+        )
 
     def test_issue_links_include_archived_chat_title(self):
         store = mock.Mock()
         raw = [{"session_id": "session-1"}]
+        detached = [{"session_id": "session-2", "connection_id": "work-vps", "profile_name": "coder"}]
         enriched = [{"session_id": "session-1", "chat_title": "Fix milk totals", "archived": True, "available": True}]
         store.links_for_issue.return_value = raw
+        store.detached_links_for_issue.return_value = detached
+        client = mock.Mock()
+        client.config.base_url = "https://jira.example.invalid"
         with mock.patch.object(plugin_api, "_store", return_value=store), mock.patch.object(
+            plugin_api, "_client", return_value=client
+        ), mock.patch.object(
             plugin_api.SERVICE,
             "enrich_session_links",
             return_value=enriched,
@@ -382,6 +416,9 @@ class JiraBrowserApiTests(unittest.TestCase):
             result = asyncio.run(plugin_api.issue_links("10001"))
 
         self.assertEqual(result["links"], enriched)
+        self.assertEqual(result["detached"], detached)
+        store.links_for_issue.assert_called_once_with("10001", jira_origin="https://jira.example.invalid")
+        store.detached_links_for_issue.assert_called_once_with("10001", jira_origin="https://jira.example.invalid")
         enrich.assert_called_once_with(raw)
 
     def test_project_sessions_use_server_side_mapping_and_include_archived(self):

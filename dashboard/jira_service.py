@@ -1308,7 +1308,7 @@ class JiraStore:
 
     def _migrate(self) -> None:
         with self._connect() as db:
-            db.executescript(
+            db.execute(
                 """
                 CREATE TABLE IF NOT EXISTS project_mappings (
                     jira_project_key TEXT PRIMARY KEY,
@@ -1316,19 +1316,43 @@ class JiraStore:
                     hermes_project_label TEXT NOT NULL,
                     repo_path TEXT NOT NULL,
                     updated_at TEXT NOT NULL
-                );
-                CREATE TABLE IF NOT EXISTS session_links (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    issue_id TEXT NOT NULL,
-                    issue_key TEXT NOT NULL,
-                    session_id TEXT NOT NULL,
-                    project_id TEXT,
-                    worktree_path TEXT,
-                    branch TEXT,
-                    created_at TEXT NOT NULL,
-                    UNIQUE(issue_id, session_id)
-                );
-                CREATE INDEX IF NOT EXISTS session_links_issue_idx ON session_links(issue_id, created_at DESC);
+                )
+                """
+            )
+            columns = {
+                str(row[1])
+                for row in db.execute("PRAGMA table_info(session_links)").fetchall()
+            }
+            required = {
+                "jira_origin",
+                "connection_id",
+                "profile_name",
+                "target_profile",
+                "detached",
+            }
+            if columns and not required.issubset(columns):
+                db.execute("ALTER TABLE session_links RENAME TO session_links_legacy")
+                self._create_session_links_table(db)
+                db.execute(
+                    """
+                    INSERT INTO session_links
+                        (issue_id, issue_key, jira_origin, connection_id, profile_name,
+                         target_profile, session_id, project_id, worktree_path, branch,
+                         detached, created_at)
+                    SELECT issue_id, issue_key, '', 'local', 'default', 'default',
+                           session_id, project_id, worktree_path, branch, 0, created_at
+                    FROM session_links_legacy
+                    """
+                )
+                db.execute("DROP TABLE session_links_legacy")
+            elif not columns:
+                self._create_session_links_table(db)
+            db.execute(
+                "CREATE INDEX IF NOT EXISTS session_links_issue_idx "
+                "ON session_links(jira_origin, issue_id, detached, created_at DESC)"
+            )
+            db.execute(
+                """
                 CREATE TABLE IF NOT EXISTS mutation_receipts (
                     idempotency_key TEXT PRIMARY KEY CHECK(length(idempotency_key) BETWEEN 16 AND 200),
                     action TEXT NOT NULL,
@@ -1341,15 +1365,42 @@ class JiraStore:
                     claimed_at TEXT NOT NULL,
                     completed_at TEXT,
                     updated_at TEXT NOT NULL
-                );
-                CREATE INDEX IF NOT EXISTS mutation_receipts_pending_idx
-                    ON mutation_receipts(completed, updated_at);
+                )
                 """
+            )
+            db.execute(
+                "CREATE INDEX IF NOT EXISTS mutation_receipts_pending_idx "
+                "ON mutation_receipts(completed, updated_at)"
             )
             self._prune_mutation_receipts_db(
                 db,
                 max_completed=MAX_COMPLETED_MUTATION_RECEIPTS,
                 retention_days=MUTATION_RECEIPT_RETENTION_DAYS,
+            )
+
+    @staticmethod
+    def _create_session_links_table(db: sqlite3.Connection) -> None:
+        db.execute(
+            """
+                CREATE TABLE IF NOT EXISTS session_links (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    issue_id TEXT NOT NULL,
+                    issue_key TEXT NOT NULL,
+                    jira_origin TEXT NOT NULL DEFAULT '',
+                    connection_id TEXT NOT NULL DEFAULT 'local',
+                    profile_name TEXT NOT NULL DEFAULT 'default',
+                    target_profile TEXT NOT NULL DEFAULT 'default',
+                    session_id TEXT NOT NULL,
+                    project_id TEXT,
+                    worktree_path TEXT,
+                    branch TEXT,
+                    detached INTEGER NOT NULL DEFAULT 0,
+                    created_at TEXT NOT NULL,
+                    UNIQUE(jira_origin, issue_id, connection_id, profile_name, target_profile, session_id)
+                );
+                CREATE INDEX IF NOT EXISTS session_links_issue_idx
+                    ON session_links(jira_origin, issue_id, detached, created_at DESC);
+                """
             )
 
     def reserve_mutation(
@@ -1550,27 +1601,43 @@ class JiraStore:
         issue_id: str,
         issue_key: str,
         session_id: str,
+        jira_origin: str = "",
+        connection_id: str = "local",
+        profile_name: str = "default",
+        target_profile: str | None = None,
         project_id: str | None = None,
         worktree_path: str | None = None,
         branch: str | None = None,
     ) -> dict[str, Any]:
         if not all((issue_id.strip(), issue_key.strip(), session_id.strip())):
             raise ValueError("Issue id, issue key, and session id are required.")
+        origin = jira_origin.strip().rstrip("/")
+        connection = connection_id.strip() or "local"
+        profile = profile_name.strip() or "default"
+        target = (target_profile or profile).strip() or profile
         with self._connect() as db:
             db.execute(
                 """
                 INSERT INTO session_links
-                    (issue_id, issue_key, session_id, project_id, worktree_path, branch, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(issue_id, session_id) DO UPDATE SET
+                    (issue_id, issue_key, jira_origin, connection_id, profile_name,
+                     target_profile, session_id, project_id, worktree_path, branch,
+                     detached, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?)
+                ON CONFLICT(jira_origin, issue_id, connection_id, profile_name, session_id) DO UPDATE SET
                     issue_key=excluded.issue_key,
+                    target_profile=excluded.target_profile,
                     project_id=excluded.project_id,
                     worktree_path=COALESCE(excluded.worktree_path, session_links.worktree_path),
-                    branch=COALESCE(excluded.branch, session_links.branch)
+                    branch=COALESCE(excluded.branch, session_links.branch),
+                    detached=0
                 """,
                 (
                     issue_id.strip(),
                     issue_key.strip().upper(),
+                    origin,
+                    connection,
+                    profile,
+                    target,
                     session_id.strip(),
                     project_id.strip() if project_id else None,
                     worktree_path.strip() if worktree_path else None,
@@ -1579,28 +1646,97 @@ class JiraStore:
                 ),
             )
             row = db.execute(
-                "SELECT * FROM session_links WHERE issue_id = ? AND session_id = ?",
-                (issue_id.strip(), session_id.strip()),
+                """
+                SELECT * FROM session_links
+                WHERE jira_origin = ? AND issue_id = ? AND connection_id = ?
+                  AND profile_name = ? AND session_id = ?
+                """,
+                (origin, issue_id.strip(), connection, profile, session_id.strip()),
             ).fetchone()
         return dict(row) if row else {}
 
-    def links_for_issue(self, issue_id: str) -> list[dict[str, Any]]:
+    def links_for_issue(self, issue_id: str, *, jira_origin: str | None = None) -> list[dict[str, Any]]:
+        clauses = ["issue_id = ?", "detached = 0"]
+        params: list[Any] = [issue_id.strip()]
+        if jira_origin is not None:
+            clauses.append("jira_origin = ?")
+            params.append(jira_origin.strip().rstrip("/"))
         with self._connect() as db:
             rows = db.execute(
-                "SELECT * FROM session_links WHERE issue_id = ? ORDER BY created_at DESC",
-                (issue_id.strip(),),
+                f"SELECT * FROM session_links WHERE {' AND '.join(clauses)} ORDER BY created_at DESC",
+                params,
             ).fetchall()
         return [dict(row) for row in rows]
 
-    def unlink_session(self, *, issue_id: str, session_id: str) -> bool:
+    def detached_session_ids(
+        self,
+        issue_id: str,
+        *,
+        jira_origin: str = "",
+        connection_id: str = "local",
+        profile_name: str = "default",
+    ) -> set[str]:
+        with self._connect() as db:
+            rows = db.execute(
+                """
+                SELECT session_id FROM session_links
+                WHERE issue_id = ? AND jira_origin = ? AND connection_id = ?
+                  AND profile_name = ? AND detached = 1
+                """,
+                (
+                    issue_id.strip(),
+                    jira_origin.strip().rstrip("/"),
+                    connection_id.strip() or "local",
+                    profile_name.strip() or "default",
+                ),
+            ).fetchall()
+        return {str(row["session_id"]) for row in rows}
+
+    def detached_links_for_issue(
+        self,
+        issue_id: str,
+        *,
+        jira_origin: str | None = None,
+    ) -> list[dict[str, Any]]:
+        clauses = ["issue_id = ?", "detached = 1"]
+        params: list[Any] = [issue_id.strip()]
+        if jira_origin is not None:
+            clauses.append("jira_origin = ?")
+            params.append(jira_origin.strip().rstrip("/"))
+        with self._connect() as db:
+            rows = db.execute(
+                f"SELECT * FROM session_links WHERE {' AND '.join(clauses)} ORDER BY created_at DESC",
+                params,
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def unlink_session(
+        self,
+        *,
+        issue_id: str,
+        session_id: str,
+        jira_origin: str = "",
+        connection_id: str = "local",
+        profile_name: str = "default",
+    ) -> bool:
         issue = issue_id.strip()
         session = session_id.strip()
         if not issue or not session:
             raise ValueError("Issue id and session id are required.")
         with self._connect() as db:
             cursor = db.execute(
-                "DELETE FROM session_links WHERE issue_id = ? AND session_id = ?",
-                (issue, session),
+                """
+                UPDATE session_links SET detached = 1
+                WHERE issue_id = ? AND session_id = ? AND jira_origin = ?
+                  AND connection_id = ? AND profile_name = ? AND detached = 0
+                """,
+                (
+                    issue,
+                    session,
+                    jira_origin.strip().rstrip("/"),
+                    connection_id.strip() or "local",
+                    profile_name.strip() or "default",
+                ),
             )
         return cursor.rowcount > 0
 

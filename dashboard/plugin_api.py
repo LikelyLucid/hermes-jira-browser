@@ -45,6 +45,9 @@ class SessionLinkRequest(BaseModel):
     issue_id: str = Field(min_length=1)
     issue_key: str = Field(min_length=1)
     session_id: str = Field(min_length=1)
+    connection_id: str = Field(default="local", min_length=1, max_length=200)
+    profile_name: str = Field(default="default", min_length=1, max_length=200)
+    target_profile: str = Field(default="default", min_length=1, max_length=200)
 
 
 class CommentRequest(BaseModel):
@@ -312,20 +315,32 @@ async def cleanup_worktree(payload: WorktreeRequest) -> dict[str, Any]:
 @router.get("/links/{issue_id}")
 async def issue_links(issue_id: str) -> dict[str, Any]:
     try:
-        links = await asyncio.to_thread(_store().links_for_issue, issue_id)
+        store = _store()
+        jira_origin = _client().config.base_url
+        links = await asyncio.to_thread(store.links_for_issue, issue_id, jira_origin=jira_origin)
+        detached = await asyncio.to_thread(store.detached_links_for_issue, issue_id, jira_origin=jira_origin)
         links = await asyncio.to_thread(SERVICE.enrich_session_links, links)
-        return {"links": links}
+        return {"links": links, "detached": detached}
     except Exception as exc:
         raise _safe_http_error(exc) from exc
 
 
 @router.delete("/links/{issue_id}/{session_id}")
-async def unlink_session(issue_id: str, session_id: str) -> dict[str, bool]:
+async def unlink_session(
+    issue_id: str,
+    session_id: str,
+    connection_id: str = "local",
+    profile_name: str = "default",
+) -> dict[str, bool]:
     try:
+        client = _client()
         unlinked = await asyncio.to_thread(
             _store().unlink_session,
             issue_id=issue_id,
             session_id=session_id,
+            jira_origin=client.config.base_url,
+            connection_id=connection_id,
+            profile_name=profile_name,
         )
         return {"unlinked": unlinked}
     except Exception as exc:
@@ -336,6 +351,10 @@ async def unlink_session(issue_id: str, session_id: str) -> dict[str, bool]:
 async def link_session(payload: SessionLinkRequest) -> dict[str, Any]:
     try:
         store = _store()
+        client = _client()
+        issue = await asyncio.to_thread(client.issue, payload.issue_key)
+        if str(issue.get("id") or "") != payload.issue_id.strip() or str(issue.get("key") or "").upper() != payload.issue_key.strip().upper():
+            raise ValueError("The Jira issue id and key do not identify the same issue.")
         metadata = await asyncio.to_thread(
             SERVICE.validated_link_metadata,
             store,
@@ -347,6 +366,10 @@ async def link_session(payload: SessionLinkRequest) -> dict[str, Any]:
             issue_id=payload.issue_id,
             issue_key=payload.issue_key,
             session_id=payload.session_id,
+            jira_origin=client.config.base_url,
+            connection_id=payload.connection_id,
+            profile_name=payload.profile_name,
+            target_profile=payload.target_profile,
             project_id=metadata["project_id"],
             worktree_path=metadata["worktree_path"],
             branch=metadata["branch"],
