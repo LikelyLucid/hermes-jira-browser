@@ -6,6 +6,13 @@ PLUGIN = Path(__file__).parents[1] / "desktop" / "plugin.js"
 
 
 class DesktopPluginTests(unittest.TestCase):
+    def test_status_colors_use_native_hermes_theme_tokens(self):
+        source = PLUGIN.read_text(encoding="utf-8")
+
+        status_color = source[source.index("function statusColor") : source.index("function normaliseProjects")]
+        self.assertIn("var(--ui-accent)", status_color)
+        self.assertNotIn("#60a5fa", status_color)
+
     def test_ticket_lists_use_persistent_stale_while_revalidate_cache(self):
         source = PLUGIN.read_text(encoding="utf-8")
 

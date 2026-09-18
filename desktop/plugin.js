@@ -112,7 +112,7 @@ function statusTone(issue) {
 function statusColor(issueOrLane) {
   const category = issueOrLane?.status_category || issueOrLane?.category || 'new'
   if (category === 'done') return 'var(--ui-text-tertiary)'
-  if (category === 'indeterminate') return '#60a5fa'
+  if (category === 'indeterminate') return 'var(--ui-accent)'
   return 'var(--ui-text-secondary)'
 }
 
