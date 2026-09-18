@@ -384,8 +384,8 @@ class JiraBrowserApiTests(unittest.TestCase):
             result = asyncio.run(plugin_api.unlink_session(
                 "10001",
                 "session-1",
-                connection_id="work-vps",
-                profile_name="coder",
+                connection_id=" work-vps ",
+                profile_name=" coder ",
             ))
 
         self.assertEqual(result, {"unlinked": True})

@@ -146,13 +146,13 @@ async def _run_mutation(
     return result
 
 
-def _validate_active_owner(profile_name: str, connection_id: str) -> str:
+def _validate_active_owner(profile_name: str, connection_id: str) -> tuple[str, str]:
     profile = SERVICE.validate_owner_field(profile_name, field_name="profile_name")
-    SERVICE.validate_owner_field(connection_id, field_name="connection_id")
+    connection = SERVICE.validate_owner_field(connection_id, field_name="connection_id")
     active = SERVICE.active_profile_name()
     if active is not None and profile != active:
         raise ValueError(f"profile_name must identify the active profile ({active}).")
-    return profile
+    return profile, connection
 
 
 @router.get("/status")
@@ -360,7 +360,7 @@ async def unlink_session(
     profile_name: str = "default",
 ) -> dict[str, bool]:
     try:
-        _validate_active_owner(profile_name, connection_id)
+        profile_name, connection_id = _validate_active_owner(profile_name, connection_id)
         client = _client()
         unlinked = await asyncio.to_thread(
             _store().unlink_session,
@@ -378,7 +378,7 @@ async def unlink_session(
 @router.post("/links")
 async def link_session(payload: SessionLinkRequest) -> dict[str, Any]:
     try:
-        _validate_active_owner(payload.profile_name, payload.connection_id)
+        profile_name, connection_id = _validate_active_owner(payload.profile_name, payload.connection_id)
         store = _store()
         client = _client()
         issue = await asyncio.to_thread(client.issue, payload.issue_key)
@@ -396,8 +396,8 @@ async def link_session(payload: SessionLinkRequest) -> dict[str, Any]:
             issue_key=payload.issue_key,
             session_id=payload.session_id,
             jira_origin=client.config.base_url,
-            connection_id=payload.connection_id,
-            profile_name=payload.profile_name,
+            connection_id=connection_id,
+            profile_name=profile_name,
             target_profile=payload.target_profile,
             project_id=metadata["project_id"],
             worktree_path=metadata["worktree_path"],
