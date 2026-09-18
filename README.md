@@ -13,8 +13,9 @@ A native Jira workspace for Hermes Desktop. It presents Jira issues on a Kanban-
 - Links one worktree to a ticket and automatically discovers sessions rooted in it.
 - Persists each chat link with its Desktop connection and Hermes profile owner, so identical stored session ids remain distinct across profiles.
 - Supports explicit **Resume work**, **New chat**, chat attachment, and chat unlinking.
-- Highlights a ticket card with a live ring and **Working** badge while any linked Hermes session is actively running.
-- Opens work sessions without submitting an agent task.
+- Highlights a ticket card with a live native status while linked Hermes sessions are working, waiting for input, starting, idle, failed, or archived.
+- Mirrors linked-session status in the native Hermes status bar/title bar, with a palette command and rebindable **Open Jira Browser** keybind (`⌘⇧J` / `Ctrl+Shift+J`).
+- Keeps completion and needs-input notifications opt-in from the command palette and deduplicated across repeated live updates.
 - Deep-links exact tickets with `/jira?issue=PROJECT-123`; the in-route drawer follows hash navigation.
 - Pins a read-only ticket companion beside chat when the Desktop `host.openWorkspace` contract is available, without opening a session.
 - Provides read-only repository, branch, diff, commit, ahead/behind, pull-request, and CI context for a ticket when its mapped Jira worktree exists.
