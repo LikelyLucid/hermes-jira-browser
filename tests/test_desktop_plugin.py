@@ -344,6 +344,31 @@ class DesktopPluginTests(unittest.TestCase):
         self.assertIn("link?.detached_at", source)
         self.assertIn("available: undefined", source)
 
+    def test_backend_detach_tombstones_are_consumed_separately_from_active_links(self):
+        source = PLUGIN.read_text(encoding="utf-8")
+
+        self.assertIn("function filterDetachedLinks(issueKey, links, backendDetached = [])", source)
+        self.assertIn("mergeBackendDetachedLinks(issueKey, backendDetached)", source)
+        self.assertIn("filterDetachedLinks(issue.key, result?.links, result?.detached)", source)
+        self.assertIn("filterDetachedLinks(detail.key, result?.links, result?.detached)", source)
+        self.assertIn("filterDetachedLinks(nextDetail.key, linksResult?.links, linksResult?.detached)", source)
+
+    def test_foreign_owner_scans_never_mix_ambient_backend_sessions(self):
+        source = PLUGIN.read_text(encoding="utf-8")
+
+        self.assertIn("function isAmbientOwnerRoute", source)
+        self.assertIn("isAmbientOwnerRoute(ownerRoute) && jiraProjectKey", source)
+        self.assertIn("const route = await resolveSessionRoute(readFocusedSessionOwner(), { matchTarget: false })", source)
+
+    def test_focused_owner_resolution_and_detach_are_fail_closed(self):
+        source = PLUGIN.read_text(encoding="utf-8")
+
+        self.assertIn("host.state?.connectionId?.get?.()", source)
+        self.assertIn("host.activeConnectionId?.()", source)
+        self.assertGreaterEqual(source.count("const route = await resolveFocusedSessionRoute()"), 4)
+        self.assertIn("sessionLinkIdentity(candidate) !== sessionLinkIdentity(linkCandidate)", source)
+        self.assertNotIn("Older running backends do not have the DELETE route yet", source)
+
 
 if __name__ == "__main__":
     unittest.main()

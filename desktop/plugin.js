@@ -205,11 +205,17 @@ function readFocusedSessionOwner() {
       targetProfile: String(focused.targetProfile || focused.target_profile || profileName).trim() || profileName
     }
   }
+  const connectionId = String(
+    host.state?.connectionId?.get?.()
+      || host.activeConnectionId?.()
+      || 'local'
+  ).trim() || 'local'
   const profileName = String(
     host.state?.focusedSessionProfile?.get?.()
+      || host.state?.profile?.get?.()
       || 'default'
   ).trim() || 'default'
-  return { connectionId: 'local', profileName, targetProfile: profileName }
+  return { connectionId, profileName, targetProfile: profileName }
 }
 
 function ownerFromLink(link) {
@@ -250,18 +256,31 @@ function sessionOwnerFields(owner) {
   }
 }
 
-async function resolveSessionRoute(value) {
+async function resolveSessionRoute(value, options = {}) {
   const owner = value?.connectionId || value?.profileName ? value : ownerFromLink(value)
+  const matchTarget = options.matchTarget !== false
   if (typeof host.profileRoutes !== 'function') throw new Error('Hermes Desktop connection routing is unavailable.')
   const routes = await host.profileRoutes()
   const route = (Array.isArray(routes) ? routes : []).find(candidate => {
     const candidateOwner = ownerFromRoute(candidate)
     return candidateOwner.connectionId === owner.connectionId
       && candidateOwner.profileName === owner.profileName
-      && candidateOwner.targetProfile === owner.targetProfile
+      && (!matchTarget || candidateOwner.targetProfile === owner.targetProfile)
   })
   if (!route) throw new Error(`The connection/profile owner ${owner.connectionId}::${owner.profileName} is unavailable.`)
   return route
+}
+
+async function resolveFocusedSessionRoute() {
+  const route = await resolveSessionRoute(readFocusedSessionOwner(), { matchTarget: false })
+  return route
+}
+
+function isAmbientOwnerRoute(route) {
+  const activeConnection = String(host.state?.connectionId?.get?.() || host.activeConnectionId?.() || 'local').trim()
+  const activeProfile = String(host.state?.profile?.get?.() || 'default').trim() || 'default'
+  return String(route?.connectionId || '').trim() === activeConnection
+    && String(route?.profile || '').trim() === activeProfile
 }
 
 function sessionIdFromRow(session) {
@@ -289,7 +308,7 @@ async function verifySessionOwner(sessionId, route) {
 
 async function listCurrentProfileSessions(projectId = '', jiraProjectKey = '', route = null) {
   const focusedOwner = readFocusedSessionOwner()
-  const ownerRoute = route || await resolveSessionRoute(focusedOwner)
+  const ownerRoute = route || await resolveFocusedSessionRoute()
   const profile = String(ownerRoute.targetProfile || ownerRoute.profile || focusedOwner.profileName).trim()
   const [recentResult, projectResult, storedResult] = await Promise.all([
     host.listPersistedSessions(ownerRoute, { profile, limit: 500 }),
@@ -300,7 +319,7 @@ async function listCurrentProfileSessions(projectId = '', jiraProjectKey = '', r
           session_limit: 20_000
         }).catch(() => ({ project: null }))
       : Promise.resolve({ project: null }),
-    jiraProjectKey
+    isAmbientOwnerRoute(ownerRoute) && jiraProjectKey
       ? api(`/sessions/${encodeURIComponent(jiraProjectKey)}`).catch(() => ({ sessions: [] }))
       : Promise.resolve({ sessions: [] })
   ])
@@ -445,8 +464,8 @@ function linkAvailability(link) {
   return isFocusedOwner ? link : { ...link, available: undefined }
 }
 
-function filterDetachedLinks(issueKey, links) {
-  const detached = mergeBackendDetachedLinks(issueKey, links)
+function filterDetachedLinks(issueKey, links, backendDetached = []) {
+  const detached = mergeBackendDetachedLinks(issueKey, backendDetached)
   return (Array.isArray(links) ? links : []).filter(link => {
     const sessionId = String(link?.session_id || '').trim()
     const identity = sessionLinkIdentity(link)
@@ -1139,8 +1158,7 @@ function IssueDetail({ issue, status, projects, mapping, links, baseRef, onOpenI
     setBusyAction('link')
     setError('')
     try {
-      const focusedOwner = readFocusedSessionOwner()
-      const route = await resolveSessionRoute(focusedOwner)
+      const route = await resolveFocusedSessionRoute()
       await verifySessionOwner(sessionId, route)
       const owner = ownerFromRoute(route)
       await api('/links', {
@@ -1191,8 +1209,9 @@ function IssueDetail({ issue, status, projects, mapping, links, baseRef, onOpenI
           ...sessionOwnerFields(owner)
         }
       })
-      writeChatDetached(issue.key, { session_id: sessionId, ...sessionOwnerFields(owner) }, false)
-      setRelatedChats(current => current.filter(candidate => candidate.session_id !== sessionId))
+      const linkCandidate = { session_id: sessionId, ...sessionOwnerFields(owner) }
+      writeChatDetached(issue.key, linkCandidate, false)
+      setRelatedChats(current => current.filter(candidate => sessionLinkIdentity(candidate) !== sessionLinkIdentity(linkCandidate)))
       await onLinksChanged()
       host.notify({ kind: 'success', message: `Attached the chat to ${issue.key}.` })
     } catch (cause) {
@@ -1211,14 +1230,8 @@ function IssueDetail({ issue, status, projects, mapping, links, baseRef, onOpenI
     setError('')
     writeChatDetached(issue.key, link, true)
     try {
-      try {
-        const query = new URLSearchParams({ connection_id: owner.connectionId, profile_name: owner.profileName })
-        await api(`/links/${encodeURIComponent(issue.id)}/${encodeURIComponent(sessionId)}?${query.toString()}`, { method: 'DELETE' })
-      } catch {
-        // Older running backends do not have the DELETE route yet. The persisted
-        // local detachment still hides the link and prevents worktree scans from
-        // reattaching it; a future backend load makes the delete authoritative.
-      }
+      const query = new URLSearchParams({ connection_id: owner.connectionId, profile_name: owner.profileName })
+      await api(`/links/${encodeURIComponent(issue.id)}/${encodeURIComponent(sessionId)}?${query.toString()}`, { method: 'DELETE' })
       await onLinksChanged()
       host.notify({ kind: 'success', message: `Unlinked the chat from ${issue.key}. The Hermes chat was kept.` })
     } catch (cause) {
@@ -1236,8 +1249,7 @@ function IssueDetail({ issue, status, projects, mapping, links, baseRef, onOpenI
     setScanningChats(true)
     setError('')
     try {
-      const focusedOwner = readFocusedSessionOwner()
-      const route = await resolveSessionRoute(focusedOwner)
+      const route = await resolveFocusedSessionRoute()
       const owner = ownerFromRoute(route)
       const sessions = await listCurrentProfileSessions(mapping?.hermes_project_id, issue?.project_key, route)
       if (!isCurrent()) return
@@ -1349,8 +1361,7 @@ function IssueDetail({ issue, status, projects, mapping, links, baseRef, onOpenI
     setError('')
     try {
       const focusedId = String(host.state?.focusedStoredSessionId?.get?.() || '')
-      const focusedOwner = readFocusedSessionOwner()
-      const route = await resolveSessionRoute(focusedOwner)
+      const route = await resolveFocusedSessionRoute()
       const sessions = await listCurrentProfileSessions(mapping?.hermes_project_id, issue?.project_key, route)
       const session = sessions.find(candidate => sessionIdFromRow(candidate) === focusedId)
       const path = sessionWorktreePath(session)
@@ -2257,8 +2268,7 @@ function JiraPage() {
       if (refreshing) return
       refreshing = true
       try {
-        const focusedOwner = readFocusedSessionOwner()
-        const route = await resolveSessionRoute(focusedOwner)
+        const route = await resolveFocusedSessionRoute()
         const result = await host.requestProfile(route, 'session.active_list', { profile: route.targetProfile || route.profile })
         if (!alive) return
         setWorkingSessionIds(new Set(
@@ -2529,7 +2539,7 @@ function JiraPage() {
       try {
         const result = await api(`/links/${encodeURIComponent(issue.id)}`)
         return [issue.key, {
-          links: filterDetachedLinks(issue.key, result?.links),
+          links: filterDetachedLinks(issue.key, result?.links, result?.detached),
           loading: false,
           storedAt: Date.now()
         }]
@@ -2549,7 +2559,7 @@ function JiraPage() {
   const reloadLinks = useCallback(async () => {
     if (!detail?.id) return
     const result = await api(`/links/${encodeURIComponent(detail.id)}`)
-    const nextLinks = filterDetachedLinks(detail.key, result?.links)
+    const nextLinks = filterDetachedLinks(detail.key, result?.links, result?.detached)
     setLinks(nextLinks)
     setWorkStates(current => {
       const next = {
@@ -2580,7 +2590,7 @@ function JiraPage() {
           : { mapping: null }
         if (!alive) return
         setDetail(nextDetail)
-        setLinks(filterDetachedLinks(nextDetail.key, linksResult?.links))
+        setLinks(filterDetachedLinks(nextDetail.key, linksResult?.links, linksResult?.detached))
         setMapping(mappingResult?.mapping || null)
       })
       .catch(cause => {
