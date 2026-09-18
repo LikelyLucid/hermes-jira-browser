@@ -145,6 +145,7 @@ class DesktopPluginTests(unittest.TestCase):
         self.assertLess(start_work.index(open_call), start_work.index("void onLinksChanged()"))
         self.assertIn("traceWorkOpen(issue.key, 'session-created')", start_work)
         self.assertIn("traceWorkOpen(issue.key, 'open-complete')", start_work)
+        self.assertIn("scanGeneration.current += 1", start_work)
 
     def test_related_chats_are_discovered_and_attachable(self):
         source = PLUGIN.read_text(encoding="utf-8")
@@ -194,7 +195,7 @@ class DesktopPluginTests(unittest.TestCase):
 
         self.assertIn("const draftJiraUpdate = useCallback", source)
         self.assertIn("title: `Jira update ${issue.key}`", source)
-        self.assertIn("host.request('prompt.submit'", source)
+        self.assertIn("host.requestProfile(route, 'prompt.submit'", source)
         self.assertIn("Do not mutate Jira", source)
         self.assertIn("Draft update", source)
 
@@ -329,7 +330,7 @@ class DesktopPluginTests(unittest.TestCase):
         self.assertIn("connection_id: owner.connectionId", source)
         self.assertIn("profile_name: owner.profileName", source)
         self.assertIn("target_profile: owner.targetProfile", source)
-        self.assertIn("new URLSearchParams({ connection_id: owner.connectionId, profile_name: owner.profileName })", source)
+        self.assertIn("new URLSearchParams({ connection_id: owner.connectionId, profile_name: owner.profileName, target_profile: owner.targetProfile })", source)
 
     def test_session_link_scans_and_verifies_through_the_owner_route(self):
         source = PLUGIN.read_text(encoding="utf-8")
@@ -374,6 +375,48 @@ class DesktopPluginTests(unittest.TestCase):
         self.assertIn("writeChatDetached(issue.key, linkCandidate, false)", source)
         self.assertIn("if (!owner) throw new Error('The focused chat owner is ambiguous or unavailable.')", source)
         self.assertIn("if (!link?.connection_id || !link?.profile_name) return null", source)
+
+    def test_ownerless_links_and_legacy_detach_tombstones_fail_closed(self):
+        source = PLUGIN.read_text(encoding="utf-8")
+
+        availability = source[source.index("function linkAvailability"):source.index("function filterDetachedLinks")]
+        self.assertIn("if (!owner) return { ...link, available: false }", availability)
+        self.assertIn("if (!focused) return { ...link, available: false }", availability)
+        detach = source[source.index("function writeChatDetached"):source.index("function mergeBackendDetachedLinks")]
+        self.assertIn("ids.delete(sessionId)", detach)
+        filtering = source[source.index("function filterDetachedLinks"):source.index("function clampDrawerWidth")]
+        self.assertIn("const legacyLocalDetach = detached.has(sessionId)", filtering)
+
+    def test_ambient_owner_route_matches_the_full_active_route_tuple(self):
+        source = PLUGIN.read_text(encoding="utf-8")
+        ambient = source[source.index("function isAmbientOwnerRoute"):source.index("function sessionIdFromRow")]
+
+        self.assertIn("activeTargetProfile", ambient)
+        self.assertIn("String(route?.targetProfile || '').trim() === activeTargetProfile", ambient)
+
+    def test_draft_update_is_fully_routed_and_fails_closed(self):
+        source = PLUGIN.read_text(encoding="utf-8")
+        draft = source[source.index("const draftJiraUpdate"):source.index("const postComment")]
+
+        self.assertIn("const route = await resolveFocusedSessionRoute()", draft)
+        self.assertIn("host.requestProfile(route, 'session.create'", draft)
+        self.assertIn("host.requestProfile(route, 'prompt.submit'", draft)
+        self.assertIn("route: route", draft)
+        self.assertIn("profile: route.targetProfile || route.profile", draft)
+        self.assertIn("host.requestProfile(route, 'session.delete'", draft)
+        self.assertNotIn("host.request('session.create'", draft)
+        self.assertNotIn("host.request('prompt.submit'", draft)
+        self.assertNotIn("host.request('session.delete'", draft)
+
+    def test_focused_link_rechecks_owner_identity_before_posting(self):
+        source = PLUGIN.read_text(encoding="utf-8")
+        link = source[source.index("const linkCurrent"):source.index("useEffect(() => {", source.index("const linkCurrent"))]
+
+        self.assertIn("const focusedOwner = readFocusedSessionOwner()", link)
+        self.assertIn("const focusedLinkIdentity = sessionLinkIdentity", link)
+        self.assertIn("const currentLinkIdentity = sessionLinkIdentity", link)
+        self.assertIn("if (currentLinkIdentity !== focusedLinkIdentity) throw new Error", link)
+        self.assertIn("scanGeneration.current += 1", link)
 
 
 if __name__ == "__main__":
