@@ -91,12 +91,9 @@ class TransitionRequest(BaseModel):
 
 
 def _store():
-    # Legacy rows have no Jira origin. Claim them once against the loaded config;
-    # connection_id is renderer routing metadata, not a backend identity registry.
-    config = SERVICE.load_jira_config()
-    store = SERVICE.JiraStore(SERVICE.default_store_path())
-    store.claim_legacy_origin(config.base_url)
-    return store
+    # Legacy rows have no Jira origin and remain quarantined until explicitly
+    # adopted; never infer ownership from the currently loaded Jira config.
+    return SERVICE.JiraStore(SERVICE.default_store_path())
 
 
 def _client():
@@ -147,9 +144,19 @@ async def _run_mutation(
     return result
 
 
-def _validate_active_owner(profile_name: str, connection_id: str) -> tuple[str, str]:
+def _validate_active_owner(
+    profile_name: str,
+    connection_id: str,
+    target_profile: str | None = None,
+) -> tuple[str, str]:
     profile = SERVICE.validate_owner_field(profile_name, field_name="profile_name")
     connection = SERVICE.validate_owner_field(connection_id, field_name="connection_id")
+    active_profile = SERVICE.active_profile_name()
+    if connection != "local" or active_profile is None or profile != active_profile:
+        raise ValueError("Session owner is not registered to this backend.")
+    target = SERVICE.validate_owner_field(target_profile or profile, field_name="target_profile")
+    if target != active_profile:
+        raise ValueError("Target profile is not registered to this backend.")
     return profile, connection
 
 
@@ -359,7 +366,11 @@ async def unlink_session(
     target_profile: str | None = None,
 ) -> dict[str, bool]:
     try:
-        profile_name, connection_id = _validate_active_owner(profile_name, connection_id)
+        profile_name, connection_id = _validate_active_owner(
+            profile_name,
+            connection_id,
+            target_profile,
+        )
         target_profile = SERVICE.validate_owner_field(
             target_profile or profile_name,
             field_name="target_profile",
@@ -382,7 +393,11 @@ async def unlink_session(
 @router.post("/links")
 async def link_session(payload: SessionLinkRequest) -> dict[str, Any]:
     try:
-        profile_name, connection_id = _validate_active_owner(payload.profile_name, payload.connection_id)
+        profile_name, connection_id = _validate_active_owner(
+            payload.profile_name,
+            payload.connection_id,
+            payload.target_profile,
+        )
         target_profile = SERVICE.validate_owner_field(
             payload.target_profile or profile_name,
             field_name="target_profile",
