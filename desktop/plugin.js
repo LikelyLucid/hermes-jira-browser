@@ -587,6 +587,100 @@ function settingsViewMode(settings) {
   return settings?.groupByStatus === false ? 'list' : 'board'
 }
 
+const VIEW_SORT_OPTIONS = [
+  { value: 'updated', label: 'Recently updated' },
+  { value: 'priority', label: 'Highest priority' },
+  { value: 'status', label: 'Status' },
+  { value: 'key', label: 'Ticket key' }
+]
+
+const VIEW_DENSITY_OPTIONS = [
+  { value: 'comfortable', label: 'Comfortable' },
+  { value: 'compact', label: 'Compact' }
+]
+
+const QUICK_FILTER_OPTIONS = [
+  { value: 'all', label: 'All tickets' },
+  { value: 'attention', label: 'Needs attention' },
+  { value: 'blocked', label: 'Blocked or on hold' },
+  { value: 'unassigned', label: 'Unassigned' },
+  { value: 'no-linked', label: 'No linked chat' },
+  { value: 'working', label: 'Work in progress' },
+  { value: 'stale', label: 'Stale tickets' }
+]
+
+function viewPreferences(settings, activeView) {
+  const views = Array.isArray(settings?.views) ? settings.views : []
+  const view = views.find(candidate => String(candidate?.id || '') === String(activeView || '')) || null
+  const fallbackLayout = view?.id === 'backlog' ? 'list' : settingsViewMode(settings)
+  const fallbackSort = view?.id === 'backlog' ? 'priority' : 'updated'
+  const fallbackDensity = view?.id === 'backlog' ? 'compact' : 'comfortable'
+  return {
+    view,
+    layout: ['board', 'list'].includes(String(view?.layout || '')) ? view.layout : fallbackLayout,
+    sort: VIEW_SORT_OPTIONS.some(option => option.value === view?.sort) ? view.sort : fallbackSort,
+    density: VIEW_DENSITY_OPTIONS.some(option => option.value === view?.density) ? view.density : fallbackDensity
+  }
+}
+
+function priorityRank(value) {
+  const label = String(value || '').toLowerCase()
+  if (/highest|blocker|critical|urgent/.test(label)) return 0
+  if (/high/.test(label)) return 1
+  if (/medium|normal/.test(label)) return 2
+  if (/lowest/.test(label)) return 4
+  if (/low/.test(label)) return 3
+  return 5
+}
+
+function sortIssues(issues, sort = 'updated') {
+  return [...(Array.isArray(issues) ? issues : [])].sort((left, right) => {
+    if (sort === 'priority') {
+      return priorityRank(left.priority) - priorityRank(right.priority)
+        || String(right.updated || '').localeCompare(String(left.updated || ''))
+    }
+    if (sort === 'status') {
+      return String(left.status || '').localeCompare(String(right.status || ''))
+        || String(right.updated || '').localeCompare(String(left.updated || ''))
+    }
+    if (sort === 'key') return String(left.key || '').localeCompare(String(right.key || ''), undefined, { numeric: true })
+    return String(right.updated || '').localeCompare(String(left.updated || ''))
+  })
+}
+
+function matchesQuickFilter(filter, issue, workState, attentionReasons = [], liveState = 'idle', workingSessionIds = null) {
+  if (filter === 'attention') return attentionReasons.length > 0 || ['failed', 'waiting'].includes(liveState)
+  if (filter === 'blocked') return attentionReasons.some(reason => reason === 'Blocked')
+  if (filter === 'unassigned') return !String(issue?.assignee || '').trim()
+  if (filter === 'no-linked') return workState && !workState.loading && !workState.refreshFailed && (workState.links || []).length === 0
+  if (filter === 'working') return ['working', 'starting'].includes(liveState)
+    || (Array.isArray(workState?.links) && workState.links.some(link => workingSessionIds?.has(sessionLinkIdentity(link))))
+  if (filter === 'stale') return attentionReasons.some(reason => String(reason).startsWith('Stale '))
+  return true
+}
+
+function escapeJqlValue(value) {
+  return String(value || '').replace(/\\/g, '\\\\').replace(/"/g, '\\"').slice(0, 120)
+}
+
+function friendlyViewJql({ assignee = 'any', status = 'open', focus = 'all', label = '', sort = 'updated' } = {}) {
+  const clauses = []
+  if (assignee === 'mine') clauses.push('assignee = currentUser()')
+  if (assignee === 'unassigned') clauses.push('assignee is EMPTY')
+  if (status === 'open') clauses.push('statusCategory != Done')
+  if (status === 'done') clauses.push('statusCategory = Done')
+  if (focus === 'blocked') clauses.push('status in ("Blocked", "On Hold")')
+  if (focus === 'review') clauses.push('status ~ "review"')
+  if (String(label || '').trim()) clauses.push(`labels = "${escapeJqlValue(label.trim())}"`)
+  const order = {
+    key: 'ORDER BY key ASC',
+    priority: 'ORDER BY priority DESC, updated DESC',
+    status: 'ORDER BY status ASC, updated DESC',
+    updated: 'ORDER BY updated DESC'
+  }[sort] || 'ORDER BY updated DESC'
+  return `${clauses.length ? `${clauses.join(' AND ')} ` : ''}${order}`
+}
+
 function normaliseProjects(tree) {
   const projects = Array.isArray(tree?.projects)
     ? tree.projects
@@ -1247,7 +1341,7 @@ function IssueRowTitle({ issue }) {
   })
 }
 
-function JiraCard({ issue, active, attentionReasons = [], onOpen, workState, workingSessionIds, liveState = 'idle' }) {
+function JiraCard({ issue, active, attentionReasons = [], density = 'comfortable', onOpen, workState, workingSessionIds, liveState = 'idle' }) {
   const tone = statusColor(issue)
   const linkedWork = Array.isArray(workState?.links) ? workState.links : []
   const branch = linkedWork.find(link => link.branch)?.branch || ''
@@ -1256,7 +1350,7 @@ function JiraCard({ issue, active, attentionReasons = [], onOpen, workState, wor
     || liveWorking || liveState === 'working' || liveState === 'starting'
   const liveAttention = ['failed', 'waiting'].includes(liveState)
   return jsxs('div', {
-    className: `group relative flex cursor-grab flex-col gap-2 rounded-md border border-(--ui-stroke-tertiary) border-l-2 bg-(--ui-bg-elevated) p-2.5 transition-colors hover:bg-primary/[0.06] active:cursor-grabbing${working ? ' border-(--dt-composer-ring) ring-1 ring-(--dt-composer-ring) bg-[color-mix(in_srgb,var(--dt-composer-ring)_10%,transparent)]' : active ? ' border-(--dt-composer-ring) bg-[color-mix(in_srgb,var(--dt-composer-ring)_7%,transparent)]' : ''}`,
+    className: `group relative flex cursor-grab flex-col ${density === 'compact' ? 'gap-1.5 p-2' : 'gap-2 p-2.5'} rounded-md border border-(--ui-stroke-tertiary) border-l-2 bg-(--ui-bg-elevated) transition-colors hover:bg-primary/[0.06] active:cursor-grabbing${working ? ' border-(--dt-composer-ring) ring-1 ring-(--dt-composer-ring) bg-[color-mix(in_srgb,var(--dt-composer-ring)_10%,transparent)]' : active ? ' border-(--dt-composer-ring) bg-[color-mix(in_srgb,var(--dt-composer-ring)_7%,transparent)]' : ''}`,
     draggable: true,
     onClick: () => onOpen(issue.key),
     onDragStart: event => {
@@ -1346,7 +1440,7 @@ function JiraCard({ issue, active, attentionReasons = [], onOpen, workState, wor
   })
 }
 
-function JiraListRow({ issue, active, attentionReasons = [], onOpen, workState, workingSessionIds, liveState = 'idle' }) {
+function JiraListRow({ issue, active, attentionReasons = [], density = 'comfortable', onOpen, workState, workingSessionIds, liveState = 'idle' }) {
   const linkedWork = Array.isArray(workState?.links) ? workState.links : []
   const working = linkedWork.some(link => workingSessionIds?.has(sessionLinkIdentity(link)))
     || liveStatusSnapshot.entries.some(entry => entry.ticketKey === issue.key && entry.state === 'working')
@@ -1356,7 +1450,7 @@ function JiraListRow({ issue, active, attentionReasons = [], onOpen, workState, 
   const status = issue.status || 'No status'
   return jsxs('button', {
     'aria-current': active ? 'true' : undefined,
-    className: `grid w-full min-w-[52rem] grid-cols-[minmax(18rem,1fr)_9rem_8rem_11rem_8rem] items-center gap-3 rounded-md border border-(--ui-stroke-tertiary) border-l-2 bg-(--ui-bg-elevated) px-3 py-2 text-left transition-colors hover:bg-primary/[0.06] focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-(--dt-composer-ring)${working ? ' ring-1 ring-(--dt-composer-ring) bg-[color-mix(in_srgb,var(--dt-composer-ring)_10%,transparent)]' : active ? ' border-(--dt-composer-ring) bg-[color-mix(in_srgb,var(--dt-composer-ring)_7%,transparent)]' : ''}`,
+    className: `grid w-full min-w-[52rem] grid-cols-[minmax(18rem,1fr)_9rem_8rem_11rem_8rem] items-center gap-3 rounded-md border border-(--ui-stroke-tertiary) border-l-2 bg-(--ui-bg-elevated) px-3 ${density === 'compact' ? 'py-1.5' : 'py-2'} text-left transition-colors hover:bg-primary/[0.06] focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-(--dt-composer-ring)${working ? ' ring-1 ring-(--dt-composer-ring) bg-[color-mix(in_srgb,var(--dt-composer-ring)_10%,transparent)]' : active ? ' border-(--dt-composer-ring) bg-[color-mix(in_srgb,var(--dt-composer-ring)_7%,transparent)]' : ''}`,
     onClick: () => onOpen(issue.key),
     style: { borderLeftColor: statusColor(issue) },
     type: 'button',
@@ -1401,7 +1495,7 @@ function JiraListRow({ issue, active, attentionReasons = [], onOpen, workState, 
   })
 }
 
-function JiraList({ issues, activeKey, attentionByKey, onOpen, workStates, workingSessionIds, liveTicketStates }) {
+function JiraList({ issues, activeKey, attentionByKey, density = 'comfortable', onOpen, workStates, workingSessionIds, liveTicketStates }) {
   return jsxs('div', {
     className: 'min-w-[52rem] space-y-1.5',
     role: 'table',
@@ -1421,6 +1515,7 @@ function JiraList({ issues, activeKey, attentionByKey, onOpen, workStates, worki
         issue,
         active: issue.key === activeKey,
         attentionReasons: attentionByKey[issue.key] || [],
+        density,
         liveState: liveTicketStates?.[issue.key] || 'idle',
         onOpen,
         workState: workStates[issue.key],
@@ -1430,7 +1525,7 @@ function JiraList({ issues, activeKey, attentionByKey, onOpen, workStates, worki
   })
 }
 
-function JiraLane({ lane, attentionByKey, collapsed, selectedKey, onToggle, onOpen, onMove, workingSessionIds, workStates, liveTicketStates }) {
+function JiraLane({ lane, attentionByKey, collapsed, density = 'comfortable', selectedKey, onToggle, onOpen, onMove, workingSessionIds, workStates, liveTicketStates }) {
   const [over, setOver] = useState(false)
   const label = lane.label || 'Tickets'
   const tone = statusColor(lane)
@@ -1504,6 +1599,7 @@ function JiraLane({ lane, attentionByKey, collapsed, selectedKey, onToggle, onOp
               issue,
               active: issue.key === selectedKey,
               attentionReasons: attentionByKey[issue.key] || [],
+              density,
               onOpen,
               workState: workStates[issue.key],
               workingSessionIds,
@@ -2840,6 +2936,170 @@ function IssueDetail({ issue, status, projects, mapping, links, baseRef, onOpenI
   })
 }
 
+function FriendlyViewBuilder({ onCreateFriendlyView }) {
+  const [label, setLabel] = useState('')
+  const [assignee, setAssignee] = useState('any')
+  const [status, setStatus] = useState('open')
+  const [focus, setFocus] = useState('all')
+  const [jiraLabel, setJiraLabel] = useState('')
+  const [sort, setSort] = useState('updated')
+  const [layout, setLayout] = useState('list')
+  const [density, setDensity] = useState('compact')
+  const inputClass = 'h-8 w-full rounded-md border border-(--ui-stroke-secondary) bg-(--ui-bg-elevated) px-2 text-xs text-foreground outline-none focus:border-(--dt-composer-ring)'
+  const jql = friendlyViewJql({ assignee, status, focus, label: jiraLabel, sort })
+  const create = () => {
+    const nextLabel = label.trim() || 'New Jira view'
+    onCreateFriendlyView({ label: nextLabel, jql, layout, sort, density })
+    setLabel('')
+  }
+  return jsxs('details', {
+    className: 'space-y-3 rounded-md border border-(--ui-stroke-tertiary) p-2.5',
+    children: [
+      jsx('summary', {
+        className: 'cursor-pointer list-none text-xs font-medium text-foreground/85 marker:hidden',
+        children: jsxs('span', {
+          className: 'flex items-center gap-2',
+          children: [
+            jsx(Codicon, { name: 'add', size: '0.72rem' }),
+            jsx('span', { children: 'Create a saved view' }),
+            jsx('span', { className: 'font-normal text-(--ui-text-quaternary)', children: 'without writing JQL' })
+          ]
+        })
+      }),
+      jsxs('div', {
+        className: 'mt-3 space-y-2.5',
+        children: [
+          jsx('input', {
+            'aria-label': 'New saved view name',
+            className: inputClass,
+            onChange: event => setLabel(event.target.value),
+            placeholder: 'Name this view, for example “Unassigned bugs”',
+            value: label
+          }),
+          jsxs('div', {
+            className: 'grid grid-cols-2 gap-2',
+            children: [
+              jsxs('label', {
+                className: 'space-y-1',
+                children: [
+                  jsx('span', { className: 'text-[0.65rem] text-(--ui-text-tertiary)', children: 'Who' }),
+                  jsx('select', {
+                    'aria-label': 'Saved view assignee',
+                    className: inputClass,
+                    onChange: event => setAssignee(event.target.value),
+                    value: assignee,
+                    children: [
+                      jsx('option', { value: 'any', children: 'Anyone' }),
+                      jsx('option', { value: 'mine', children: 'Assigned to me' }),
+                      jsx('option', { value: 'unassigned', children: 'Unassigned' })
+                    ]
+                  })
+                ]
+              }),
+              jsxs('label', {
+                className: 'space-y-1',
+                children: [
+                  jsx('span', { className: 'text-[0.65rem] text-(--ui-text-tertiary)', children: 'Work state' }),
+                  jsx('select', {
+                    'aria-label': 'Saved view work state',
+                    className: inputClass,
+                    onChange: event => setStatus(event.target.value),
+                    value: status,
+                    children: [
+                      jsx('option', { value: 'open', children: 'Open work' }),
+                      jsx('option', { value: 'done', children: 'Completed work' }),
+                      jsx('option', { value: 'all', children: 'Open or completed' })
+                    ]
+                  })
+                ]
+              }),
+              jsxs('label', {
+                className: 'space-y-1',
+                children: [
+                  jsx('span', { className: 'text-[0.65rem] text-(--ui-text-tertiary)', children: 'Focus' }),
+                  jsx('select', {
+                    'aria-label': 'Saved view focus',
+                    className: inputClass,
+                    onChange: event => setFocus(event.target.value),
+                    value: focus,
+                    children: [
+                      jsx('option', { value: 'all', children: 'Anything' }),
+                      jsx('option', { value: 'blocked', children: 'Blocked or on hold' }),
+                      jsx('option', { value: 'review', children: 'Needs review' })
+                    ]
+                  })
+                ]
+              }),
+              jsxs('label', {
+                className: 'space-y-1',
+                children: [
+                  jsx('span', { className: 'text-[0.65rem] text-(--ui-text-tertiary)', children: 'Sort by' }),
+                  jsx('select', {
+                    'aria-label': 'Saved view sort',
+                    className: inputClass,
+                    onChange: event => setSort(event.target.value),
+                    value: sort,
+                    children: VIEW_SORT_OPTIONS.map(option => jsx('option', { value: option.value, children: option.label }, option.value))
+                  })
+                ]
+              })
+            ]
+          }),
+          jsxs('label', {
+            className: 'space-y-1',
+            children: [
+              jsx('span', { className: 'text-[0.65rem] text-(--ui-text-tertiary)', children: 'Jira label (optional)' }),
+              jsx('input', {
+                'aria-label': 'Saved view Jira label',
+                className: inputClass,
+                onChange: event => setJiraLabel(event.target.value),
+                placeholder: 'For example: frontend',
+                value: jiraLabel
+              })
+            ]
+          }),
+          jsxs('div', {
+            className: 'grid grid-cols-2 gap-2',
+            children: [
+              jsxs('label', {
+                className: 'space-y-1',
+                children: [
+                  jsx('span', { className: 'text-[0.65rem] text-(--ui-text-tertiary)', children: 'Open it as' }),
+                  jsx('select', {
+                    'aria-label': 'Saved view layout',
+                    className: inputClass,
+                    onChange: event => setLayout(event.target.value),
+                    value: layout,
+                    children: [jsx('option', { value: 'list', children: 'List for scanning' }), jsx('option', { value: 'board', children: 'Board for workflow' })]
+                  })
+                ]
+              }),
+              jsxs('label', {
+                className: 'space-y-1',
+                children: [
+                  jsx('span', { className: 'text-[0.65rem] text-(--ui-text-tertiary)', children: 'Density' }),
+                  jsx('select', {
+                    'aria-label': 'Saved view density',
+                    className: inputClass,
+                    onChange: event => setDensity(event.target.value),
+                    value: density,
+                    children: VIEW_DENSITY_OPTIONS.map(option => jsx('option', { value: option.value, children: option.label }, option.value))
+                  })
+                ]
+              })
+            ]
+          }),
+          jsx('div', {
+            className: 'rounded bg-foreground/5 px-2 py-1.5 font-mono text-[0.62rem] leading-relaxed text-(--ui-text-quaternary)',
+            children: jql
+          }),
+          jsx(Button, { className: 'w-full', disabled: !label.trim(), onClick: create, size: 'sm', children: 'Create saved view' })
+        ]
+      })
+    ]
+  })
+}
+
 function SettingsDrawer({
   draft,
   error,
@@ -2848,17 +3108,19 @@ function SettingsDrawer({
   onChangeDraft,
   onCopyJson,
   onCopyPath,
+  onCreateFriendlyView,
   onFieldChange,
   onReload,
   onRemoveView,
   onViewChange,
   onViewModeChange,
+  activeView,
   settings,
   state
 }) {
   const inputClass = 'h-8 w-full rounded-md border border-(--ui-stroke-secondary) bg-(--ui-bg-elevated) px-2 text-xs text-foreground outline-none focus:border-(--dt-composer-ring)'
   const views = Array.isArray(settings?.views) ? settings.views : []
-  const viewMode = settingsViewMode(settings)
+  const viewMode = viewPreferences(settings, activeView).layout
   return jsxs('div', {
     className: 'space-y-5',
     children: [
@@ -3035,17 +3297,68 @@ function SettingsDrawer({
                     })
                   ]
                 }),
-                jsx(Textarea, {
-                  'aria-label': `Saved view ${index + 1} JQL`,
-                  className: 'min-h-20 resize-y font-mono text-[0.68rem] leading-relaxed',
-                  onChange: event => onViewChange(index, 'jql', event.target.value),
-                  placeholder: 'JQL query',
-                  spellCheck: false,
-                  value: String(view.jql || '')
+                jsxs('div', {
+                  className: 'grid grid-cols-3 gap-2',
+                  children: [
+                    jsxs('label', {
+                      className: 'space-y-1',
+                      children: [
+                        jsx('span', { className: 'text-[0.62rem] text-(--ui-text-quaternary)', children: 'Open as' }),
+                        jsx('select', {
+                          'aria-label': `Saved view ${index + 1} layout`,
+                          className: inputClass,
+                          onChange: event => onViewChange(index, 'layout', event.target.value),
+                          value: view.layout || (view.id === 'backlog' ? 'list' : settingsViewMode(settings)),
+                          children: [jsx('option', { value: 'board', children: 'Board' }), jsx('option', { value: 'list', children: 'List' })]
+                        })
+                      ]
+                    }),
+                    jsxs('label', {
+                      className: 'space-y-1',
+                      children: [
+                        jsx('span', { className: 'text-[0.62rem] text-(--ui-text-quaternary)', children: 'Sort by' }),
+                        jsx('select', {
+                          'aria-label': `Saved view ${index + 1} sort`,
+                          className: inputClass,
+                          onChange: event => onViewChange(index, 'sort', event.target.value),
+                          value: view.sort || (view.id === 'backlog' ? 'priority' : 'updated'),
+                          children: VIEW_SORT_OPTIONS.map(option => jsx('option', { value: option.value, children: option.label }, option.value))
+                        })
+                      ]
+                    }),
+                    jsxs('label', {
+                      className: 'space-y-1',
+                      children: [
+                        jsx('span', { className: 'text-[0.62rem] text-(--ui-text-quaternary)', children: 'Density' }),
+                        jsx('select', {
+                          'aria-label': `Saved view ${index + 1} density`,
+                          className: inputClass,
+                          onChange: event => onViewChange(index, 'density', event.target.value),
+                          value: view.density || (view.id === 'backlog' ? 'compact' : 'comfortable'),
+                          children: VIEW_DENSITY_OPTIONS.map(option => jsx('option', { value: option.value, children: option.label }, option.value))
+                        })
+                      ]
+                    })
+                  ]
+                }),
+                jsxs('details', {
+                  className: 'border-t border-(--ui-stroke-tertiary) pt-2',
+                  children: [
+                    jsx('summary', { className: 'cursor-pointer text-[0.62rem] text-(--ui-text-quaternary)', children: 'Advanced query (JQL)' }),
+                    jsx(Textarea, {
+                      'aria-label': `Saved view ${index + 1} JQL`,
+                      className: 'mt-2 min-h-20 resize-y font-mono text-[0.68rem] leading-relaxed',
+                      onChange: event => onViewChange(index, 'jql', event.target.value),
+                      placeholder: 'JQL query',
+                      spellCheck: false,
+                      value: String(view.jql || '')
+                    })
+                  ]
                 })
               ]
             }, `settings-view-${index}`)
-          )
+          ),
+          onCreateFriendlyView ? jsx(FriendlyViewBuilder, { onCreateFriendlyView }) : null
         ]
       }),
       jsxs('details', {
@@ -3133,6 +3446,7 @@ function JiraPage() {
   const [settingsState, setSettingsState] = useState('')
   const [settingsError, setSettingsError] = useState('')
   const [filter, setFilter] = useState('')
+  const [quickFilter, setQuickFilter] = useState('all')
   const [attentionOnly, setAttentionOnly] = useState(false)
   const [collapsedLanes, setCollapsedLanes] = useState({})
   const [loading, setLoading] = useState(true)
@@ -3432,9 +3746,12 @@ function JiraPage() {
     mutateSettingsDraft(current => ({
       ...current,
       viewMode: mode,
-      groupByStatus: mode === 'board'
+      groupByStatus: mode === 'board',
+      views: (Array.isArray(current.views) ? current.views : []).map(view =>
+        view.id === activeView ? { ...view, layout: mode } : view
+      )
     }))
-  }, [mutateSettingsDraft])
+  }, [activeView, mutateSettingsDraft])
 
   const updateSavedView = useCallback((index, field, value) => {
     mutateSettingsDraft(current => {
@@ -3447,6 +3764,35 @@ function JiraPage() {
     })
   }, [mutateSettingsDraft])
 
+  const updateActiveViewPreference = useCallback((field, value) => {
+    const index = (Array.isArray(editableSettings.views) ? editableSettings.views : [])
+      .findIndex(view => String(view?.id || '') === String(activeView || ''))
+    if (index >= 0) updateSavedView(index, field, value)
+  }, [activeView, editableSettings.views, updateSavedView])
+
+  const createFriendlyView = useCallback(definition => {
+    const nextLabel = String(definition?.label || 'New Jira view').trim().slice(0, 100) || 'New Jira view'
+    const nextJql = String(definition?.jql || '').trim()
+    if (!nextJql) return
+    const nextLayout = ['board', 'list'].includes(definition?.layout) ? definition.layout : 'list'
+    const nextSort = VIEW_SORT_OPTIONS.some(option => option.value === definition?.sort) ? definition.sort : 'updated'
+    const nextDensity = VIEW_DENSITY_OPTIONS.some(option => option.value === definition?.density) ? definition.density : 'compact'
+    const nextId = `view-${Date.now().toString(36)}`
+    mutateSettingsDraft(current => ({
+      ...current,
+      views: [
+        ...(Array.isArray(current.views) ? current.views : []),
+        { id: nextId, label: nextLabel, jql: nextJql, layout: nextLayout, sort: nextSort, density: nextDensity }
+      ]
+    }))
+    setActiveView(nextId)
+    setSubmittedJql(nextJql)
+    setQuickFilter('all')
+    setAttentionOnly(false)
+    if (status?.configured) void loadIssues(nextJql, { pageSize: editableSettings.pageSize })
+    host.notify({ kind: 'success', message: `Saved view “${nextLabel}”.` })
+  }, [editableSettings.pageSize, loadIssues, mutateSettingsDraft, status?.configured])
+
   const addBacklogView = useCallback(() => {
     mutateSettingsDraft(current => {
       const views = Array.isArray(current.views) ? [...current.views] : []
@@ -3458,7 +3804,10 @@ function JiraPage() {
           {
             id: 'backlog',
             label: 'Backlog',
-            jql: 'statusCategory != Done ORDER BY priority DESC, updated DESC'
+            jql: 'statusCategory != Done ORDER BY priority DESC, updated DESC',
+            layout: 'list',
+            sort: 'priority',
+            density: 'compact'
           }
         ]
       }
@@ -3471,7 +3820,7 @@ function JiraPage() {
       const ids = new Set(views.map(view => String(view.id || '')))
       let number = views.length + 1
       while (ids.has(`view-${number}`)) number += 1
-      views.push({ id: `view-${number}`, label: `New view ${number}`, jql: DEFAULT_JQL })
+      views.push({ id: `view-${number}`, label: `New view ${number}`, jql: DEFAULT_JQL, layout: 'board', sort: 'updated', density: 'comfortable' })
       return { ...current, views }
     })
   }, [mutateSettingsDraft])
@@ -3716,23 +4065,43 @@ function JiraPage() {
     () => issues.filter(issue => (attentionByKey[issue.key] || []).length > 0).length,
     [attentionByKey, issues]
   )
+  const activeViewPreferences = useMemo(
+    () => viewPreferences(editableSettings, activeView),
+    [activeView, editableSettings]
+  )
 
   const visibleIssues = useMemo(() => {
     const needle = filter.trim().toLowerCase()
     return issues.filter(issue => {
       if (attentionOnly && (attentionByKey[issue.key] || []).length === 0) return false
+      if (!matchesQuickFilter(
+        quickFilter,
+        issue,
+        workStates[issue.key],
+        attentionByKey[issue.key] || [],
+        liveTicketStates[issue.key] || 'idle',
+        workingSessionIds
+      )) return false
       if (!needle) return true
       return `${issue.key} ${issue.summary} ${issue.assignee || ''} ${issue.status || ''}`.toLowerCase().includes(needle)
     })
-  }, [attentionByKey, attentionOnly, filter, issues])
+  }, [attentionByKey, attentionOnly, filter, issues, liveTicketStates, quickFilter, workingSessionIds, workStates])
+
+  const sortedVisibleIssues = useMemo(
+    () => sortIssues(visibleIssues, activeViewPreferences.sort),
+    [activeViewPreferences.sort, visibleIssues]
+  )
 
   const issueLanes = useMemo(() => {
-    if (!settings?.groupByStatus) return [{ key: 'all', label: '', issues: visibleIssues, rank: 0 }]
+    const explicitBoardView = activeViewPreferences.view?.layout === 'board'
+    const shouldGroup = activeViewPreferences.layout === 'board'
+      && (editableSettings?.groupByStatus !== false || explicitBoardView)
+    if (!shouldGroup) return [{ key: 'all', label: '', issues: sortedVisibleIssues, rank: 0 }]
     const groups = new Map()
     for (const lane of detectedLanes) {
       groups.set(lane.label.toLowerCase(), { ...lane, issues: [] })
     }
-    for (const issue of visibleIssues) {
+    for (const issue of sortedVisibleIssues) {
       const label = issue.status || 'No status'
       const identity = label.toLowerCase()
       if (!groups.has(identity)) {
@@ -3748,21 +4117,24 @@ function JiraPage() {
       groups.get(identity).issues.push(issue)
     }
     return [...groups.values()].sort((left, right) => left.rank - right.rank || left.label.localeCompare(right.label))
-  }, [detectedLanes, settings?.groupByStatus, visibleIssues])
+  }, [activeViewPreferences, detectedLanes, editableSettings?.groupByStatus, sortedVisibleIssues])
 
   const listView = settingsViewMode(editableSettings) === 'list'
+  const effectiveListView = activeViewPreferences.view ? activeViewPreferences.layout === 'list' : listView
 
   const toggleLane = useCallback(key => {
     setCollapsedLanes(current => ({ ...current, [key]: !current[key] }))
   }, [])
 
   const selectView = useCallback(nextId => {
-    const view = settings?.views?.find(candidate => candidate.id === nextId)
+    const view = editableSettings?.views?.find(candidate => candidate.id === nextId)
     if (!view) return
     setActiveView(nextId)
     setSubmittedJql(view.jql)
-    loadIssues(view.jql, { pageSize: settings?.pageSize })
-  }, [loadIssues, settings])
+    setQuickFilter('all')
+    setAttentionOnly(false)
+    loadIssues(view.jql, { pageSize: editableSettings?.pageSize })
+  }, [editableSettings, loadIssues])
 
   const openTicket = useCallback(issueKey => {
     const key = normaliseIssueKey(issueKey)
@@ -3771,6 +4143,57 @@ function JiraPage() {
     setSelectedKey(key)
     host.navigate(jiraRoute(key))
   }, [])
+
+  const selectedIssueIndex = sortedVisibleIssues.findIndex(issue => issue.key === selectedKey)
+  const previousIssueKey = selectedIssueIndex > 0 ? sortedVisibleIssues[selectedIssueIndex - 1]?.key : ''
+  const nextIssueKey = selectedIssueIndex >= 0 ? sortedVisibleIssues[selectedIssueIndex + 1]?.key || '' : ''
+
+  useEffect(() => {
+    const handleKeyboard = event => {
+      if (event.defaultPrevented || event.metaKey || event.ctrlKey || event.altKey) return
+      const target = event.target
+      const tagName = String(target?.tagName || '').toUpperCase()
+      const typing = target?.isContentEditable || ['INPUT', 'TEXTAREA', 'SELECT'].includes(tagName)
+      if (typing) {
+        if (event.key === 'Escape') target.blur?.()
+        return
+      }
+      if (event.key === '/') {
+        event.preventDefault()
+        document.querySelector('[aria-label="Filter Jira tickets"]')?.focus()
+        return
+      }
+      if (event.key === 'Escape') {
+        event.preventDefault()
+        if (showSettings) setShowSettings(false)
+        else if (selectedKey) {
+          setSelectedKey('')
+          host.navigate(jiraRoute(''))
+        }
+        return
+      }
+      if (event.key === 'j' || event.key === 'ArrowDown' || event.key === 'k' || event.key === 'ArrowUp') {
+        event.preventDefault()
+        const delta = event.key === 'j' || event.key === 'ArrowDown' ? 1 : -1
+        const currentIndex = sortedVisibleIssues.findIndex(issue => issue.key === selectedKey)
+        const nextIndex = currentIndex < 0 ? (delta > 0 ? 0 : sortedVisibleIssues.length - 1) : currentIndex + delta
+        const nextKey = sortedVisibleIssues[nextIndex]?.key
+        if (nextKey) openTicket(nextKey)
+        return
+      }
+      if (event.key === 'b' || event.key === 'l') {
+        event.preventDefault()
+        updateViewMode(event.key === 'l' ? 'list' : 'board')
+        return
+      }
+      if (event.key === 'r' && !loading) {
+        event.preventDefault()
+        void loadIssues(submittedJql, { force: true, pageSize: editableSettings?.pageSize })
+      }
+    }
+    window.addEventListener('keydown', handleKeyboard)
+    return () => window.removeEventListener('keydown', handleKeyboard)
+  }, [editableSettings?.pageSize, loadIssues, loading, openTicket, selectedKey, showSettings, sortedVisibleIssues, submittedJql, updateViewMode])
 
   const pinTicket = useCallback(() => {
     const issue = detail
@@ -3925,7 +4348,7 @@ function JiraPage() {
                   children: jsx(SelectValue, { placeholder: 'Choose a Jira view' })
                 }),
                 jsx(SelectContent, {
-                  children: (settings?.views || []).map(view =>
+                  children: (editableSettings?.views || []).map(view =>
                     jsx(SelectItem, { value: view.id, children: view.label }, view.id)
                   )
                 })
@@ -3938,24 +4361,27 @@ function JiraPage() {
             role: 'group',
             children: [
               jsx(Button, {
-                'aria-pressed': !listView,
+                'aria-pressed': !effectiveListView,
                 onClick: () => updateViewMode('board'),
                 size: 'xs',
-                variant: !listView ? 'secondary' : 'ghost',
+                variant: !effectiveListView ? 'secondary' : 'ghost',
                 children: 'Board'
               }),
               jsx(Button, {
-                'aria-pressed': listView,
+                'aria-pressed': effectiveListView,
                 onClick: () => updateViewMode('list'),
                 size: 'xs',
-                variant: listView ? 'secondary' : 'ghost',
+                variant: effectiveListView ? 'secondary' : 'ghost',
                 children: 'List'
               })
             ]
           }),
           jsxs(Button, {
             'aria-pressed': attentionOnly,
-            onClick: () => setAttentionOnly(value => !value),
+            onClick: () => {
+              setQuickFilter('all')
+              setAttentionOnly(value => !value)
+            },
             size: 'sm',
             variant: attentionOnly ? 'secondary' : 'ghost',
             children: [
@@ -3972,6 +4398,46 @@ function JiraPage() {
               placeholder: 'Filter tickets',
               value: filter
             })
+          }),
+          jsx(Select, {
+            value: quickFilter,
+            onValueChange: value => {
+              setQuickFilter(value)
+              setAttentionOnly(false)
+            },
+            children: jsxs(Fragment, {
+              children: [
+                jsx(SelectTrigger, { className: 'h-7 w-36 text-xs', 'aria-label': 'Quick filter', children: jsx(SelectValue, { placeholder: 'Quick filter' }) }),
+                jsx(SelectContent, {
+                  children: QUICK_FILTER_OPTIONS.map(option => jsx(SelectItem, { value: option.value, children: option.label }, option.value))
+                })
+              ]
+            })
+          }),
+          jsx(Select, {
+            value: activeViewPreferences.sort,
+            onValueChange: value => updateActiveViewPreference('sort', value),
+            children: jsxs(Fragment, {
+              children: [
+                jsx(SelectTrigger, { className: 'h-7 w-36 text-xs', 'aria-label': 'Sort tickets', children: jsx(SelectValue, { placeholder: 'Sort tickets' }) }),
+                jsx(SelectContent, {
+                  children: VIEW_SORT_OPTIONS.map(option => jsx(SelectItem, { value: option.value, children: option.label }, option.value))
+                })
+              ]
+            })
+          }),
+          jsx(Button, {
+            'aria-label': 'Density',
+            onClick: () => updateActiveViewPreference('density', activeViewPreferences.density === 'compact' ? 'comfortable' : 'compact'),
+            size: 'xs',
+            title: `Density: ${activeViewPreferences.density === 'compact' ? 'compact' : 'comfortable'}`,
+            variant: 'ghost',
+            children: jsx(Codicon, { name: activeViewPreferences.density === 'compact' ? 'list-flat' : 'list-tree', size: '0.8rem' })
+          }),
+          jsx('span', {
+            className: 'hidden text-[0.6rem] text-(--ui-text-quaternary) xl:inline',
+            title: 'Keyboard shortcuts: / filter · j/k navigate · b/l layout · r refresh · Escape close',
+            children: 'Keyboard shortcuts: / · j/k · b/l · r'
           }),
           jsx('span', {
             className: 'text-[0.625rem] text-(--ui-text-quaternary)',
@@ -3994,7 +4460,7 @@ function JiraPage() {
                 jsx(Button, {
                   'aria-label': 'Refresh Jira tickets',
                   disabled: loading,
-                  onClick: () => loadIssues(submittedJql, { force: true, pageSize: settings?.pageSize }),
+                  onClick: () => loadIssues(submittedJql, { force: true, pageSize: editableSettings?.pageSize }),
                   size: 'icon-xs',
                   variant: 'ghost',
                   children: jsx(Codicon, { name: loading ? 'loading~spin' : 'refresh', size: '0.85rem' })
@@ -4026,14 +4492,15 @@ function JiraPage() {
                 ]
               })
             })
-          : listView
+          : effectiveListView
             ? jsxs('div', {
                 className: 'min-h-0 flex-1 overflow-auto px-4 pt-1 pb-3',
                 children: [
                   jsx(JiraList, {
                     activeKey: selectedKey,
                     attentionByKey,
-                    issues: visibleIssues,
+                    density: activeViewPreferences.density,
+                    issues: sortedVisibleIssues,
                     liveTicketStates,
                     onOpen: openTicket,
                     workStates,
@@ -4044,7 +4511,7 @@ function JiraPage() {
                         className: 'flex justify-center py-3',
                         children: jsx(Button, {
                           disabled: loadingMore,
-                          onClick: () => loadIssues(submittedJql, { append: true, nextPageToken, pageSize: settings?.pageSize }),
+                          onClick: () => loadIssues(submittedJql, { append: true, nextPageToken, pageSize: editableSettings?.pageSize }),
                           size: 'sm',
                           variant: 'ghost',
                           children: loadingMore ? 'Loading…' : 'Load more tickets'
@@ -4061,6 +4528,7 @@ function JiraPage() {
                     lane,
                     attentionByKey,
                     collapsed: Boolean(collapsedLanes[lane.key]),
+                    density: activeViewPreferences.density,
                     selectedKey,
                     onToggle: () => toggleLane(lane.key),
                     onOpen: openTicket,
@@ -4076,7 +4544,7 @@ function JiraPage() {
                       children: jsx(Button, {
                         className: 'mt-6 w-full',
                         disabled: loadingMore,
-                        onClick: () => loadIssues(submittedJql, { append: true, nextPageToken, pageSize: settings?.pageSize }),
+                        onClick: () => loadIssues(submittedJql, { append: true, nextPageToken, pageSize: editableSettings?.pageSize }),
                         size: 'sm',
                         variant: 'ghost',
                         children: loadingMore ? 'Loading…' : 'Load more'
@@ -4141,11 +4609,13 @@ function JiraPage() {
                   onChangeDraft: setSettingsDraft,
                   onCopyJson: copySettingsJson,
                   onCopyPath: copySettingsPath,
+                  onCreateFriendlyView: createFriendlyView,
                   onFieldChange: updateSettingsField,
                   onReload: reloadSettingsFile,
                   onRemoveView: removeSavedView,
                   onViewChange: updateSavedView,
                   onViewModeChange: updateViewMode,
+                  activeView,
                   settings: editableSettings,
                   state: settingsState
                 })
@@ -4182,6 +4652,24 @@ function JiraPage() {
                 className: 'flex items-center gap-2 px-4 pt-3.5 pb-3',
                 children: [
                   jsx('span', { className: 'font-mono text-[0.6875rem] text-(--ui-text-tertiary)', children: selectedKey }),
+                  jsx(Button, {
+                    'aria-label': 'Previous Jira ticket',
+                    disabled: !previousIssueKey,
+                    onClick: () => openTicket(previousIssueKey),
+                    size: 'icon-xs',
+                    title: 'Previous ticket',
+                    variant: 'ghost',
+                    children: jsx(Codicon, { name: 'chevron-up', size: '0.8rem' })
+                  }),
+                  jsx(Button, {
+                    'aria-label': 'Next Jira ticket',
+                    disabled: !nextIssueKey,
+                    onClick: () => openTicket(nextIssueKey),
+                    size: 'icon-xs',
+                    title: 'Next ticket',
+                    variant: 'ghost',
+                    children: jsx(Codicon, { name: 'chevron-down', size: '0.8rem' })
+                  }),
                   jsx('button', {
                     'aria-label': 'Close Jira ticket',
                     className: 'ml-auto grid size-6 place-items-center rounded text-(--ui-text-tertiary) transition-colors hover:bg-(--chrome-action-hover) hover:text-foreground',

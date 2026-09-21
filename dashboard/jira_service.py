@@ -66,21 +66,33 @@ DEFAULT_SETTINGS: dict[str, Any] = {
             "id": "assigned",
             "label": "Assigned to me",
             "jql": "assignee = currentUser() AND statusCategory != Done ORDER BY updated DESC",
+            "layout": "board",
+            "sort": "updated",
+            "density": "comfortable",
         },
         {
             "id": "backlog",
             "label": "Backlog",
             "jql": "statusCategory != Done ORDER BY priority DESC, updated DESC",
+            "layout": "list",
+            "sort": "priority",
+            "density": "compact",
         },
         {
             "id": "reported",
             "label": "Reported by me",
             "jql": "reporter = currentUser() AND statusCategory != Done ORDER BY updated DESC",
+            "layout": "list",
+            "sort": "updated",
+            "density": "comfortable",
         },
         {
             "id": "recent",
             "label": "Recently updated",
             "jql": "updated >= -14d ORDER BY updated DESC",
+            "layout": "list",
+            "sort": "updated",
+            "density": "compact",
         },
     ],
 }
@@ -653,7 +665,7 @@ def validate_settings(value: Mapping[str, Any]) -> dict[str, Any]:
     if len(raw_views) > 20:
         raise ValueError("settings.views supports at most 20 saved views.")
 
-    views: list[dict[str, str]] = []
+    views: list[dict[str, Any]] = []
     seen: set[str] = set()
     for raw in raw_views:
         if not isinstance(raw, Mapping):
@@ -670,7 +682,19 @@ def validate_settings(value: Mapping[str, Any]) -> dict[str, Any]:
         if not jql or len(jql) > 4_000:
             raise ValueError("Each saved view JQL must be 1-4000 characters.")
         seen.add(view_id)
-        views.append({"id": view_id, "label": label, "jql": jql})
+        view: dict[str, Any] = {"id": view_id, "label": label, "jql": jql}
+        for field, allowed in {
+            "layout": {"board", "list"},
+            "sort": {"updated", "priority", "status", "key"},
+            "density": {"comfortable", "compact"},
+        }.items():
+            if field not in raw:
+                continue
+            option = str(raw.get(field) or "").strip().lower()
+            if option not in allowed:
+                raise ValueError(f"Each saved view {field} must be one of: {', '.join(sorted(allowed))}.")
+            view[field] = option
+        views.append(view)
 
     default_view = str(value.get("defaultView") or "").strip()
     if default_view not in seen:

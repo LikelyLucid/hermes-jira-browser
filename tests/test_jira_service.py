@@ -1131,6 +1131,62 @@ class SettingsTests(unittest.TestCase):
         self.assertIn("Backlog", [view["label"] for view in settings["views"]])
         self.assertIn("assignee = currentUser()", settings["views"][0]["jql"])
 
+    def test_default_views_include_human_preferences(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = jira_service.load_settings(Path(tmp) / "missing.json")
+
+        assigned = next(view for view in settings["views"] if view["id"] == "assigned")
+        backlog = next(view for view in settings["views"] if view["id"] == "backlog")
+        self.assertEqual(assigned["layout"], "board")
+        self.assertEqual(assigned["sort"], "updated")
+        self.assertEqual(assigned["density"], "comfortable")
+        self.assertEqual(backlog["layout"], "list")
+        self.assertEqual(backlog["sort"], "priority")
+        self.assertEqual(backlog["density"], "compact")
+
+    def test_saved_view_preferences_are_validated_and_preserved(self):
+        value = {
+            "version": 1,
+            "defaultView": "mine",
+            "viewMode": "board",
+            "pageSize": 50,
+            "baseRef": "HEAD",
+            "groupByStatus": True,
+            "views": [{
+                "id": "mine",
+                "label": "Mine",
+                "jql": "assignee = currentUser()",
+                "layout": "list",
+                "sort": "priority",
+                "density": "compact",
+            }],
+        }
+
+        settings = jira_service.validate_settings(value)
+
+        self.assertEqual(settings["views"][0]["layout"], "list")
+        self.assertEqual(settings["views"][0]["sort"], "priority")
+        self.assertEqual(settings["views"][0]["density"], "compact")
+
+    def test_saved_view_preferences_reject_unknown_values(self):
+        value = {
+            "version": 1,
+            "defaultView": "mine",
+            "viewMode": "board",
+            "pageSize": 50,
+            "baseRef": "HEAD",
+            "groupByStatus": True,
+            "views": [{
+                "id": "mine",
+                "label": "Mine",
+                "jql": "assignee = currentUser()",
+                "layout": "calendar",
+            }],
+        }
+
+        with self.assertRaisesRegex(ValueError, "layout"):
+            jira_service.validate_settings(value)
+
     def test_settings_round_trip_as_json(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "settings.json"

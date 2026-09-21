@@ -109,6 +109,48 @@ class DesktopPluginTests(unittest.TestCase):
         self.assertIn("? jsxs('div', {\n                className: 'min-h-0 flex-1 overflow-auto", source)
         self.assertIn("children: loadingMore ? 'Loading…' : 'Load more tickets'", source)
 
+    def test_saved_views_have_human_preferences_and_a_friendly_builder(self):
+        source = PLUGIN.read_text(encoding="utf-8")
+
+        self.assertIn("function FriendlyViewBuilder", source)
+        self.assertIn("Create a saved view", source)
+        self.assertIn("onCreateFriendlyView", source)
+        self.assertIn("viewPreferences(settings, activeView)", source)
+        self.assertIn("updateActiveViewPreference", source)
+        self.assertIn("view.layout", source)
+        self.assertIn("view.sort", source)
+        self.assertIn("view.density", source)
+
+    def test_ticket_surface_has_quick_filters_sorting_and_density_controls(self):
+        source = PLUGIN.read_text(encoding="utf-8")
+
+        self.assertIn("const QUICK_FILTER_OPTIONS", source)
+        self.assertIn("matchesQuickFilter", source)
+        self.assertIn("Quick filter", source)
+        self.assertIn("Sort tickets", source)
+        self.assertIn("Density", source)
+        self.assertIn("sortIssues", source)
+        self.assertIn("quickFilter", source)
+
+    def test_working_filter_reacts_to_live_sessions_and_ranks_lowest_last(self):
+        source = PLUGIN.read_text(encoding="utf-8")
+
+        self.assertIn("if (/lowest/.test(label)) return 4\n  if (/low/.test(label)) return 3", source)
+        self.assertIn("quickFilter, workingSessionIds, workStates])", source)
+
+    def test_ticket_navigation_supports_keyboard_and_previous_next_buttons(self):
+        source = PLUGIN.read_text(encoding="utf-8")
+
+        self.assertIn("Keyboard shortcuts", source)
+        self.assertIn("event.key === '/'", source)
+        self.assertIn("event.key === 'j'", source)
+        self.assertIn("event.key === 'k'", source)
+        self.assertIn("event.key === 'Escape'", source)
+        self.assertIn("'aria-label': 'Previous Jira ticket'", source)
+        self.assertIn("'aria-label': 'Next Jira ticket'", source)
+        self.assertIn("previousIssueKey", source)
+        self.assertIn("nextIssueKey", source)
+
     def test_workflow_lanes_are_auto_detected_and_cached_from_jira(self):
         source = PLUGIN.read_text(encoding="utf-8")
 
