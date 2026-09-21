@@ -57,6 +57,7 @@ SAFE_ATTACHMENT_PREVIEW_TYPES = frozenset({
 DEFAULT_SETTINGS: dict[str, Any] = {
     "version": 1,
     "defaultView": "assigned",
+    "viewMode": "board",
     "pageSize": 50,
     "baseRef": "HEAD",
     "groupByStatus": True,
@@ -65,6 +66,11 @@ DEFAULT_SETTINGS: dict[str, Any] = {
             "id": "assigned",
             "label": "Assigned to me",
             "jql": "assignee = currentUser() AND statusCategory != Done ORDER BY updated DESC",
+        },
+        {
+            "id": "backlog",
+            "label": "Backlog",
+            "jql": "statusCategory != Done ORDER BY priority DESC, updated DESC",
         },
         {
             "id": "reported",
@@ -669,6 +675,9 @@ def validate_settings(value: Mapping[str, Any]) -> dict[str, Any]:
     default_view = str(value.get("defaultView") or "").strip()
     if default_view not in seen:
         raise ValueError("settings.defaultView must match one of settings.views[].id.")
+    view_mode = str(value.get("viewMode") or ("board" if value.get("groupByStatus", True) else "list")).strip().lower()
+    if view_mode not in {"board", "list"}:
+        raise ValueError("settings.viewMode must be 'board' or 'list'.")
     try:
         page_size = int(value.get("pageSize", 50))
     except (TypeError, ValueError) as exc:
@@ -684,6 +693,7 @@ def validate_settings(value: Mapping[str, Any]) -> dict[str, Any]:
     return {
         "version": 1,
         "defaultView": default_view,
+        "viewMode": view_mode,
         "pageSize": page_size,
         "baseRef": base_ref,
         "groupByStatus": group_by_status,

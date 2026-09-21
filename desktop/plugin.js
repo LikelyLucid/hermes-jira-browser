@@ -581,6 +581,12 @@ function statusColor(issueOrLane) {
   return 'var(--ui-text-secondary)'
 }
 
+function settingsViewMode(settings) {
+  const explicit = String(settings?.viewMode || '').trim().toLowerCase()
+  if (explicit === 'list' || explicit === 'board') return explicit
+  return settings?.groupByStatus === false ? 'list' : 'board'
+}
+
 function normaliseProjects(tree) {
   const projects = Array.isArray(tree?.projects)
     ? tree.projects
@@ -1336,6 +1342,90 @@ function JiraCard({ issue, active, attentionReasons = [], onOpen, workState, wor
             ]
           })
         : null
+    ]
+  })
+}
+
+function JiraListRow({ issue, active, attentionReasons = [], onOpen, workState, workingSessionIds, liveState = 'idle' }) {
+  const linkedWork = Array.isArray(workState?.links) ? workState.links : []
+  const working = linkedWork.some(link => workingSessionIds?.has(sessionLinkIdentity(link)))
+    || liveStatusSnapshot.entries.some(entry => entry.ticketKey === issue.key && entry.state === 'working')
+    || liveState === 'working'
+    || liveState === 'starting'
+  const liveAttention = ['failed', 'waiting'].includes(liveState)
+  const status = issue.status || 'No status'
+  return jsxs('button', {
+    'aria-current': active ? 'true' : undefined,
+    className: `grid w-full min-w-[52rem] grid-cols-[minmax(18rem,1fr)_9rem_8rem_11rem_8rem] items-center gap-3 rounded-md border border-(--ui-stroke-tertiary) border-l-2 bg-(--ui-bg-elevated) px-3 py-2 text-left transition-colors hover:bg-primary/[0.06] focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-(--dt-composer-ring)${working ? ' ring-1 ring-(--dt-composer-ring) bg-[color-mix(in_srgb,var(--dt-composer-ring)_10%,transparent)]' : active ? ' border-(--dt-composer-ring) bg-[color-mix(in_srgb,var(--dt-composer-ring)_7%,transparent)]' : ''}`,
+    onClick: () => onOpen(issue.key),
+    style: { borderLeftColor: statusColor(issue) },
+    type: 'button',
+    children: [
+      jsxs('span', {
+        className: 'min-w-0',
+        children: [
+          jsxs('span', {
+            className: 'flex min-w-0 items-baseline gap-2',
+            children: [
+              jsx('span', { className: 'shrink-0 font-mono text-[0.65rem] font-medium text-(--ui-text-tertiary)', children: issue.key }),
+              jsx('span', { className: 'truncate text-xs font-medium text-foreground', children: issue.summary || issue.key })
+            ]
+          }),
+          issue.issue_type
+            ? jsx('span', { className: 'mt-0.5 block truncate text-[0.62rem] text-(--ui-text-quaternary)', children: issue.issue_type })
+            : null
+        ]
+      }),
+      jsx(PanelPill, { tone: statusTone(issue), children: status }),
+      jsx('span', { className: 'truncate text-xs text-(--ui-text-secondary)', children: issue.priority || '—' }),
+      jsx('span', { className: 'truncate text-xs text-(--ui-text-secondary)', children: issue.assignee || 'Unassigned' }),
+      jsxs('span', {
+        className: 'flex min-w-0 flex-wrap items-center justify-end gap-1 text-[0.62rem] text-(--ui-text-tertiary)',
+        children: [
+          jsx('span', { className: 'shrink-0 text-(--ui-text-quaternary)', children: relativeDate(issue.updated) }),
+          working
+            ? jsx('span', { className: 'inline-flex items-center gap-1 rounded bg-[color-mix(in_srgb,var(--dt-composer-ring)_14%,transparent)] px-1.5 py-0.5 text-(--dt-composer-ring)', children: 'Working' })
+            : null,
+          liveAttention
+            ? jsx('span', { className: `rounded px-1.5 py-0.5 ${liveState === 'failed' ? 'bg-red-500/10 text-red-400' : 'bg-amber-500/10 text-amber-400'}`, children: liveStatusLabel(liveState) })
+            : null,
+          attentionReasons[0]
+            ? jsx('span', { className: 'max-w-28 truncate rounded bg-amber-500/10 px-1.5 py-0.5 text-amber-400', title: attentionReasons.join(' · '), children: attentionReasons[0] })
+            : null,
+          linkedWork.length
+            ? jsx('span', { className: 'rounded bg-foreground/5 px-1.5 py-0.5', children: `${linkedWork.length} chat${linkedWork.length === 1 ? '' : 's'}` })
+            : null
+        ]
+      })
+    ]
+  })
+}
+
+function JiraList({ issues, activeKey, attentionByKey, onOpen, workStates, workingSessionIds, liveTicketStates }) {
+  return jsxs('div', {
+    className: 'min-w-[52rem] space-y-1.5',
+    role: 'table',
+    children: [
+      jsxs('div', {
+        className: 'grid grid-cols-[minmax(18rem,1fr)_9rem_8rem_11rem_8rem] gap-3 px-3 text-[0.62rem] font-medium uppercase tracking-wide text-(--ui-text-quaternary)',
+        role: 'row',
+        children: [
+          jsx('span', { role: 'columnheader', children: 'Ticket' }),
+          jsx('span', { role: 'columnheader', children: 'Status' }),
+          jsx('span', { role: 'columnheader', children: 'Priority' }),
+          jsx('span', { role: 'columnheader', children: 'Assignee' }),
+          jsx('span', { className: 'text-right', role: 'columnheader', children: 'Updated' })
+        ]
+      }),
+      ...issues.map(issue => jsx(JiraListRow, {
+        issue,
+        active: issue.key === activeKey,
+        attentionReasons: attentionByKey[issue.key] || [],
+        liveState: liveTicketStates?.[issue.key] || 'idle',
+        onOpen,
+        workState: workStates[issue.key],
+        workingSessionIds
+      }, issue.id || issue.key))
     ]
   })
 }
@@ -2753,6 +2843,7 @@ function IssueDetail({ issue, status, projects, mapping, links, baseRef, onOpenI
 function SettingsDrawer({
   draft,
   error,
+  onAddBacklogView,
   onAddView,
   onChangeDraft,
   onCopyJson,
@@ -2761,22 +2852,67 @@ function SettingsDrawer({
   onReload,
   onRemoveView,
   onViewChange,
+  onViewModeChange,
   settings,
   state
 }) {
   const inputClass = 'h-8 w-full rounded-md border border-(--ui-stroke-secondary) bg-(--ui-bg-elevated) px-2 text-xs text-foreground outline-none focus:border-(--dt-composer-ring)'
   const views = Array.isArray(settings?.views) ? settings.views : []
+  const viewMode = settingsViewMode(settings)
   return jsxs('div', {
     className: 'space-y-5',
     children: [
       jsxs('section', {
         className: 'space-y-3',
         children: [
-          jsx(PanelSectionLabel, { children: 'Human-friendly settings' }),
+          jsx(PanelSectionLabel, { children: 'How Jira looks' }),
+          jsx('p', {
+            className: 'text-xs leading-relaxed text-(--ui-text-tertiary)',
+            children: 'Pick the layout that matches the work. Boards are useful for moving active work through statuses; lists are easier to scan for a backlog.'
+          }),
+          jsxs('div', {
+            className: 'space-y-1.5',
+            children: [
+              jsx('span', { className: 'text-[0.68rem] text-(--ui-text-tertiary)', children: 'Ticket layout' }),
+              jsxs('div', {
+                className: 'grid grid-cols-2 gap-2',
+                children: [
+                  jsx(Button, {
+                    'aria-pressed': viewMode !== 'list',
+                    className: 'h-auto justify-start px-3 py-2 text-left',
+                    onClick: () => onViewModeChange('board'),
+                    size: 'sm',
+                    variant: viewMode !== 'list' ? 'secondary' : 'outline',
+                    children: jsxs('span', {
+                      className: 'flex flex-col items-start gap-0.5',
+                      children: [
+                        jsx('span', { className: 'font-medium', children: 'Board' }),
+                        jsx('span', { className: 'text-[0.62rem] font-normal text-(--ui-text-tertiary)', children: 'Move work across status columns' })
+                      ]
+                    })
+                  }),
+                  jsx(Button, {
+                    'aria-pressed': viewMode === 'list',
+                    className: 'h-auto justify-start px-3 py-2 text-left',
+                    onClick: () => onViewModeChange('list'),
+                    size: 'sm',
+                    variant: viewMode === 'list' ? 'secondary' : 'outline',
+                    children: jsxs('span', {
+                      className: 'flex flex-col items-start gap-0.5',
+                      children: [
+                        jsx('span', { className: 'font-medium', children: 'List' }),
+                        jsx('span', { className: 'text-[0.62rem] font-normal text-(--ui-text-tertiary)', children: 'Scan a backlog or queue' })
+                      ]
+                    })
+                  })
+                ]
+              })
+            ]
+          }),
           jsxs('label', {
             className: 'block space-y-1',
             children: [
-              jsx('span', { className: 'text-[0.68rem] text-(--ui-text-tertiary)', children: 'Default view' }),
+              jsx('span', { className: 'text-[0.68rem] text-(--ui-text-tertiary)', children: 'Open Jira with' }),
               jsx(Select, {
                 value: String(settings?.defaultView || ''),
                 onValueChange: value => onFieldChange('defaultView', value),
@@ -2799,7 +2935,7 @@ function SettingsDrawer({
               jsxs('label', {
                 className: 'space-y-1',
                 children: [
-                  jsx('span', { className: 'text-[0.68rem] text-(--ui-text-tertiary)', children: 'Tickets per page' }),
+                  jsx('span', { className: 'text-[0.68rem] text-(--ui-text-tertiary)', children: 'Tickets to load at once' }),
                   jsx('input', {
                     className: inputClass,
                     max: 100,
@@ -2813,7 +2949,8 @@ function SettingsDrawer({
               jsxs('label', {
                 className: 'space-y-1',
                 children: [
-                  jsx('span', { className: 'text-[0.68rem] text-(--ui-text-tertiary)', children: 'Worktree base ref' }),
+                  jsx('span', { className: 'text-[0.68rem] text-(--ui-text-tertiary)', children: 'New worktree base' }),
+                  jsx('span', { className: 'block text-[0.6rem] leading-relaxed text-(--ui-text-quaternary)', children: 'Usually HEAD. Change this only if new work should start from another branch or ref.' }),
                   jsx('input', {
                     className: inputClass,
                     onChange: event => onFieldChange('baseRef', event.target.value),
@@ -2824,14 +2961,20 @@ function SettingsDrawer({
             ]
           }),
           jsxs('label', {
-            className: 'flex cursor-pointer items-center gap-2 rounded-md border border-(--ui-stroke-tertiary) px-2.5 py-2 text-xs text-foreground/80',
+            className: `flex cursor-pointer items-start gap-2 rounded-md border border-(--ui-stroke-tertiary) px-2.5 py-2 text-xs text-foreground/80${viewMode === 'list' ? ' opacity-55' : ''}`,
             children: [
               jsx('input', {
                 checked: Boolean(settings?.groupByStatus),
+                disabled: viewMode === 'list',
                 onChange: event => onFieldChange('groupByStatus', event.target.checked),
                 type: 'checkbox'
               }),
-              jsx('span', { children: 'Group tickets into Jira workflow lanes' })
+              jsxs('span', {
+                children: [
+                  jsx('span', { className: 'block', children: 'Group tickets into columns by status' }),
+                  jsx('span', { className: 'mt-0.5 block text-[0.6rem] leading-relaxed text-(--ui-text-quaternary)', children: viewMode === 'list' ? 'Only used by the Board layout.' : 'Useful when you are moving active work through a workflow.' })
+                ]
+              })
             ]
           })
         ]
@@ -2842,9 +2985,24 @@ function SettingsDrawer({
           jsxs('div', {
             className: 'flex items-center justify-between gap-2',
             children: [
-              jsx(PanelSectionLabel, { children: `Saved views · ${views.length}` }),
-              jsx(Button, { onClick: onAddView, size: 'xs', variant: 'outline', children: 'Add view' })
+              jsxs('div', {
+                className: 'flex flex-wrap items-center justify-between gap-2',
+                children: [
+                  jsx(PanelSectionLabel, { children: `Saved views · ${views.length}` }),
+                  jsxs('div', {
+                    className: 'flex flex-wrap gap-1.5',
+                    children: [
+                      jsx(Button, { onClick: onAddBacklogView, size: 'xs', variant: 'ghost', children: 'Add backlog view' }),
+                      jsx(Button, { onClick: onAddView, size: 'xs', variant: 'outline', children: 'Add view' })
+                    ]
+                  })
+                ]
+              })
             ]
+          }),
+          jsx('p', {
+            className: 'text-xs leading-relaxed text-(--ui-text-tertiary)',
+            children: 'A saved view is simply a named Jira search. Use Backlog for open work that is better scanned as a list, or add a view for a team queue.'
           }),
           ...views.map((view, index) =>
             jsxs('div', {
@@ -2890,50 +3048,61 @@ function SettingsDrawer({
           )
         ]
       }),
-      jsxs('section', {
-        className: 'space-y-2 border-t border-(--ui-stroke-tertiary) pt-4',
+      jsxs('details', {
+        className: 'border-t border-(--ui-stroke-tertiary) pt-4',
         children: [
+          jsx('summary', {
+            className: 'cursor-pointer list-none text-xs font-medium text-foreground/85 outline-none marker:hidden focus-visible:text-(--dt-composer-ring)',
+            children: jsxs('span', {
+              className: 'flex items-center gap-2',
+              children: [
+                jsx(Codicon, { name: 'chevron-right', size: '0.7rem' }),
+                jsx('span', { children: 'Advanced settings' }),
+                jsx('span', { className: 'font-normal text-(--ui-text-quaternary)', children: '(JSON file)' })
+              ]
+            })
+          }),
           jsxs('div', {
-            className: 'flex items-center justify-between gap-2',
+            className: 'mt-3 space-y-2',
             children: [
               jsxs('div', {
+                className: 'flex items-center justify-between gap-2',
                 children: [
-                  jsx(PanelSectionLabel, { children: 'Agent JSON' }),
                   jsx('p', {
-                    className: 'mt-1 text-[0.65rem] leading-relaxed text-(--ui-text-quaternary)',
-                    children: 'Canonical, credential-free JSON. Agents can edit this file directly; use Reload file to pull external edits into the board.'
+                    className: 'max-w-[26rem] text-[0.65rem] leading-relaxed text-(--ui-text-quaternary)',
+                    children: 'Most people can ignore this. Use it when an agent or an advanced Jira setup needs the complete credential-free settings file.'
+                  }),
+                  jsx('span', { className: 'shrink-0 text-[0.65rem] text-(--ui-text-tertiary)', children: state })
+                ]
+              }),
+              jsxs('div', {
+                className: 'rounded-md bg-foreground/5 p-2',
+                children: [
+                  jsx('code', {
+                    className: 'block truncate text-[0.62rem] text-(--ui-text-tertiary)',
+                    title: '$HERMES_HOME/jira-browser/settings.json',
+                    children: '$HERMES_HOME/jira-browser/settings.json'
+                  }),
+                  jsxs('div', {
+                    className: 'mt-2 flex flex-wrap gap-1.5',
+                    children: [
+                      jsx(Button, { onClick: onCopyPath, size: 'xs', variant: 'outline', children: 'Copy path' }),
+                      jsx(Button, { onClick: onCopyJson, size: 'xs', variant: 'outline', children: 'Copy JSON' }),
+                      jsx(Button, { onClick: onReload, size: 'xs', variant: 'ghost', children: 'Reload file' })
+                    ]
                   })
                 ]
               }),
-              jsx('span', { className: 'shrink-0 text-[0.65rem] text-(--ui-text-tertiary)', children: state })
-            ]
-          }),
-          jsxs('div', {
-            className: 'rounded-md bg-foreground/5 p-2',
-            children: [
-              jsx('code', {
-                className: 'block truncate text-[0.62rem] text-(--ui-text-tertiary)',
-                title: '$HERMES_HOME/jira-browser/settings.json',
-                children: '$HERMES_HOME/jira-browser/settings.json'
+              jsx(Textarea, {
+                'aria-label': 'Jira Browser JSON settings',
+                className: 'min-h-72 resize-y font-mono text-[0.68rem] leading-relaxed',
+                onChange: event => onChangeDraft(event.target.value),
+                spellCheck: false,
+                value: draft
               }),
-              jsxs('div', {
-                className: 'mt-2 flex flex-wrap gap-1.5',
-                children: [
-                  jsx(Button, { onClick: onCopyPath, size: 'xs', variant: 'outline', children: 'Copy path' }),
-                  jsx(Button, { onClick: onCopyJson, size: 'xs', variant: 'outline', children: 'Copy JSON' }),
-                  jsx(Button, { onClick: onReload, size: 'xs', variant: 'ghost', children: 'Reload file' })
-                ]
-              })
+              error ? jsx('p', { className: 'text-[0.68rem] text-destructive', children: error }) : null
             ]
-          }),
-          jsx(Textarea, {
-            'aria-label': 'Jira Browser JSON settings',
-            className: 'min-h-72 resize-y font-mono text-[0.68rem] leading-relaxed',
-            onChange: event => onChangeDraft(event.target.value),
-            spellCheck: false,
-            value: draft
-          }),
-          error ? jsx('p', { className: 'text-[0.68rem] text-destructive', children: error }) : null
+          })
         ]
       })
     ]
@@ -3259,6 +3428,14 @@ function JiraPage() {
     mutateSettingsDraft(current => ({ ...current, [field]: value }))
   }, [mutateSettingsDraft])
 
+  const updateViewMode = useCallback(mode => {
+    mutateSettingsDraft(current => ({
+      ...current,
+      viewMode: mode,
+      groupByStatus: mode === 'board'
+    }))
+  }, [mutateSettingsDraft])
+
   const updateSavedView = useCallback((index, field, value) => {
     mutateSettingsDraft(current => {
       const views = Array.isArray(current.views) ? [...current.views] : []
@@ -3267,6 +3444,24 @@ function JiraPage() {
       views[index] = { ...previous, [field]: value }
       const defaultView = field === 'id' && current.defaultView === previous.id ? value : current.defaultView
       return { ...current, defaultView, views }
+    })
+  }, [mutateSettingsDraft])
+
+  const addBacklogView = useCallback(() => {
+    mutateSettingsDraft(current => {
+      const views = Array.isArray(current.views) ? [...current.views] : []
+      if (views.some(view => String(view.id || '') === 'backlog')) return current
+      return {
+        ...current,
+        views: [
+          ...views,
+          {
+            id: 'backlog',
+            label: 'Backlog',
+            jql: 'statusCategory != Done ORDER BY priority DESC, updated DESC'
+          }
+        ]
+      }
     })
   }, [mutateSettingsDraft])
 
@@ -3555,6 +3750,8 @@ function JiraPage() {
     return [...groups.values()].sort((left, right) => left.rank - right.rank || left.label.localeCompare(right.label))
   }, [detectedLanes, settings?.groupByStatus, visibleIssues])
 
+  const listView = settingsViewMode(editableSettings) === 'list'
+
   const toggleLane = useCallback(key => {
     setCollapsedLanes(current => ({ ...current, [key]: !current[key] }))
   }, [])
@@ -3735,6 +3932,27 @@ function JiraPage() {
               ]
             })
           }),
+          jsxs('div', {
+            className: 'flex items-center gap-0.5 rounded-md border border-(--ui-stroke-tertiary) p-0.5',
+            'aria-label': 'Jira ticket layout',
+            role: 'group',
+            children: [
+              jsx(Button, {
+                'aria-pressed': !listView,
+                onClick: () => updateViewMode('board'),
+                size: 'xs',
+                variant: !listView ? 'secondary' : 'ghost',
+                children: 'Board'
+              }),
+              jsx(Button, {
+                'aria-pressed': listView,
+                onClick: () => updateViewMode('list'),
+                size: 'xs',
+                variant: listView ? 'secondary' : 'ghost',
+                children: 'List'
+              })
+            ]
+          }),
           jsxs(Button, {
             'aria-pressed': attentionOnly,
             onClick: () => setAttentionOnly(value => !value),
@@ -3797,7 +4015,7 @@ function JiraPage() {
         : null,
       loading && issues.length === 0
         ? jsx('div', { className: 'grid flex-1 place-items-center', children: jsx(Loader, { type: 'lemniscate-bloom' }) })
-        : visibleIssues.length === 0 && detectedLanes.length === 0
+        : visibleIssues.length === 0
           ? jsx('div', {
               className: 'grid flex-1 place-items-center px-4 text-center',
               children: jsxs('div', {
@@ -3808,8 +4026,35 @@ function JiraPage() {
                 ]
               })
             })
-          : jsxs('div', {
-              className: 'flex flex-1 gap-2 overflow-x-auto px-4 pt-1 pb-3',
+          : listView
+            ? jsxs('div', {
+                className: 'min-h-0 flex-1 overflow-auto px-4 pt-1 pb-3',
+                children: [
+                  jsx(JiraList, {
+                    activeKey: selectedKey,
+                    attentionByKey,
+                    issues: visibleIssues,
+                    liveTicketStates,
+                    onOpen: openTicket,
+                    workStates,
+                    workingSessionIds
+                  }),
+                  nextPageToken
+                    ? jsx('div', {
+                        className: 'flex justify-center py-3',
+                        children: jsx(Button, {
+                          disabled: loadingMore,
+                          onClick: () => loadIssues(submittedJql, { append: true, nextPageToken, pageSize: settings?.pageSize }),
+                          size: 'sm',
+                          variant: 'ghost',
+                          children: loadingMore ? 'Loading…' : 'Load more tickets'
+                        })
+                      })
+                    : null
+                ]
+              })
+            : jsxs('div', {
+                className: 'flex flex-1 gap-2 overflow-x-auto px-4 pt-1 pb-3',
               children: [
                 ...issueLanes.map(lane =>
                   jsx(JiraLane, {
@@ -3891,6 +4136,7 @@ function JiraPage() {
                 children: jsx(SettingsDrawer, {
                   draft: settingsDraft,
                   error: settingsError,
+                  onAddBacklogView: addBacklogView,
                   onAddView: addSavedView,
                   onChangeDraft: setSettingsDraft,
                   onCopyJson: copySettingsJson,
@@ -3899,6 +4145,7 @@ function JiraPage() {
                   onReload: reloadSettingsFile,
                   onRemoveView: removeSavedView,
                   onViewChange: updateSavedView,
+                  onViewModeChange: updateViewMode,
                   settings: editableSettings,
                   state: settingsState
                 })

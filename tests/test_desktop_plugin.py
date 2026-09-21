@@ -86,13 +86,28 @@ class DesktopPluginTests(unittest.TestCase):
         source = PLUGIN.read_text(encoding="utf-8")
 
         self.assertIn("function SettingsDrawer", source)
-        self.assertIn("Human-friendly settings", source)
-        self.assertIn("Agent JSON", source)
+        self.assertIn("How Jira looks", source)
+        self.assertIn("Ticket layout", source)
+        self.assertIn("Scan a backlog or queue", source)
+        self.assertIn("Advanced settings", source)
         self.assertIn("$HERMES_HOME/jira-browser/settings.json", source)
         self.assertIn("const updateSettingsField = useCallback", source)
         self.assertIn("const updateSavedView = useCallback", source)
+        self.assertIn("onAddBacklogView: addBacklogView", source)
         self.assertIn("onCopyPath: copySettingsPath", source)
         self.assertIn("style: { width: `${drawerWidth}px` }", source)
+
+    def test_list_layout_is_a_scan_friendly_ticket_view(self):
+        source = PLUGIN.read_text(encoding="utf-8")
+
+        self.assertIn("function JiraListRow", source)
+        self.assertIn("function JiraList(", source)
+        self.assertIn("role: 'table'", source)
+        self.assertIn("function settingsViewMode", source)
+        self.assertIn("const listView = settingsViewMode(editableSettings) === 'list'", source)
+        self.assertIn("updateViewMode('list')", source)
+        self.assertIn("? jsxs('div', {\n                className: 'min-h-0 flex-1 overflow-auto", source)
+        self.assertIn("children: loadingMore ? 'Loading…' : 'Load more tickets'", source)
 
     def test_workflow_lanes_are_auto_detected_and_cached_from_jira(self):
         source = PLUGIN.read_text(encoding="utf-8")

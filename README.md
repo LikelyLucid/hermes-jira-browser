@@ -119,7 +119,7 @@ Settings are written atomically with mode `0600` to:
 $HERMES_HOME/jira-browser/settings.json
 ```
 
-The drawer provides a form for common settings and a raw JSON editor for complete control. Settings include saved views, JQL, default view, page size, base ref, grouping, and UI preferences. Credentials are never stored there.
+The drawer uses plain-language controls for common settings: choose a **Board** for moving active work through workflow columns or a **List** for scanning a backlog, choose the view to open by default, set how many tickets load at once, and choose the base ref for new worktrees. Saved views are named Jira searches; a **Backlog** preset is available for open tickets ordered by priority. Advanced users can expand the credential-free JSON editor, but most users never need it. Credentials are never stored there.
 
 ## Desktop compatibility
 

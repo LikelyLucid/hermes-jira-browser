@@ -1127,6 +1127,8 @@ class SettingsTests(unittest.TestCase):
             self.assertTrue(path.exists())
 
         self.assertEqual(settings["defaultView"], "assigned")
+        self.assertEqual(settings["viewMode"], "board")
+        self.assertIn("Backlog", [view["label"] for view in settings["views"]])
         self.assertIn("assignee = currentUser()", settings["views"][0]["jql"])
 
     def test_settings_round_trip_as_json(self):
@@ -1135,6 +1137,7 @@ class SettingsTests(unittest.TestCase):
             value = {
                 "version": 1,
                 "defaultView": "mine",
+                "viewMode": "list",
                 "pageSize": 25,
                 "baseRef": "main",
                 "groupByStatus": False,
@@ -1156,12 +1159,37 @@ class SettingsTests(unittest.TestCase):
         value = {
             "version": 1,
             "defaultView": "missing",
+            "viewMode": "board",
             "pageSize": 50,
             "baseRef": "HEAD",
             "views": [{"id": "mine", "label": "Mine", "jql": "assignee = currentUser()"}],
         }
         with self.assertRaisesRegex(ValueError, "defaultView"):
             jira_service.validate_settings(value)
+
+    def test_settings_reject_invalid_view_mode(self):
+        value = {
+            "version": 1,
+            "defaultView": "mine",
+            "viewMode": "calendar",
+            "pageSize": 50,
+            "baseRef": "HEAD",
+            "views": [{"id": "mine", "label": "Mine", "jql": "assignee = currentUser()"}],
+        }
+        with self.assertRaisesRegex(ValueError, "viewMode"):
+            jira_service.validate_settings(value)
+
+    def test_legacy_settings_infer_list_mode_when_status_grouping_was_disabled(self):
+        value = {
+            "version": 1,
+            "defaultView": "mine",
+            "pageSize": 50,
+            "baseRef": "HEAD",
+            "groupByStatus": False,
+            "views": [{"id": "mine", "label": "Mine", "jql": "assignee = currentUser()"}],
+        }
+        settings = jira_service.validate_settings(value)
+        self.assertEqual(settings["viewMode"], "list")
 
     def test_loading_settings_persists_new_defaults(self):
         with tempfile.TemporaryDirectory() as tmp:
