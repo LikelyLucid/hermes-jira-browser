@@ -1487,7 +1487,8 @@ function JiraCard({ issue, active, attentionReasons = [], density = 'comfortable
   })
 }
 
-function JiraListRow({ issue, active, attentionReasons = [], density = 'comfortable', onOpen, workState, workingSessionIds, liveState = 'idle' }) {
+function JiraListRow({ issue, active, attentionReasons = [], density = 'comfortable', listGrid, onOpen, workState, workingSessionIds, liveState = 'idle' }) {
+  const compact = density === 'compact'
   const linkedWork = Array.isArray(workState?.links) ? workState.links : []
   const working = linkedWork.some(link => workingSessionIds?.has(sessionLinkIdentity(link)))
     || liveStatusSnapshot.entries.some(entry => entry.ticketKey === issue.key && entry.state === 'working')
@@ -1497,7 +1498,7 @@ function JiraListRow({ issue, active, attentionReasons = [], density = 'comforta
   const status = issue.status || 'No status'
   return jsxs('button', {
     'aria-current': active ? 'true' : undefined,
-    className: `grid w-full min-w-[52rem] grid-cols-[minmax(18rem,1fr)_9rem_8rem_11rem_8rem] items-center gap-3 rounded-md border border-(--ui-stroke-tertiary) border-l-2 bg-(--ui-bg-elevated) px-3 ${density === 'compact' ? 'py-1.5' : 'py-2'} text-left transition-colors hover:bg-primary/[0.06] focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-(--dt-composer-ring)${working ? ' ring-1 ring-(--dt-composer-ring) bg-[color-mix(in_srgb,var(--dt-composer-ring)_10%,transparent)]' : active ? ' border-(--dt-composer-ring) bg-[color-mix(in_srgb,var(--dt-composer-ring)_7%,transparent)]' : ''}`,
+    className: `${listGrid} grid w-full min-w-0 items-center ${compact ? 'gap-2 border-b border-l-2 border-(--ui-stroke-tertiary) px-2 py-1' : 'gap-3 rounded-md border border-(--ui-stroke-tertiary) border-l-2 bg-(--ui-bg-elevated) px-3 py-2'} text-left transition-colors hover:bg-primary/[0.06] focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-(--dt-composer-ring)${working ? ' ring-1 ring-(--dt-composer-ring) bg-[color-mix(in_srgb,var(--dt-composer-ring)_10%,transparent)]' : active ? ' border-(--dt-composer-ring) bg-[color-mix(in_srgb,var(--dt-composer-ring)_7%,transparent)]' : ''}`,
     onClick: () => onOpen(issue.key),
     style: { borderLeftColor: statusColor(issue) },
     type: 'button',
@@ -1506,35 +1507,45 @@ function JiraListRow({ issue, active, attentionReasons = [], density = 'comforta
         className: 'min-w-0',
         children: [
           jsxs('span', {
-            className: 'flex min-w-0 items-baseline gap-2',
+            className: `flex min-w-0 ${compact ? 'items-center gap-1.5' : 'items-baseline gap-2'}`,
             children: [
-              jsx('span', { className: 'shrink-0 font-mono text-[0.65rem] font-medium text-(--ui-text-tertiary)', children: issue.key }),
-              jsx('span', { className: 'truncate text-xs font-medium text-foreground', children: issue.summary || issue.key })
+              jsx('span', { className: `shrink-0 font-mono ${compact ? 'text-[0.6rem]' : 'text-[0.65rem] font-medium'} text-(--ui-text-tertiary)`, children: issue.key }),
+              jsx('span', { className: compact ? 'truncate text-[0.68rem] text-(--ui-text-secondary)' : 'truncate text-xs font-medium text-foreground', children: issue.summary || issue.key })
             ]
           }),
-          issue.issue_type
+          !compact && issue.issue_type
             ? jsx('span', { className: 'mt-0.5 block truncate text-[0.62rem] text-(--ui-text-quaternary)', children: issue.issue_type })
             : null
         ]
       }),
-      jsx(PanelPill, { tone: statusTone(issue), children: status }),
-      jsx('span', { className: 'truncate text-xs text-(--ui-text-secondary)', children: issue.priority || '—' }),
-      jsx('span', { className: 'truncate text-xs text-(--ui-text-secondary)', children: issue.assignee || 'Unassigned' }),
+      compact
+        ? jsx('span', { className: 'truncate text-[0.68rem] text-(--ui-text-secondary)', title: status, children: status })
+        : jsx(PanelPill, { tone: statusTone(issue), children: status }),
+      jsx('span', { className: compact ? 'truncate text-[0.68rem] text-(--ui-text-tertiary)' : 'truncate text-xs text-(--ui-text-secondary)', children: issue.priority || '—' }),
+      jsx('span', { className: compact ? 'truncate text-[0.68rem] text-(--ui-text-tertiary)' : 'truncate text-xs text-(--ui-text-secondary)', children: issue.assignee || 'Unassigned' }),
       jsxs('span', {
-        className: 'flex min-w-0 flex-wrap items-center justify-end gap-1 text-[0.62rem] text-(--ui-text-tertiary)',
+        className: compact ? 'flex min-w-0 items-center justify-end gap-1 text-[0.6rem] text-(--ui-text-tertiary)' : 'flex min-w-0 flex-wrap items-center justify-end gap-1 text-[0.62rem] text-(--ui-text-tertiary)',
         children: [
           jsx('span', { className: 'shrink-0 text-(--ui-text-quaternary)', children: relativeDate(issue.updated) }),
           working
-            ? jsx('span', { className: 'inline-flex items-center gap-1 rounded bg-[color-mix(in_srgb,var(--dt-composer-ring)_14%,transparent)] px-1.5 py-0.5 text-(--dt-composer-ring)', children: 'Working' })
+            ? compact
+              ? jsx('span', { 'aria-label': 'Working', className: 'text-(--dt-composer-ring)', title: 'Working', children: jsx(Codicon, { className: 'animate-pulse', name: 'loading~spin', size: '0.6rem' }) })
+              : jsx('span', { className: 'inline-flex items-center gap-1 rounded bg-[color-mix(in_srgb,var(--dt-composer-ring)_14%,transparent)] px-1.5 py-0.5 text-(--dt-composer-ring)', children: 'Working' })
             : null,
           liveAttention
-            ? jsx('span', { className: `rounded px-1.5 py-0.5 ${liveState === 'failed' ? 'bg-red-500/10 text-red-400' : 'bg-amber-500/10 text-amber-400'}`, children: liveStatusLabel(liveState) })
+            ? compact
+              ? jsx('span', { 'aria-label': liveStatusLabel(liveState), className: liveState === 'failed' ? 'text-red-400' : 'text-amber-400', title: liveStatusLabel(liveState), children: jsx(Codicon, { name: 'warning', size: '0.6rem' }) })
+              : jsx('span', { className: `rounded px-1.5 py-0.5 ${liveState === 'failed' ? 'bg-red-500/10 text-red-400' : 'bg-amber-500/10 text-amber-400'}`, children: liveStatusLabel(liveState) })
             : null,
           attentionReasons[0]
-            ? jsx('span', { className: 'max-w-28 truncate rounded bg-amber-500/10 px-1.5 py-0.5 text-amber-400', title: attentionReasons.join(' · '), children: attentionReasons[0] })
+            ? compact
+              ? jsx('span', { 'aria-label': attentionReasons.join(' · '), className: 'text-amber-400', title: attentionReasons.join(' · '), children: jsx(Codicon, { name: 'bell', size: '0.6rem' }) })
+              : jsx('span', { className: 'max-w-28 truncate rounded bg-amber-500/10 px-1.5 py-0.5 text-amber-400', title: attentionReasons.join(' · '), children: attentionReasons[0] })
             : null,
           linkedWork.length
-            ? jsx('span', { className: 'rounded bg-foreground/5 px-1.5 py-0.5', children: `${linkedWork.length} chat${linkedWork.length === 1 ? '' : 's'}` })
+            ? compact
+              ? jsx('span', { 'aria-label': `${linkedWork.length} linked chat${linkedWork.length === 1 ? '' : 's'}`, className: 'text-(--ui-text-tertiary)', title: `${linkedWork.length} linked chat${linkedWork.length === 1 ? '' : 's'}`, children: jsx(Codicon, { name: 'comment-discussion', size: '0.6rem' }) })
+              : jsx('span', { className: 'rounded bg-foreground/5 px-1.5 py-0.5', children: `${linkedWork.length} chat${linkedWork.length === 1 ? '' : 's'}` })
             : null
         ]
       })
@@ -1543,12 +1554,14 @@ function JiraListRow({ issue, active, attentionReasons = [], density = 'comforta
 }
 
 function JiraList({ issues, activeKey, attentionByKey, density = 'comfortable', onOpen, workStates, workingSessionIds, liveTicketStates }) {
+  const compact = density === 'compact'
+  const listGrid = compact ? 'grid-cols-[minmax(14rem,1fr)_6rem_5rem_8rem_5rem]' : 'grid-cols-[minmax(18rem,1fr)_9rem_8rem_11rem_8rem]'
   return jsxs('div', {
-    className: 'min-w-[52rem] space-y-1.5',
+    className: compact ? 'min-w-[42rem] space-y-0' : 'min-w-[52rem] space-y-1.5',
     role: 'table',
     children: [
       jsxs('div', {
-        className: 'grid grid-cols-[minmax(18rem,1fr)_9rem_8rem_11rem_8rem] gap-3 px-3 text-[0.62rem] font-medium uppercase tracking-wide text-(--ui-text-quaternary)',
+        className: `${listGrid} grid ${compact ? 'gap-2 px-2 pb-1 text-[0.58rem]' : 'gap-3 px-3 text-[0.62rem]'} font-medium uppercase tracking-wide text-(--ui-text-quaternary)`,
         role: 'row',
         children: [
           jsx('span', { role: 'columnheader', children: 'Ticket' }),
@@ -1563,6 +1576,7 @@ function JiraList({ issues, activeKey, attentionByKey, density = 'comfortable', 
         active: issue.key === activeKey,
         attentionReasons: attentionByKey[issue.key] || [],
         density,
+        listGrid,
         liveState: liveTicketStates?.[issue.key] || 'idle',
         onOpen,
         workState: workStates[issue.key],

@@ -109,6 +109,15 @@ class DesktopPluginTests(unittest.TestCase):
         self.assertIn("? jsxs('div', {\n                className: 'min-h-0 flex-1 overflow-auto", source)
         self.assertIn("children: loadingMore ? 'Loading…' : 'Load more tickets'", source)
 
+    def test_compact_list_is_single_line_and_minimal(self):
+        source = PLUGIN.read_text(encoding="utf-8")
+
+        self.assertIn("const compact = density === 'compact'", source)
+        self.assertIn("const listGrid = compact ? 'grid-cols-[minmax(14rem,1fr)_6rem_5rem_8rem_5rem]'", source)
+        self.assertIn("compact ? 'min-w-[42rem] space-y-0' : 'min-w-[52rem] space-y-1.5'", source)
+        self.assertIn("compact ? 'gap-2 border-b border-l-2 border-(--ui-stroke-tertiary) px-2 py-1'", source)
+        self.assertIn("compact ? 'truncate text-[0.68rem] text-(--ui-text-secondary)'", source)
+
     def test_saved_view_management_supports_human_builder_and_per_view_preferences(self):
         source = PLUGIN.read_text(encoding="utf-8")
 
