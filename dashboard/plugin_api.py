@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import importlib.util
+import re
+import urllib.parse
 from pathlib import Path
 from typing import Any
 
@@ -28,6 +30,20 @@ _CONTEXT_SPEC.loader.exec_module(REPOSITORY_CONTEXT)
 router = APIRouter()
 
 
+MAX_BATCH_ISSUES = 50
+MAX_BATCH_CONCURRENCY = 8
+MAX_CHAT_CONTEXT_SESSION_ID_CHARS = 256
+MAX_CHAT_CONTEXT_PROFILE_CHARS = 200
+MAX_CHAT_CONTEXT_CONNECTION_CHARS = 200
+MAX_CHAT_CONTEXT_SUMMARY_CHARS = 400
+MAX_CHAT_CONTEXT_STATUS_CHARS = 120
+MAX_CHAT_CONTEXT_COMMENT_CHARS = 6_000
+MAX_CHAT_CONTEXT_ATTACHMENT_NAME_CHARS = 160
+MAX_CHAT_CONTEXT_ATTACHMENT_MIME_CHARS = 80
+MAX_CHAT_CONTEXT_COMMENTS = 3
+MAX_CHAT_CONTEXT_ATTACHMENTS = 20
+
+
 class ProjectMappingRequest(BaseModel):
     hermes_project_id: str = Field(min_length=1)
     hermes_project_label: str = Field(min_length=1)
@@ -39,6 +55,21 @@ class WorktreeRequest(BaseModel):
     issue_key: str = Field(min_length=1)
     summary: str = Field(min_length=1)
     base_ref: str = "HEAD"
+
+
+class IssueBatchRequest(BaseModel):
+    issue_keys: list[str] = Field(min_length=1, max_length=MAX_BATCH_ISSUES)
+    include_transitions: bool = True
+    include_links: bool = True
+    include_details: bool = False
+    connection_id: str = Field(min_length=1, max_length=200)
+    profile_name: str = Field(min_length=1, max_length=200)
+    target_profile: str = Field(min_length=1, max_length=200)
+
+    @field_validator("connection_id", "profile_name", "target_profile", mode="before")
+    @classmethod
+    def _validate_batch_owner(cls, value: Any, info):
+        return SERVICE.validate_owner_field(value, field_name=info.field_name)
 
 
 class SessionLinkRequest(BaseModel):
@@ -101,7 +132,7 @@ def _safe_http_error(exc: Exception, *, status_code: int = 500) -> HTTPException
 
 
 def _mutation_failure_releases_claim(exc: Exception) -> bool:
-    return isinstance(exc, (SERVICE.JiraPreRequestError, SERVICE.JiraDefinitiveRejectionError, ValueError))
+    return isinstance(exc, (SERVICE.JiraPreRequestError, SERVICE.JiraDefinitiveRejectionError))
 
 
 async def _run_mutation(
@@ -112,8 +143,8 @@ async def _run_mutation(
     payload: dict[str, Any],
     operation,
 ) -> dict[str, Any]:
-    # Resolve configuration and endpoint syntax before reserving a mutation key.
-    client = await asyncio.to_thread(_client)
+    # Reserve before loading Jira configuration so a completed replay is
+    # answerable from durable local state even when Jira is currently offline.
     store = _store()
     reservation = await asyncio.to_thread(
         store.reserve_mutation,
@@ -125,12 +156,19 @@ async def _run_mutation(
     if reservation["status"] == "completed":
         return reservation["result"]
     try:
+        client = await asyncio.to_thread(_client)
+    except Exception:
+        # No Jira request can have been sent while constructing the client.
+        await asyncio.to_thread(store.release_mutation, idempotency_key)
+        raise
+    try:
         result = await asyncio.to_thread(operation, client)
     except Exception as exc:
+        # Only explicit pre-request and definitive-rejection classifications
+        # prove that a retry cannot duplicate a Jira write. All other failures
+        # retain the pending receipt as an ambiguous outcome.
         if _mutation_failure_releases_claim(exc):
             await asyncio.to_thread(store.release_mutation, idempotency_key)
-        # Ambiguous transport/outcome errors retain the pending receipt so a
-        # later retry cannot issue a possibly-duplicating Jira write.
         raise
     await asyncio.to_thread(store.complete_mutation, idempotency_key, result)
     return result
@@ -140,7 +178,7 @@ def _validate_active_owner(
     profile_name: str,
     connection_id: str,
     target_profile: str,
-) -> tuple[str, str]:
+) -> tuple[str, str, str]:
     profile = SERVICE.validate_owner_field(profile_name, field_name="profile_name")
     connection = SERVICE.validate_owner_field(connection_id, field_name="connection_id")
     active_profile = SERVICE.active_profile_name()
@@ -149,7 +187,7 @@ def _validate_active_owner(
     target = SERVICE.validate_owner_field(target_profile, field_name="target_profile")
     if target != active_profile:
         raise ValueError("Target profile is not registered to this backend.")
-    return profile, connection
+    return profile, connection, target
 
 
 def _owner_qualified_rows(
@@ -183,6 +221,191 @@ def _owner_qualified_rows(
         if actual == expected:
             qualified.append(row)
     return qualified
+
+
+async def _load_issue_batch_item(
+    client: Any,
+    store: Any,
+    issue_key: str,
+    *,
+    include_transitions: bool,
+    include_links: bool,
+    include_details: bool,
+    owner: tuple[str, str, str],
+    semaphore: asyncio.Semaphore,
+) -> dict[str, Any]:
+    async with semaphore:
+        try:
+            issue = await asyncio.to_thread(
+                client.issue if include_details else client.issue_summary,
+                issue_key,
+            )
+            transitions = (
+                await asyncio.to_thread(client.transitions, issue_key)
+                if include_transitions
+                else []
+            )
+            links: list[dict[str, Any]] = []
+            if include_links and store is not None:
+                origin = SERVICE.JiraStore._normalize_jira_origin(client.config.base_url)
+                raw_links = await asyncio.to_thread(
+                    store.links_for_issue,
+                    str(issue.get("id") or ""),
+                    jira_origin=origin,
+                    # _validate_active_owner returns (profile, connection, target).
+                    connection_id=owner[1],
+                    profile_name=owner[0],
+                    target_profile=owner[2],
+                )
+                links = await asyncio.to_thread(SERVICE.enrich_session_links, raw_links)
+            return {"issue": issue, "transitions": transitions, "links": links}
+        except Exception:
+            return {"issue_key": issue_key, "error": "Could not load issue data."}
+
+
+@router.post("/issues/batch")
+async def issue_batch(payload: IssueBatchRequest) -> dict[str, Any]:
+    """Load a bounded set of issues with one scoped, concurrency-limited call."""
+    keys = [str(key).strip().upper() for key in payload.issue_keys]
+    if any(not re.fullmatch(r"[A-Z][A-Z0-9]+-\d+", key) for key in keys):
+        raise _safe_http_error(ValueError("issue_keys must contain valid Jira issue keys."))
+    keys = list(dict.fromkeys(keys))
+    if not keys or len(keys) > MAX_BATCH_ISSUES:
+        raise _safe_http_error(ValueError(f"issue_keys must contain between 1 and {MAX_BATCH_ISSUES} issue keys."))
+    try:
+        owner = _validate_active_owner(
+            payload.profile_name,
+            payload.connection_id,
+            payload.target_profile,
+        )
+        client = _client()
+        store = _store() if payload.include_links else None
+        semaphore = asyncio.Semaphore(MAX_BATCH_CONCURRENCY)
+        items = await asyncio.gather(*(
+            _load_issue_batch_item(
+                client,
+                store,
+                issue_key,
+                include_transitions=payload.include_transitions,
+                include_links=payload.include_links,
+                include_details=payload.include_details,
+                owner=owner,
+                semaphore=semaphore,
+            )
+            for issue_key in keys
+        ))
+        return {
+            "items": items,
+            "bounded": True,
+            "max_items": MAX_BATCH_ISSUES,
+            "requested_items": len(keys),
+        }
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise _safe_http_error(exc, status_code=502) from exc
+
+
+def _bounded_context_text(value: Any, limit: int) -> str:
+    return str(value or "").strip()[:limit]
+
+
+def _bounded_context_size(value: Any) -> int:
+    try:
+        return max(0, int(value or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _bounded_chat_context(issue: dict[str, Any], link: dict[str, Any]) -> dict[str, Any]:
+    comments_raw: list[Any] = []
+    attachments_raw: list[Any] = []
+    raw_comments = issue.get("comments")
+    raw_attachments = issue.get("attachments")
+    if isinstance(raw_comments, list):
+        comments_raw = raw_comments
+    if isinstance(raw_attachments, list):
+        attachments_raw = raw_attachments
+    comments = [comment for comment in comments_raw if isinstance(comment, dict)][:MAX_CHAT_CONTEXT_COMMENTS]
+    attachments = [attachment for attachment in attachments_raw if isinstance(attachment, dict)][:MAX_CHAT_CONTEXT_ATTACHMENTS]
+    return {
+        "session_id": _bounded_context_text(link.get("session_id"), MAX_CHAT_CONTEXT_SESSION_ID_CHARS),
+        "issue_id": _bounded_context_text(link.get("issue_id"), 200),
+        "issue_key": _bounded_context_text(issue.get("key") or link.get("issue_key"), 100),
+        "title": _bounded_context_text(issue.get("summary"), MAX_CHAT_CONTEXT_SUMMARY_CHARS),
+        "summary": _bounded_context_text(issue.get("summary"), MAX_CHAT_CONTEXT_SUMMARY_CHARS),
+        "status": _bounded_context_text(issue.get("status"), MAX_CHAT_CONTEXT_STATUS_CHARS),
+        "status_category": _bounded_context_text(issue.get("status_category"), MAX_CHAT_CONTEXT_STATUS_CHARS),
+        "comments": [
+            {
+                "id": _bounded_context_text(comment.get("id"), 100),
+                "body": _bounded_context_text(comment.get("body"), MAX_CHAT_CONTEXT_COMMENT_CHARS),
+            }
+            for comment in comments[:MAX_CHAT_CONTEXT_COMMENTS]
+            if isinstance(comment, dict)
+        ],
+        "attachments": [
+            {
+                "id": _bounded_context_text(attachment.get("id"), 100),
+                "filename": _bounded_context_text(attachment.get("filename"), MAX_CHAT_CONTEXT_ATTACHMENT_NAME_CHARS),
+                "mime_type": _bounded_context_text(attachment.get("mime_type"), MAX_CHAT_CONTEXT_ATTACHMENT_MIME_CHARS),
+                "size": _bounded_context_size(attachment.get("size")),
+            }
+            for attachment in attachments[:MAX_CHAT_CONTEXT_ATTACHMENTS]
+            if isinstance(attachment, dict)
+        ],
+    }
+
+
+@router.get("/links/session/{session_id}/context")
+async def focused_session_context(
+    session_id: str,
+    profile_name: str = "",
+    connection_id: str = "",
+    target_profile: str = "",
+) -> dict[str, Any]:
+    """Read one exact owner-qualified Jira link for native chat context."""
+    values = (session_id.strip(), profile_name.strip(), connection_id.strip(), target_profile.strip())
+    limits = (
+        MAX_CHAT_CONTEXT_SESSION_ID_CHARS,
+        MAX_CHAT_CONTEXT_PROFILE_CHARS,
+        MAX_CHAT_CONTEXT_CONNECTION_CHARS,
+        MAX_CHAT_CONTEXT_PROFILE_CHARS,
+    )
+    if not all(values) or any(len(value) > limit for value, limit in zip(values, limits)):
+        return {"available": False, "reason": "owner_required"}
+    try:
+        _validate_active_owner(profile_name, connection_id, target_profile)
+    except ValueError:
+        return {"available": False, "reason": "owner_unavailable"}
+    try:
+        client = await asyncio.to_thread(_client)
+        origin = SERVICE.JiraStore._normalize_jira_origin(client.config.base_url)
+        store = _store()
+        link = await asyncio.to_thread(
+            store.link_for_session_owner,
+            session_id=session_id,
+            jira_origin=origin,
+            connection_id=connection_id,
+            profile_name=profile_name,
+            target_profile=target_profile,
+        )
+        if not isinstance(link, dict):
+            return {"available": False, "reason": "no_exact_link"}
+        issue_key = str(link.get("issue_key") or "").strip().upper()
+        if not re.fullmatch(r"[A-Z][A-Z0-9]+-\d+", issue_key):
+            return {"available": False, "reason": "invalid_link"}
+        issue = await asyncio.to_thread(client.issue, issue_key)
+        if (
+            str(issue.get("id") or "") != str(link.get("issue_id") or "")
+            or str(issue.get("key") or "").strip().upper() != issue_key
+        ):
+            return {"available": False, "reason": "issue_mismatch"}
+        context = _bounded_chat_context(issue, link)
+        context["issue_url"] = f"{origin}/browse/{urllib.parse.quote(issue_key, safe='-')}"
+        return {"available": True, "context": context}
+    except Exception as exc:
+        raise _safe_http_error(exc, status_code=502) from exc
 
 
 @router.get("/status")
@@ -377,7 +600,7 @@ async def issue_links(
     target_profile: str,
 ) -> dict[str, Any]:
     try:
-        profile_name, connection_id = _validate_active_owner(
+        profile_name, connection_id, target_profile = _validate_active_owner(
             profile_name,
             connection_id,
             target_profile,
@@ -434,7 +657,7 @@ async def unlink_session(
     target_profile: str,
 ) -> dict[str, bool]:
     try:
-        profile_name, connection_id = _validate_active_owner(
+        profile_name, connection_id, target_profile = _validate_active_owner(
             profile_name,
             connection_id,
             target_profile,
@@ -461,7 +684,7 @@ async def unlink_session(
 @router.post("/links")
 async def link_session(payload: SessionLinkRequest) -> dict[str, Any]:
     try:
-        profile_name, connection_id = _validate_active_owner(
+        profile_name, connection_id, target_profile = _validate_active_owner(
             payload.profile_name,
             payload.connection_id,
             payload.target_profile,

@@ -546,6 +546,26 @@ def _validate_comment_response(payload: Any) -> Mapping[str, Any]:
         raise JiraAmbiguousError(invalid_response) from exc
 
 
+def _validate_transition_response(payload: Any, transition_id: str) -> None:
+    """Accept Jira's empty 204 body or a response that names the transition."""
+    invalid_response = "Jira returned an invalid transition response; the write outcome is unknown."
+    if not isinstance(payload, Mapping):
+        raise JiraAmbiguousError(invalid_response)
+    if not payload:
+        # An empty body is success only when the transport preserved Jira's
+        # explicit no-content status. A JSON `{}` on a normal 2xx response is
+        # not evidence that the transition was applied.
+        if getattr(payload, "status_code", None) == 204:
+            return
+        raise JiraAmbiguousError(invalid_response)
+    transition = payload.get("transition")
+    if isinstance(transition, Mapping) and str(transition.get("id") or "").strip() == transition_id:
+        return
+    if str(payload.get("transition_id") or "").strip() == transition_id:
+        return
+    raise JiraAmbiguousError(invalid_response)
+
+
 def _normalise_issue(issue: Mapping[str, Any], *, detail: bool = False) -> dict[str, Any]:
     fields = issue.get("fields") if isinstance(issue.get("fields"), Mapping) else {}
     status = fields.get("status") if isinstance(fields.get("status"), Mapping) else {}
@@ -737,6 +757,14 @@ class NoJiraRedirects(urllib.request.HTTPRedirectHandler):
         raise RuntimeError("Jira redirect refused to protect the configured credentials.")
 
 
+class JiraResponse(dict[str, Any]):
+    """JSON object with the HTTP status retained for write validation."""
+
+    def __init__(self, payload: Mapping[str, Any], *, status_code: int | None):
+        super().__init__(payload)
+        self.status_code = status_code
+
+
 class JiraClient:
     def __init__(self, config: JiraConfig, *, timeout: int = 20):
         self.config = config
@@ -749,7 +777,7 @@ class JiraClient:
         *,
         method: str = "GET",
         body: Mapping[str, Any] | None = None,
-    ) -> dict[str, Any]:
+    ) -> JiraResponse:
         try:
             query = urllib.parse.urlencode({key: value for key, value in (params or {}).items() if value is not None})
             url = f"{self.config.base_url}{path}{'?' + query if query else ''}"
@@ -780,6 +808,13 @@ class JiraClient:
                 raw = response.read(MAX_JIRA_JSON_BYTES + 1)
                 if len(raw) > MAX_JIRA_JSON_BYTES:
                     raise JiraAmbiguousError("Jira returned a response that is too large.")
+                status_code = getattr(response, "status", None)
+                if status_code is None and callable(getattr(response, "getcode", None)):
+                    status_code = response.getcode()
+                try:
+                    status_code = int(status_code) if status_code is not None else None
+                except (TypeError, ValueError):
+                    status_code = None
                 payload = json.loads(raw.decode("utf-8")) if raw else {}
         except urllib.error.HTTPError as exc:
             if 400 <= exc.code < 500:
@@ -797,7 +832,7 @@ class JiraClient:
             raise JiraAmbiguousError("Jira returned an invalid or timed-out response; the write outcome is unknown.") from exc
         if not isinstance(payload, dict):
             raise JiraAmbiguousError("Jira returned an invalid response; the write outcome is unknown.")
-        return payload
+        return JiraResponse(payload, status_code=status_code)
 
     def _request_bytes(
         self,
@@ -879,6 +914,14 @@ class JiraClient:
         result["comments"] = comments
         result["comments_truncated"] = total > len(comments)
         return result
+
+    def issue_summary(self, issue_key: str) -> dict[str, Any]:
+        """Load only bounded board fields without paginating comment history."""
+        safe_key = urllib.parse.quote(issue_key.strip(), safe="-")
+        if not safe_key:
+            raise ValueError("issue_key is required")
+        payload = self._request(f"/rest/api/3/issue/{safe_key}", {"fields": SEARCH_FIELDS})
+        return _normalise_issue(payload)
 
     def attachments(self, issue_key: str) -> list[dict[str, Any]]:
         safe_key = urllib.parse.quote(issue_key.strip(), safe="-")
@@ -981,11 +1024,12 @@ class JiraClient:
             raise ValueError("issue_key is required")
         if not transition or len(transition) > 100:
             raise ValueError("A valid transition id is required.")
-        self._request(
+        payload = self._request(
             f"/rest/api/3/issue/{safe_key}/transitions",
             method="POST",
             body={"transition": {"id": transition}},
         )
+        _validate_transition_response(payload, transition)
         return {"transition_id": transition}
 
 
@@ -1378,7 +1422,7 @@ class JiraStore:
                             (issue_id, issue_key, jira_origin, connection_id, profile_name,
                              target_profile, session_id, project_id, worktree_path, branch,
                              detached, created_at)
-                        SELECT issue_id, issue_key, '', 'local', 'default', 'default',
+                        SELECT issue_id, issue_key, '', '', '', '',
                                session_id, project_id, worktree_path, branch, 0, created_at
                         FROM session_links_legacy
                         """
@@ -1468,10 +1512,10 @@ class JiraStore:
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 issue_id TEXT NOT NULL,
                 issue_key TEXT NOT NULL,
-                jira_origin TEXT NOT NULL DEFAULT '',
-                connection_id TEXT NOT NULL DEFAULT 'local',
-                profile_name TEXT NOT NULL DEFAULT 'default',
-                target_profile TEXT NOT NULL DEFAULT 'default',
+                jira_origin TEXT NOT NULL,
+                connection_id TEXT NOT NULL,
+                profile_name TEXT NOT NULL,
+                target_profile TEXT NOT NULL,
                 session_id TEXT NOT NULL,
                 project_id TEXT,
                 worktree_path TEXT,
@@ -1774,6 +1818,37 @@ class JiraStore:
                 (issue, origin, connection, profile, target),
             ).fetchall()
         return [dict(row) for row in rows]
+
+    def link_for_session_owner(
+        self,
+        *,
+        session_id: str,
+        jira_origin: str,
+        connection_id: str,
+        profile_name: str,
+        target_profile: str,
+    ) -> dict[str, Any] | None:
+        session = session_id.strip()
+        if not session:
+            raise ValueError("Session id is required for link reads.")
+        origin, connection, profile, target = self._normalize_read_owner(
+            jira_origin,
+            connection_id,
+            profile_name,
+            target_profile,
+        )
+        with self._connect() as db:
+            row = db.execute(
+                """
+                SELECT * FROM session_links
+                WHERE session_id = ? AND jira_origin = ? AND connection_id = ?
+                  AND profile_name = ? AND target_profile = ? AND detached = 0
+                ORDER BY created_at DESC
+                LIMIT 1
+                """,
+                (session, origin, connection, profile, target),
+            ).fetchone()
+        return dict(row) if row else None
 
     def detached_session_ids(
         self,

@@ -97,7 +97,7 @@ class DesktopPluginTests(unittest.TestCase):
         self.assertIn("const [detectedLanes, setDetectedLanes]", source)
         self.assertIn("Promise.all(laneProbeKeys.map", source)
         self.assertIn("/transitions`)", source)
-        self.assertIn("writeLaneCache(projectKeys, lanes)", source)
+        self.assertIn("writeLaneCache(projectKeys, lanes, status?.base_url)", source)
         self.assertIn("for (const lane of detectedLanes)", source)
 
     def test_cards_show_cached_linked_work_state(self):
@@ -105,7 +105,7 @@ class DesktopPluginTests(unittest.TestCase):
 
         self.assertIn("const WORK_STATE_CACHE_KEY = 'ticket-work-state-cache-v1'", source)
         self.assertIn("const [workStates, setWorkStates]", source)
-        self.assertIn("api(`/links/${encodeURIComponent(issue.id)}`)", source)
+        self.assertIn("issueLinksPath(issue.id, owner)", source)
         self.assertIn("workState: workStates[issue.key]", source)
         self.assertIn("Linked work", source)
 
@@ -315,10 +315,14 @@ class DesktopPluginTests(unittest.TestCase):
     def test_session_link_identity_includes_connection_and_profile_owner(self):
         source = PLUGIN.read_text(encoding="utf-8")
 
+        self.assertIn("function linkId(link)", source)
         self.assertIn("function sessionLinkIdentity", source)
         self.assertIn("owner.connectionId", source)
         self.assertIn("owner.profileName", source)
-        self.assertIn("return `${owner.connectionId}::${owner.profileName}::${owner.targetProfile}::${sessionId}`", source)
+        self.assertIn("const connectionId = String(owner.connectionId || owner.connection_id || '').trim()", source)
+        self.assertIn("const profileName = String(owner.profileName || owner.profile_name || owner.profile || '').trim()", source)
+        self.assertIn("const targetProfile = String(owner.targetProfile || owner.target_profile || '').trim()", source)
+        self.assertIn("return `${connectionId}::${profileName}::${targetProfile}::${sessionId}`", source)
         self.assertIn("sessionLinkIdentity(link)", source)
         self.assertIn("`${link.issue_id}:${sessionLinkIdentity(link)}`", source)
 
@@ -374,7 +378,10 @@ class DesktopPluginTests(unittest.TestCase):
         self.assertIn("clear_detachment: false", source)
         self.assertIn("writeChatDetached(issue.key, linkCandidate, false, status?.base_url)", source)
         self.assertIn("if (!owner) throw new Error('The focused chat owner is ambiguous or unavailable.')", source)
-        self.assertIn("if (!link?.connection_id || !link?.profile_name) return null", source)
+        owner = source[source.index("function ownerFromLink"):source.index("function ownerFromRoute")]
+        self.assertIn("const rawTargetProfile = link?.target_profile ?? link?.targetProfile", owner)
+        self.assertIn("if (!connectionId || !profileName || !targetProfile) return null", owner)
+        self.assertNotIn("|| profileName).trim() || profileName", owner)
 
     def test_focused_profile_fallback_is_ambient_verified_and_fail_closed(self):
         source = PLUGIN.read_text(encoding="utf-8")
@@ -511,13 +518,22 @@ class DesktopPluginTests(unittest.TestCase):
         self.assertEqual(sum("clear_detachment: false" in write for write in writes), 1)
         self.assertIn("new URLSearchParams({ connection_id: owner.connectionId, profile_name: owner.profileName, target_profile: owner.targetProfile })", source)
 
+    def test_issue_link_reads_require_the_active_owner_query(self):
+        source = PLUGIN.read_text(encoding="utf-8")
+        self.assertIn("function readActiveOwner()", source)
+        self.assertIn("function issueLinksPath(issueId, owner)", source)
+        self.assertIn("new URLSearchParams(sessionOwnerFields(owner))", source)
+        self.assertGreaterEqual(source.count("issueLinksPath("), 4)
+
     def test_detached_local_keys_are_scoped_by_jira_origin_and_full_owner(self):
         source = PLUGIN.read_text(encoding="utf-8")
         detached = source[source.index("function normaliseJiraOrigin"):source.index("function linkAvailability")]
 
         self.assertIn("function detachedChatStorageKey(issueKey, jiraOrigin, link)", detached)
         self.assertIn("const origin = normaliseJiraOrigin(jiraOrigin)", detached)
-        self.assertIn("owner.connectionId, owner.profileName, owner.targetProfile", detached)
+        self.assertIn("owner?.connectionId", detached)
+        self.assertIn("owner?.profileName", detached)
+        self.assertIn("owner?.targetProfile", detached)
         self.assertIn("encodeURIComponent", detached)
         self.assertIn("writeChatDetached(issue.key, link, true, status?.base_url)", source)
         self.assertIn("readDetachedChatIds(issue.key, status?.base_url, owner)", source)

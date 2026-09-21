@@ -2,7 +2,9 @@ import {
   Badge,
   Button,
   Codicon,
+  COMPOSER_AREAS,
   EmptyState,
+  queryClient,
   GlyphSpinner,
 
   Loader,
@@ -50,6 +52,421 @@ const BOARD_MIN_WIDTH = 320
 
 let pluginContext = null
 const companionDisposers = new Map()
+
+const LIVE_STATUS_NOTIFICATIONS_KEY = 'live-status-notifications-v1'
+const LIVE_STATUS_RECEIPTS_KEY = 'live-status-notification-receipts-v1'
+const MAX_LIVE_NOTIFICATION_RECEIPTS = 128
+let liveStatusSnapshot = { context: { links: [], selectedKey: '', title: '' }, entries: [], notificationsEnabled: false }
+const liveStatusSubscribers = new Set()
+let liveStatusTimer = null
+let liveStatusGeneration = 0
+let liveStatusRefreshing = false
+const liveEventStates = new Map()
+
+function emitLiveStatus(snapshot) {
+  liveStatusSnapshot = snapshot
+  for (const listener of liveStatusSubscribers) {
+    try { listener(snapshot) } catch { /* presentation listeners are best effort */ }
+  }
+}
+
+function subscribeLiveStatus(listener) {
+  liveStatusSubscribers.add(listener)
+  listener(liveStatusSnapshot)
+  return () => liveStatusSubscribers.delete(listener)
+}
+
+function liveStatusText(value) {
+  return String(value ?? '').trim().toLowerCase()
+}
+
+function liveStatusLabel(state) {
+  return {
+    archived: 'Archived',
+    failed: 'Failed',
+    idle: 'Idle',
+    starting: 'Starting',
+    waiting: 'Needs input',
+    working: 'Working'
+  }[state] || 'Idle'
+}
+
+function liveStatusPriority(state) {
+  return { failed: 5, waiting: 4, working: 3, starting: 2, idle: 1, archived: 0 }[state] || 0
+}
+
+function liveStateFor(link, row, eventState = '') {
+  if (link?.archived || row?.archived) return 'archived'
+  const values = [eventState, row?.status, row?.state].map(liveStatusText).filter(Boolean)
+  if (row?.failed === true || values.some(value => ['failed', 'error', 'errored', 'interrupted', 'cancelled', 'canceled'].includes(value))) return 'failed'
+  if (values.some(value => ['needs-input', 'needs_input', 'waiting', 'awaiting-input', 'approval'].includes(value))) return 'waiting'
+  if (values.some(value => ['starting', 'queued', 'connecting', 'initializing', 'resuming'].includes(value))) return 'starting'
+  if (row?.busy === true || values.some(value => ['working', 'running', 'busy', 'streaming'].includes(value))) return 'working'
+  return 'idle'
+}
+
+function liveEventState(value) {
+  const raw = liveStatusText(value)
+  if (!raw) return ''
+  if (raw.includes('fail') || raw.includes('error') || raw.includes('interrupt') || raw.includes('cancel')) return 'failed'
+  if (raw.includes('wait') || raw.includes('approval') || raw.includes('needs-input') || raw.includes('needs_input')) return 'waiting'
+  if (raw.includes('start') || raw.includes('queue') || raw.includes('connect') || raw.includes('resum')) return 'starting'
+  if (
+    raw.includes('complete')
+      || raw.includes('finish')
+      || raw === 'done'
+      || raw.endsWith('.done')
+      || raw === 'idle'
+      || raw.includes('success')
+  ) return 'idle'
+  return 'working'
+}
+
+function liveRowIds(row) {
+  return [row?.session_key, row?.stored_session_id, row?.storedSessionId, row?.session_id, row?.sessionId, row?.id]
+    .map(value => String(value || '').trim())
+    .filter(Boolean)
+}
+
+function liveLinkId(link) {
+  return String(link?.session_id || link?.stored_session_id || link?.storedSessionId || link?.sessionId || '').trim()
+}
+
+function liveOwnerKey(owner) {
+  return [owner?.connectionId, owner?.profileName, owner?.targetProfile].map(value => String(value || '')).join('::')
+}
+
+function liveOwnerFromLink(link) {
+  const connectionId = String(link?.connection_id || link?.connectionId || '').trim()
+  const profileName = String(link?.profile_name || link?.profileName || link?.profile || '').trim()
+  const targetProfile = String(link?.target_profile || link?.targetProfile || '').trim()
+  if (!connectionId || !profileName || !targetProfile) return null
+  return { connectionId, profileName, targetProfile }
+}
+
+function liveNotificationEnabled() {
+  try { return Boolean(pluginContext?.storage?.get(LIVE_STATUS_NOTIFICATIONS_KEY, false)) } catch { return false }
+}
+
+function setLiveNotificationEnabled(value) {
+  try { pluginContext?.storage?.set(LIVE_STATUS_NOTIFICATIONS_KEY, Boolean(value)) } catch { /* optional storage */ }
+  emitLiveStatus({ ...liveStatusSnapshot, notificationsEnabled: Boolean(value) })
+}
+
+function liveNotificationReceipts() {
+  try {
+    const stored = pluginContext?.storage?.get(LIVE_STATUS_RECEIPTS_KEY, [])
+    return new Set(Array.isArray(stored) ? stored.map(value => String(value).slice(0, 512)) : [])
+  } catch {
+    return new Set()
+  }
+}
+
+function saveLiveNotificationReceipts(receipts) {
+  try {
+    pluginContext?.storage?.set(LIVE_STATUS_RECEIPTS_KEY, [...receipts].slice(-MAX_LIVE_NOTIFICATION_RECEIPTS))
+  } catch {
+    // Notifications remain best effort when persistence is unavailable.
+  }
+}
+
+function liveEntryKey(entry) {
+  return `${entry?.ownerKey || 'unavailable'}::${liveLinkId(entry?.link)}`
+}
+
+function notifyLiveTransition(previous, current) {
+  if (!liveNotificationEnabled() || !previous || !current || previous.state === current.state) return
+  const state = String(current.state || '').trim()
+  const previousState = String(previous.state || '').trim()
+  const wasActive = ['starting', 'working'].includes(previousState)
+  const kind = wasActive && state === 'waiting' ? 'warning' : wasActive && state === 'idle' ? 'success' : ''
+  if (!kind || typeof host.notify !== 'function') return
+  const activityKey = String(current.activityKey || previous.activityKey || 'unknown').slice(0, 256)
+  const token = `${liveEntryKey(current)}::${activityKey}::${state}`
+  const receipts = liveNotificationReceipts()
+  if (receipts.has(token)) return
+  receipts.add(token)
+  saveLiveNotificationReceipts(receipts)
+  const ticket = String(current.ticketKey || current.ticketLabel || 'Jira ticket').trim().slice(0, 120)
+  const message = state === 'waiting' ? `${ticket} needs input from the active chat.` : `${ticket} work completed.`
+  host.notify({ kind, message })
+  try {
+    const activation = current.ticketKey ? jiraRoute(current.ticketKey) : ROUTE
+    const result = pluginContext?.os?.notify?.({ title: 'Jira Browser', body: message, activate: activation })
+    if (result && typeof result.catch === 'function') void result.catch(() => undefined)
+  } catch {
+    // Native notifications are optional; the in-app toast above is canonical.
+  }
+}
+
+async function refreshLiveStatuses() {
+  if (!pluginContext || liveStatusRefreshing) return
+  const generation = ++liveStatusGeneration
+  liveStatusRefreshing = true
+  try {
+    const links = Array.isArray(liveStatusSnapshot.context?.links) ? liveStatusSnapshot.context.links : []
+    const routes = new Map()
+    for (const link of links) {
+      const owner = liveOwnerFromLink(link)
+      if (owner) routes.set(liveOwnerKey(owner), owner)
+    }
+    const activeRows = new Map()
+    const availableOwners = new Set()
+    await Promise.all([...routes.values()].map(async owner => {
+      try {
+        const route = await resolveSessionRoute(owner, { matchTarget: true })
+        const result = await host.requestProfile(route, 'session.active_list', { profile: route.targetProfile || route.profile })
+        availableOwners.add(liveOwnerKey(owner))
+        for (const row of Array.isArray(result?.sessions) ? result.sessions : []) {
+          for (const id of liveRowIds(row)) activeRows.set(`${liveOwnerKey(owner)}::${id}`, row)
+        }
+      } catch {
+        // An unavailable route becomes a failed presentation below.
+      }
+    }))
+    if (generation !== liveStatusGeneration) return
+    const previousEntries = new Map((Array.isArray(liveStatusSnapshot.entries) ? liveStatusSnapshot.entries : []).map(entry => [liveEntryKey(entry), entry]))
+    const entries = links.map(link => {
+      const owner = liveOwnerFromLink(link)
+      const ownerKey = owner ? liveOwnerKey(owner) : 'unavailable'
+      const id = liveLinkId(link)
+      const active = owner ? activeRows.get(`${ownerKey}::${id}`) || null : null
+      const eventState = liveEventStates.get(`${ownerKey}::${id}`) || ''
+      const state = owner && availableOwners.has(ownerKey) ? liveStateFor(link, active, eventState) : 'failed'
+      const activityKey = String(
+        active?.started_at || active?.startedAt || active?.created_at || active?.createdAt || active?.updated_at || active?.updatedAt || ''
+      ).trim().slice(0, 256)
+      return {
+        link,
+        owner,
+        ownerKey,
+        state,
+        activityKey,
+        ticketKey: String(link?.ticketKey || '').trim(),
+        ticketLabel: String(liveStatusSnapshot.context?.title || liveStatusSnapshot.context?.selectedKey || 'Jira ticket').trim()
+      }
+    })
+    for (const entry of entries) notifyLiveTransition(previousEntries.get(liveEntryKey(entry)), entry)
+    emitLiveStatus({ ...liveStatusSnapshot, entries, refreshedAt: Date.now(), notificationsEnabled: liveNotificationEnabled() })
+  } finally {
+    liveStatusRefreshing = false
+  }
+}
+
+function subscribeLiveStatuses(listener) {
+  return subscribeLiveStatus(listener)
+}
+
+function publishJiraContext(context = {}) {
+  emitLiveStatus({
+    ...liveStatusSnapshot,
+    context: {
+      links: Array.isArray(context.links) ? context.links.map(link => ({ ...link })) : [],
+      selectedKey: String(context.selectedKey || '').trim(),
+      title: String(context.title || '').trim()
+    }
+  })
+  void refreshLiveStatuses()
+}
+
+function LiveStatusContribution({ titlebar = false }) {
+  const [snapshot, setSnapshot] = useState(liveStatusSnapshot)
+  useEffect(() => subscribeLiveStatus(setSnapshot), [])
+  const entries = Array.isArray(snapshot.entries) ? snapshot.entries : []
+  const selectedKey = String(snapshot.context?.selectedKey || '').trim()
+  const entry = entries
+    .filter(candidate => !selectedKey || candidate.ticketKey === selectedKey)
+    .sort((left, right) => liveStatusPriority(right.state) - liveStatusPriority(left.state))[0]
+  const label = selectedKey ? `${selectedKey}${entry ? ` · ${liveStatusLabel(entry.state)}` : ''}` : 'Jira'
+  return jsx('button', {
+    'aria-label': `Open Jira${selectedKey ? ` ${selectedKey}` : ''}`,
+    className: titlebar
+      ? 'inline-flex h-7 max-w-80 items-center gap-1.5 rounded px-2 text-xs text-(--ui-text-tertiary) transition-colors hover:bg-(--chrome-action-hover) hover:text-foreground'
+      : 'inline-flex h-full min-w-0 items-center gap-1 rounded-none px-1.5 text-[0.6875rem] text-(--ui-text-tertiary) transition-colors hover:bg-(--chrome-action-hover) hover:text-foreground',
+    onClick: () => host.navigate(selectedKey ? jiraRoute(selectedKey) : ROUTE),
+    title: snapshot.notificationsEnabled ? 'Jira live notifications on' : 'Jira live notifications off',
+    type: 'button',
+    children: [jsx(Codicon, { name: 'issues', size: titlebar ? '0.8rem' : '0.75rem' }), jsx('span', { className: 'truncate', children: label })]
+  })
+}
+
+function focusedChatContextPath() {
+  const sessionId = String(host.state?.focusedStoredSessionId?.get?.() || '').trim()
+  const owner = readFocusedSessionOwner()
+  if (!sessionId || !owner) return ''
+  const params = new URLSearchParams({
+    profile_name: owner.profileName,
+    connection_id: owner.connectionId,
+    target_profile: owner.targetProfile
+  })
+  return `/links/session/${encodeURIComponent(sessionId)}/context?${params.toString()}`
+}
+
+async function readFocusedChatContext() {
+  const path = focusedChatContextPath()
+  if (!path) return null
+  const result = await api(path)
+  return result?.available && result.context ? result.context : null
+}
+
+function safeChatContextText(value, limit) {
+  return String(value || '').trim().slice(0, limit)
+}
+
+function JiraChatContextStrip() {
+  const [context, setContext] = useState(null)
+  useEffect(() => {
+    let alive = true
+    const refresh = async () => {
+      try {
+        const next = await readFocusedChatContext()
+        if (alive) setContext(next)
+      } catch {
+        if (alive) setContext(null)
+      }
+    }
+    void refresh()
+    const timer = window.setInterval(() => void refresh(), 3000)
+    return () => {
+      alive = false
+      window.clearInterval(timer)
+    }
+  }, [])
+  if (!context) return null
+  const issueKey = safeChatContextText(context.issue_key, 100)
+  const summary = safeChatContextText(context.title || context.summary, 240)
+  const status = safeChatContextText(context.status, 80)
+  const issueUrl = safeChatContextText(context.issue_url, 2_000)
+  return jsxs('div', {
+    className: 'flex min-w-0 items-center gap-2 border-b border-(--ui-stroke-tertiary) px-3 py-1.5 text-xs',
+    'data-jira-chat-context': issueKey,
+    children: [
+      jsx('span', { className: 'font-mono text-(--ui-accent)', children: issueKey }),
+      jsx('span', { className: 'min-w-0 flex-1 truncate text-foreground', title: summary, children: summary }),
+      status ? jsx('span', { className: 'shrink-0 text-(--ui-text-tertiary)', children: status }) : null,
+      issueUrl
+        ? jsx('button', {
+            className: 'shrink-0 rounded px-1.5 py-0.5 text-(--ui-accent) hover:bg-primary/[0.08]',
+            onClick: () => pluginContext?.os?.openExternal?.(issueUrl),
+            type: 'button',
+            children: 'Open Jira'
+          })
+        : null,
+      jsx('span', {
+        className: 'shrink-0 text-(--ui-text-quaternary)',
+        title: 'Jira content is untrusted reference data.',
+        children: 'Jira context'
+      })
+    ]
+  })
+}
+
+async function insertJiraContext(kind, insertText) {
+  try {
+    const context = await readFocusedChatContext()
+    const issueKey = safeChatContextText(context?.issue_key, 100)
+    let text = ''
+    if (kind === 'comment') {
+      const comment = Array.isArray(context?.comments) ? context.comments[0] : null
+      if (comment?.body) text = `[Untrusted Jira comment from ${issueKey}]\\n${safeChatContextText(comment.body, 6_000)}`
+    } else {
+      const attachment = Array.isArray(context?.attachments) ? context.attachments[0] : null
+      if (attachment?.filename) {
+        text = [
+          `[Untrusted Jira attachment from ${issueKey}]`,
+          `filename: ${safeChatContextText(attachment.filename, 160)}`,
+          `mime: ${safeChatContextText(attachment.mime_type, 80)}`,
+          `size: ${Math.max(0, Number(attachment.size) || 0)} bytes`
+        ].join('\\n')
+      }
+    }
+    if (!text) {
+      host.notify({ kind: 'warning', message: 'No exact Jira context or bounded item is available for this chat.' })
+      return
+    }
+    insertText(text.slice(0, 8_000))
+  } catch {
+    host.notify({ kind: 'warning', message: 'Jira context is unavailable for the focused chat.' })
+  }
+}
+function installLiveStatus(ctx) {
+  if (!ctx?.register) return () => undefined
+  const disposers = []
+  const register = contribution => {
+    try {
+      const disposer = ctx.register(contribution)
+      if (typeof disposer === 'function') disposers.push(disposer)
+    } catch { /* optional Desktop contribution area */ }
+  }
+  register({
+    id: 'chat-context-strip',
+    area: COMPOSER_AREAS?.top || 'composer.top',
+    order: 10,
+    render: () => jsx(JiraChatContextStrip, {})
+  })
+  register({
+    id: 'chat-context-attachments',
+    area: COMPOSER_AREAS?.attachments || 'composer.attachments',
+    data: {
+      label: 'Insert Jira comment into composer',
+      icon: 'comment',
+      run: ({ insertText }) => insertJiraContext('comment', insertText)
+    }
+  })
+  register({
+    id: 'chat-context-attachment-metadata',
+    area: COMPOSER_AREAS?.attachments || 'composer.attachments',
+    data: {
+      label: 'Insert Jira attachment metadata into composer',
+      icon: 'file',
+      run: ({ insertText }) => insertJiraContext('attachment', insertText)
+    }
+  })
+  register({ id: 'live-status', area: 'statusBar.right', order: 135, render: () => jsx(LiveStatusContribution, {}) })
+  register({ id: 'live-status-titlebar', area: 'titleBar.center', order: 120, render: () => jsx(LiveStatusContribution, { titlebar: true }) })
+  register({
+    id: 'toggle-live-notifications',
+    area: PALETTE_AREA || 'palette',
+    data: {
+      id: 'jira-browser.toggle-live-notifications',
+      label: 'Toggle Jira live notifications',
+      keywords: ['jira', 'notifications', 'completed', 'needs input'],
+      run: () => setLiveNotificationEnabled(!liveNotificationEnabled())
+    }
+  })
+  register({
+    id: 'live-open-jira-keybind',
+    area: 'keybinds',
+    data: { id: 'jira-browser.open', category: 'navigation', defaults: ['mod+shift+j'], label: 'Open Jira Browser', run: () => host.navigate(ROUTE) }
+  })
+  if (typeof host.onEvent === 'function') {
+    const disposer = host.onEvent('*', event => {
+      const owner = liveOwnerFromLink(event?.owner || event?.route || event?.payload?.owner || event?.payload?.route || event)
+      const storedId = String(event?.payload?.session_key || event?.payload?.stored_session_id || event?.session_key || '').trim()
+      if (owner && storedId) {
+        const raw = event?.payload?.status || event?.payload?.state || event?.status || event?.state || event?.type
+        const state = liveEventState(raw)
+        if (state) liveEventStates.set(`${liveOwnerKey(owner)}::${storedId}`, state)
+        void refreshLiveStatuses()
+      }
+    })
+    if (typeof disposer === 'function') disposers.push(disposer)
+  }
+  liveStatusTimer = window.setInterval(() => void refreshLiveStatuses(), 3000)
+  void refreshLiveStatuses()
+  const dispose = () => {
+    if (liveStatusTimer !== null) window.clearInterval(liveStatusTimer)
+    liveStatusTimer = null
+    liveStatusGeneration += 1
+    liveEventStates.clear()
+    for (const disposer of disposers) {
+      try { disposer() } catch { /* best effort */ }
+    }
+    emitLiveStatus({ context: { links: [], selectedKey: '', title: '' }, entries: [], notificationsEnabled: false })
+  }
+  if (typeof ctx.onDispose === 'function') ctx.onDispose(dispose)
+  return dispose
+}
 
 function errorText(error, fallback = 'Something went wrong.') {
   if (error && typeof error.message === 'string' && error.message.trim()) return error.message.trim()
@@ -185,6 +602,74 @@ async function api(path, options) {
   return pluginContext.rest(path, options)
 }
 
+const MAX_BATCH_ISSUES = 50
+
+async function fetchIssueBatch(issueKeys, options = {}) {
+  const rawKeys = (Array.isArray(issueKeys) ? issueKeys : [])
+    .map(key => String(key || '').trim().toUpperCase())
+  if (rawKeys.some(key => !ISSUE_KEY_PATTERN.test(key))) throw new Error('Invalid Jira issue key in batch request.')
+  const keys = [...new Set(rawKeys)]
+  const chunks = []
+  for (let index = 0; index < keys.length; index += MAX_BATCH_ISSUES) chunks.push(keys.slice(index, index + MAX_BATCH_ISSUES))
+  if (chunks.length === 0) return { items: [], bounded: true, max_items: MAX_BATCH_ISSUES }
+  const owner = options.owner || readActiveOwner()
+  if (!owner) throw new Error('Jira link owner is unavailable.')
+  const connectionId = String(options.connectionId || owner?.connectionId || '').trim()
+  const profileName = String(options.profileName || owner?.profileName || '').trim()
+  const targetProfile = String(options.targetProfile || owner?.targetProfile || profileName).trim()
+  const origin = String(options.origin || 'configured-origin').trim() || 'configured-origin'
+  const loadChunk = chunk => {
+    const body = {
+      issue_keys: chunk,
+      include_transitions: options.includeTransitions === true,
+      include_links: options.includeLinks !== false,
+      include_details: options.includeDetails === true,
+      connection_id: connectionId,
+      profile_name: profileName,
+      target_profile: targetProfile
+    }
+    const request = () => api('/issues/batch', {
+      method: 'POST',
+      timeoutMs: options.timeoutMs || 30_000,
+      body
+    })
+    if (typeof queryClient?.fetchQuery !== 'function') return request()
+    return queryClient.fetchQuery({
+      queryKey: ['jira-browser', origin, connectionId, profileName, targetProfile, 'issue-batch', body],
+      queryFn: request,
+      staleTime: options.staleTime ?? 15_000
+    })
+  }
+  const pages = await Promise.all(chunks.map(loadChunk))
+  const byKey = new Map()
+  for (const page of pages) {
+    for (const item of Array.isArray(page?.items) ? page.items : []) {
+      const key = String(item?.issue?.key || item?.issue_key || '').trim().toUpperCase()
+      if (key && !byKey.has(key)) byKey.set(key, item)
+    }
+  }
+  return {
+    items: keys.map(key => byKey.get(key) || { issue_key: key, error: 'Could not load issue data.' }),
+    bounded: true,
+    max_items: MAX_BATCH_ISSUES,
+    requested_items: keys.length
+  }
+}
+
+async function invalidateIssueBatchCache(owner, origin = '') {
+  if (!owner || typeof queryClient?.invalidateQueries !== 'function') return
+  await queryClient.invalidateQueries({
+    queryKey: [
+      'jira-browser',
+      String(origin || 'configured-origin'),
+      owner.connectionId,
+      owner.profileName,
+      owner.targetProfile,
+      'issue-batch'
+    ]
+  })
+}
+
 function flattenProjectSessions(project) {
   const sessions = []
   for (const repo of Array.isArray(project?.repos) ? project.repos : []) {
@@ -202,9 +687,12 @@ function readFocusedSessionOwner() {
     const focused = focusedOwnerAtom.get()
     const connectionId = String(focused?.connectionId || focused?.connection_id || '').trim()
     const profileName = String(focused?.profile || focused?.profile_name || '').trim()
+    const hasTargetProfile = focused != null
+      && (Object.prototype.hasOwnProperty.call(focused, 'targetProfile')
+        || Object.prototype.hasOwnProperty.call(focused, 'target_profile'))
     const rawTargetProfile = focused?.targetProfile ?? focused?.target_profile
-    if (!connectionId || !profileName || (rawTargetProfile !== undefined && !String(rawTargetProfile).trim())) return null
-    const targetProfile = String(rawTargetProfile || profileName).trim()
+    if (!connectionId || !profileName || (hasTargetProfile && !String(rawTargetProfile ?? '').trim())) return null
+    const targetProfile = String(hasTargetProfile ? rawTargetProfile : profileName).trim()
     return { connectionId, profileName, targetProfile }
   }
   const connectionId = String(
@@ -220,36 +708,87 @@ function readFocusedSessionOwner() {
   return { connectionId, profileName, targetProfile: profileName }
 }
 
+function readActiveOwner() {
+  const connectionId = String(
+    host.state?.connectionId?.get?.()
+      || host.activeConnectionId?.()
+      || ''
+  ).trim()
+  const profileName = String(
+    host.state?.profile?.get?.()
+      || host.state?.profileName?.get?.()
+      || ''
+  ).trim()
+  const targetState = host.state?.targetProfile ?? host.state?.target_profile
+  const hasTargetProfile = targetState != null
+  const rawTargetProfile = typeof targetState?.get === 'function' ? targetState.get() : targetState
+  const targetProfile = String(hasTargetProfile ? rawTargetProfile ?? '' : profileName).trim()
+  if (!connectionId || !profileName || !targetProfile) return null
+  return { connectionId, profileName, targetProfile }
+}
+
+function issueLinksPath(issueId, owner) {
+  if (!owner) return ''
+  const query = new URLSearchParams(sessionOwnerFields(owner))
+  return `/links/${encodeURIComponent(issueId)}?${query.toString()}`
+}
+
 function ownerFromLink(link) {
-  if (!link?.connection_id || !link?.profile_name) return null
-  const hasConnectionOwner = Boolean(link?.connection_id)
+  const connectionId = String(link?.connection_id || link?.connectionId || '').trim()
   const profileName = String(
     link?.profile_name
+      || link?.profileName
       || link?.profile
-      || (hasConnectionOwner ? '' : host.state?.focusedSessionProfile?.get?.())
-      || 'default'
-  ).trim() || 'default'
+      || ''
+  ).trim()
+  const rawTargetProfile = link?.target_profile ?? link?.targetProfile
+  const targetProfile = String(rawTargetProfile || '').trim()
+  if (!connectionId || !profileName || !targetProfile) return null
   return {
-    connectionId: String(link?.connection_id || 'local').trim(),
+    connectionId,
     profileName,
-    targetProfile: String(link?.target_profile || profileName).trim() || profileName
+    targetProfile
   }
 }
 
 function ownerFromRoute(route) {
-  const profileName = String(route?.profile || '').trim()
+  const profileName = String(route?.profile || route?.profile_name || '').trim()
+  const hasTargetProfile = route != null
+    && (Object.prototype.hasOwnProperty.call(route, 'targetProfile')
+      || Object.prototype.hasOwnProperty.call(route, 'target_profile'))
+  const rawTargetProfile = route?.targetProfile ?? route?.target_profile
   return {
-    connectionId: String(route?.connectionId || '').trim(),
+    connectionId: String(route?.connectionId || route?.connection_id || '').trim(),
     profileName,
-    targetProfile: String(route?.targetProfile || profileName).trim() || profileName
+    targetProfile: String(hasTargetProfile ? rawTargetProfile ?? '' : profileName).trim()
   }
 }
 
+function linkId(link) {
+  return String(
+    link?.session_id
+      || link?.stored_session_id
+      || link?.storedSessionId
+      || link?.sessionId
+      || ''
+  ).trim()
+}
+
 function sessionLinkIdentity(link) {
-  const owner = link?.connectionId || link?.profileName ? link : ownerFromLink(link)
-  const sessionId = String(link?.session_id || link?.sessionId || link?.id || '').trim()
+  const owner = ownerFromLink(link)
+  const sessionId = String(
+    link?.session_id
+      || link?.stored_session_id
+      || link?.storedSessionId
+      || link?.sessionId
+      || ''
+  ).trim()
   if (!owner) return `unowned::::${sessionId}`
-  return `${owner.connectionId}::${owner.profileName}::${owner.targetProfile}::${sessionId}`
+  const connectionId = String(owner.connectionId || owner.connection_id || '').trim()
+  const profileName = String(owner.profileName || owner.profile_name || owner.profile || '').trim()
+  const targetProfile = String(owner.targetProfile || owner.target_profile || '').trim()
+  if (!connectionId || !profileName || !targetProfile) return `unowned::::${sessionId}`
+  return `${connectionId}::${profileName}::${targetProfile}::${sessionId}`
 }
 
 function sessionOwnerFields(owner) {
@@ -292,20 +831,28 @@ function isConfirmedTransientRpcFailure(error) {
 }
 
 function isAmbientOwnerRoute(route) {
-  const activeConnection = String(host.state?.connectionId?.get?.() || host.activeConnectionId?.() || 'local').trim()
-  const activeProfile = String(host.state?.profile?.get?.() || 'default').trim() || 'default'
-  const activeTargetProfile = String(
-    host.state?.targetProfile?.get?.()
-      || host.state?.gatewayProfile?.get?.()
-      || activeProfile
-  ).trim() || activeProfile
+  const activeConnection = String(host.state?.connectionId?.get?.() || host.activeConnectionId?.() || '').trim()
+  const activeProfile = String(host.state?.profile?.get?.() || host.state?.profileName?.get?.() || '').trim()
+  const targetState = host.state?.targetProfile ?? host.state?.gatewayProfile ?? host.state?.target_profile
+  const hasTargetProfile = targetState != null
+  const rawTargetProfile = typeof targetState?.get === 'function' ? targetState.get() : targetState
+  const activeTargetProfile = String(hasTargetProfile ? rawTargetProfile ?? '' : activeProfile).trim()
+  if (!activeConnection || !activeProfile || !activeTargetProfile) return false
   return String(route?.connectionId || '').trim() === activeConnection
     && String(route?.profile || '').trim() === activeProfile
     && String(route?.targetProfile || '').trim() === activeTargetProfile
 }
 
 function sessionIdFromRow(session) {
-  return String(session?.id || session?.stored_session_id || '').trim()
+  return String(
+    session?.session_key
+      || session?.stored_session_id
+      || session?.storedSessionId
+      || session?.session_id
+      || session?.sessionId
+      || session?.id
+      || ''
+  ).trim()
 }
 
 async function verifySessionOwner(sessionId, route) {
@@ -330,7 +877,8 @@ async function verifySessionOwner(sessionId, route) {
 async function listCurrentProfileSessions(projectId = '', jiraProjectKey = '', route = null) {
   const focusedOwner = readFocusedSessionOwner()
   const ownerRoute = route || await resolveFocusedSessionRoute()
-  const profile = String(ownerRoute.targetProfile || ownerRoute.profile || focusedOwner.profileName).trim()
+  const profile = String(ownerRoute.targetProfile || ownerRoute.profile || focusedOwner?.profileName || '').trim()
+  if (!profile) throw new Error('The session owner profile is unavailable.')
   const [recentResult, projectResult, storedResult] = await Promise.all([
     host.listPersistedSessions(ownerRoute, { profile, limit: 500 }),
     projectId
@@ -355,21 +903,36 @@ async function listCurrentProfileSessions(projectId = '', jiraProjectKey = '', r
   ).values()]
 }
 
-function issueCacheId(jql, pageSize) {
-  return `${Number(pageSize) || 50}:${String(jql || '')}`
+function cacheScopeKey(origin = '', owner = null) {
+  const resolvedOwner = owner || readActiveOwner()
+  const values = [
+    normaliseJiraOrigin(origin),
+    resolvedOwner?.connectionId,
+    resolvedOwner?.profileName,
+    resolvedOwner?.targetProfile
+  ].map(value => String(value || '').trim())
+  if (values.some(value => !value)) return ''
+  return values.map(value => encodeURIComponent(value)).join('::')
 }
 
-function readIssueCache(jql, pageSize) {
+function issueCacheId(jql, pageSize, scope = '') {
+  return `${scope}:${Number(pageSize) || 50}:${String(jql || '')}`
+}
+
+function readIssueCache(jql, pageSize, origin = '', owner = null) {
+  const scope = cacheScopeKey(origin, owner)
+  if (!scope) return null
   const cache = pluginContext?.storage.get(ISSUE_CACHE_KEY, {}) || {}
-  const entry = cache[issueCacheId(jql, pageSize)]
+  const entry = cache[issueCacheId(jql, pageSize, scope)]
   if (!entry || !Array.isArray(entry.issues)) return null
   return entry
 }
 
-function writeIssueCache(jql, pageSize, issues, nextPageToken) {
-  if (!pluginContext || !Array.isArray(issues)) return
+function writeIssueCache(jql, pageSize, issues, nextPageToken, origin = '', owner = null) {
+  const scope = cacheScopeKey(origin, owner)
+  if (!pluginContext || !scope || !Array.isArray(issues)) return
   const current = pluginContext.storage.get(ISSUE_CACHE_KEY, {}) || {}
-  const key = issueCacheId(jql, pageSize)
+  const key = issueCacheId(jql, pageSize, scope)
   const next = {
     ...current,
     [key]: {
@@ -386,22 +949,24 @@ function writeIssueCache(jql, pageSize, issues, nextPageToken) {
   pluginContext.storage.set(ISSUE_CACHE_KEY, trimmed)
 }
 
-function laneCacheId(projectKeys) {
-  return [...new Set((projectKeys || []).map(key => String(key || '').trim().toUpperCase()).filter(Boolean))]
+function laneCacheId(projectKeys, scope = '') {
+  const projects = [...new Set((projectKeys || []).map(key => String(key || '').trim().toUpperCase()).filter(Boolean))]
     .sort()
     .join('|')
+  return scope && projects ? `${scope}:${projects}` : ''
 }
 
-function readLaneCache(projectKeys) {
-  const key = laneCacheId(projectKeys)
+function readLaneCache(projectKeys, origin = '', owner = null) {
+  const key = laneCacheId(projectKeys, cacheScopeKey(origin, owner))
   if (!key) return []
   const cache = pluginContext?.storage.get(LANE_CACHE_KEY, {}) || {}
   return Array.isArray(cache[key]?.lanes) ? cache[key].lanes : []
 }
 
-function writeLaneCache(projectKeys, lanes) {
-  if (!pluginContext || !Array.isArray(lanes)) return
-  const key = laneCacheId(projectKeys)
+function writeLaneCache(projectKeys, lanes, origin = '', owner = null) {
+  const scope = cacheScopeKey(origin, owner)
+  if (!pluginContext || !scope || !Array.isArray(lanes)) return
+  const key = laneCacheId(projectKeys, scope)
   if (!key) return
   const current = pluginContext.storage.get(LANE_CACHE_KEY, {}) || {}
   pluginContext.storage.set(LANE_CACHE_KEY, {
@@ -410,34 +975,53 @@ function writeLaneCache(projectKeys, lanes) {
   })
 }
 
-function readWorkStateCache() {
+function readWorkStateCache(origin = '', owner = null) {
+  const scope = cacheScopeKey(origin, owner)
+  if (!scope) return {}
   const cache = pluginContext?.storage.get(WORK_STATE_CACHE_KEY, {}) || {}
-  return cache && typeof cache === 'object' ? cache : {}
+  const states = cache?.[scope]?.states
+  return states && typeof states === 'object' ? states : {}
 }
 
-function writeWorkStateCache(states) {
-  if (!pluginContext || !states || typeof states !== 'object') return
+function writeWorkStateCache(states, origin = '', owner = null) {
+  const scope = cacheScopeKey(origin, owner)
+  if (!pluginContext || !scope || !states || typeof states !== 'object') return
   const trimmed = Object.fromEntries(
     Object.entries(states)
       .sort((left, right) => Number(right[1]?.storedAt || 0) - Number(left[1]?.storedAt || 0))
       .slice(0, 200)
   )
-  pluginContext.storage.set(WORK_STATE_CACHE_KEY, trimmed)
+  const current = pluginContext.storage.get(WORK_STATE_CACHE_KEY, {}) || {}
+  const next = {
+    ...current,
+    [scope]: { states: trimmed, storedAt: Date.now() }
+  }
+  const bounded = Object.fromEntries(
+    Object.entries(next)
+      .sort((left, right) => Number(right[1]?.storedAt || 0) - Number(left[1]?.storedAt || 0))
+      .slice(0, 8)
+  )
+  pluginContext.storage.set(WORK_STATE_CACHE_KEY, bounded)
 }
 
-function readTicketWorktree(issueKey) {
+function readTicketWorktree(issueKey, origin = '', owner = null) {
+  const scope = cacheScopeKey(origin, owner)
+  if (!scope) return null
   const links = pluginContext?.storage.get(WORKTREE_LINKS_KEY, {}) || {}
-  const worktree = links[String(issueKey || '').toUpperCase()]
+  const worktree = links?.[scope]?.[String(issueKey || '').toUpperCase()]
   return worktree?.path ? worktree : null
 }
 
-function writeTicketWorktree(issueKey, worktree) {
-  if (!pluginContext || !issueKey) return
+function writeTicketWorktree(issueKey, worktree, origin = '', owner = null) {
+  const scope = cacheScopeKey(origin, owner)
+  if (!pluginContext || !scope || !issueKey) return
   const links = pluginContext.storage.get(WORKTREE_LINKS_KEY, {}) || {}
+  const scoped = { ...(links?.[scope] || {}) }
   const key = String(issueKey).toUpperCase()
-  if (worktree?.path) links[key] = worktree
-  else delete links[key]
-  pluginContext.storage.set(WORKTREE_LINKS_KEY, links)
+  if (worktree?.path) scoped[key] = worktree
+  else delete scoped[key]
+  const next = { ...links, [scope]: scoped }
+  pluginContext.storage.set(WORKTREE_LINKS_KEY, next)
 }
 
 function normaliseJiraOrigin(value) {
@@ -445,11 +1029,14 @@ function normaliseJiraOrigin(value) {
 }
 
 function detachedChatStorageKey(issueKey, jiraOrigin, link) {
-  const owner = link?.connectionId || link?.profileName ? link : ownerFromLink(link)
+  const owner = ownerFromLink(link)
   const origin = normaliseJiraOrigin(jiraOrigin)
   const key = String(issueKey || '').trim().toUpperCase()
-  if (!origin || !key || !owner?.connectionId || !owner?.profileName || !owner?.targetProfile) return ''
-  return [origin, key, owner.connectionId, owner.profileName, owner.targetProfile]
+  const connectionId = String(owner?.connectionId || '').trim()
+  const profileName = String(owner?.profileName || '').trim()
+  const targetProfile = String(owner?.targetProfile || '').trim()
+  if (!origin || !key || !connectionId || !profileName || !targetProfile) return ''
+  return [origin, key, connectionId, profileName, targetProfile]
     .map(value => encodeURIComponent(String(value)))
     .join('::')
 }
@@ -464,7 +1051,7 @@ function readDetachedChatIds(issueKey, jiraOrigin = '', owner = null) {
       : [])
   ].map(String)
   const result = new Set(values)
-  const resolvedOwner = owner?.connectionId || owner?.profileName ? owner : ownerFromLink(owner)
+  const resolvedOwner = ownerFromLink(owner)
   if (resolvedOwner) {
     for (const sessionId of values) {
       result.add(sessionLinkIdentity({ session_id: sessionId, ...resolvedOwner }))
@@ -474,12 +1061,12 @@ function readDetachedChatIds(issueKey, jiraOrigin = '', owner = null) {
 }
 
 function writeChatDetached(issueKey, link, value, jiraOrigin = '') {
-  if (!pluginContext || !issueKey || !link?.session_id) return
+  const sessionId = linkId(link)
+  if (!pluginContext || !issueKey || !sessionId) return
   const detached = pluginContext.storage.get(DETACHED_CHAT_LINKS_KEY, {}) || {}
   const key = detachedChatStorageKey(issueKey, jiraOrigin, link)
   if (!key) return
   const ids = new Set(Array.isArray(detached[key]) ? detached[key].map(String) : [])
-  const sessionId = String(link.session_id).trim()
   if (value) ids.add(sessionId)
   else {
     ids.delete(sessionId)
@@ -492,14 +1079,16 @@ function writeChatDetached(issueKey, link, value, jiraOrigin = '') {
 function mergeBackendDetachedLinks(issueKey, links, jiraOrigin = '') {
   const detached = readDetachedChatIds(issueKey, jiraOrigin)
   for (const link of Array.isArray(links) ? links : []) {
+    const sessionId = linkId(link)
+    const owner = ownerFromLink(link)
     if ((link?.detached || link?.is_detached || link?.tombstone || link?.deleted || link?.detached_at || link?.deleted_at)
-      && link?.connection_id && link?.profile_name && link?.session_id) {
+      && owner && sessionId) {
       detached.add(sessionLinkIdentity(link))
       const ownerKey = detachedChatStorageKey(issueKey, link?.jira_origin || jiraOrigin, link)
       if (ownerKey && pluginContext) {
         const current = pluginContext.storage.get(DETACHED_CHAT_LINKS_KEY, {}) || {}
         const values = new Set(Array.isArray(current[ownerKey]) ? current[ownerKey].map(String) : [])
-        values.add(String(link.session_id).trim())
+        values.add(sessionId)
         current[ownerKey] = [...values]
         pluginContext.storage.set(DETACHED_CHAT_LINKS_KEY, current)
       }
@@ -525,11 +1114,23 @@ function filterDetachedLinks(issueKey, links, backendDetached = [], jiraOrigin =
   const candidates = Array.isArray(links) ? links : []
   const legacyLocalDetachIds = new Set()
   for (const link of candidates) {
-    const sessionId = String(link?.session_id || '').trim()
+    const sessionId = String(
+      link?.session_id
+        || link?.stored_session_id
+        || link?.storedSessionId
+        || link?.sessionId
+        || ''
+    ).trim()
     if (sessionId && detached.has(sessionId)) legacyLocalDetachIds.add(sessionId)
   }
   return candidates.filter(link => {
-    const sessionId = String(link?.session_id || '').trim()
+    const sessionId = String(
+      link?.session_id
+        || link?.stored_session_id
+        || link?.storedSessionId
+        || link?.sessionId
+        || ''
+    ).trim()
     const identity = sessionLinkIdentity(link)
     const legacyLocalDetach = legacyLocalDetachIds.has(sessionId)
     const ownerLocalDetach = readDetachedChatIds(issueKey, jiraOrigin, link)
@@ -640,11 +1241,14 @@ function IssueRowTitle({ issue }) {
   })
 }
 
-function JiraCard({ issue, active, attentionReasons = [], onOpen, workState, workingSessionIds }) {
+function JiraCard({ issue, active, attentionReasons = [], onOpen, workState, workingSessionIds, liveState = 'idle' }) {
   const tone = statusColor(issue)
   const linkedWork = Array.isArray(workState?.links) ? workState.links : []
   const branch = linkedWork.find(link => link.branch)?.branch || ''
+  const liveWorking = liveStatusSnapshot.entries.some(entry => entry.ticketKey === issue.key && entry.state === 'working')
   const working = linkedWork.some(link => workingSessionIds?.has(sessionLinkIdentity(link)))
+    || liveWorking || liveState === 'working' || liveState === 'starting'
+  const liveAttention = ['failed', 'waiting'].includes(liveState)
   return jsxs('div', {
     className: `group relative flex cursor-grab flex-col gap-2 rounded-md border border-(--ui-stroke-tertiary) border-l-2 bg-(--ui-bg-elevated) p-2.5 transition-colors hover:bg-primary/[0.06] active:cursor-grabbing${working ? ' border-(--dt-composer-ring) ring-1 ring-(--dt-composer-ring) bg-[color-mix(in_srgb,var(--dt-composer-ring)_10%,transparent)]' : active ? ' border-(--dt-composer-ring) bg-[color-mix(in_srgb,var(--dt-composer-ring)_7%,transparent)]' : ''}`,
     draggable: true,
@@ -685,10 +1289,17 @@ function JiraCard({ issue, active, attentionReasons = [], onOpen, workState, wor
           jsx('span', { className: 'ml-auto shrink-0 text-(--ui-text-quaternary)', children: relativeDate(issue.updated) })
         ]
       }),
-      linkedWork.length || attentionReasons.length || working
+      linkedWork.length || attentionReasons.length || working || liveAttention
         ? jsxs('div', {
             className: 'flex flex-wrap items-center gap-1 border-t border-(--ui-stroke-tertiary) pt-1.5 text-[0.6rem] text-(--ui-text-tertiary)',
             children: [
+              liveState !== 'idle' && liveState !== 'working' && liveState !== 'starting'
+                ? jsx('span', {
+                    className: `inline-flex items-center gap-1 rounded px-1.5 py-0.5 ${liveState === 'failed' ? 'bg-red-500/10 text-red-400' : 'bg-amber-500/10 text-amber-400'}`,
+                    title: 'Live chat state',
+                    children: liveStatusLabel(liveState)
+                  })
+                : null,
               working
                 ? jsxs('span', {
                     className: 'inline-flex items-center gap-1 rounded bg-[color-mix(in_srgb,var(--dt-composer-ring)_14%,transparent)] px-1.5 py-0.5 text-(--dt-composer-ring)',
@@ -729,7 +1340,7 @@ function JiraCard({ issue, active, attentionReasons = [], onOpen, workState, wor
   })
 }
 
-function JiraLane({ lane, attentionByKey, collapsed, selectedKey, onToggle, onOpen, onMove, workingSessionIds, workStates }) {
+function JiraLane({ lane, attentionByKey, collapsed, selectedKey, onToggle, onOpen, onMove, workingSessionIds, workStates, liveTicketStates }) {
   const [over, setOver] = useState(false)
   const label = lane.label || 'Tickets'
   const tone = statusColor(lane)
@@ -805,7 +1416,8 @@ function JiraLane({ lane, attentionByKey, collapsed, selectedKey, onToggle, onOp
               attentionReasons: attentionByKey[issue.key] || [],
               onOpen,
               workState: workStates[issue.key],
-              workingSessionIds
+              workingSessionIds,
+              liveState: liveTicketStates?.[issue.key] || 'idle'
             }, issue.id || issue.key))
           : jsx('div', {
               className: 'pointer-events-none absolute inset-0 grid place-items-center text-[0.6875rem] text-(--ui-text-quaternary)',
@@ -948,15 +1560,15 @@ function LinkedChats({ links, onAttach, onOpen, onScan, onUnlink, relatedChats, 
                         children: [
                           jsx('span', {
                             className: 'min-w-0 truncate',
-                            children: link.chat_title || link.branch || `Chat ${String(link.session_id).slice(0, 8)}`
+                            children: link.chat_title || link.branch || `Chat ${linkId(link).slice(0, 8)}`
                           }),
                           link.archived ? jsx(Badge, { variant: 'outline', children: 'Archived' }) : null
                         ]
                       }),
                       jsx('div', {
                         className: 'truncate font-mono text-[0.6rem] text-(--ui-text-quaternary)',
-                        title: link.worktree_path || link.session_id,
-                        children: link.worktree_path || link.session_id
+                        title: link.worktree_path || linkId(link),
+                        children: link.worktree_path || linkId(link)
                       })
                     ]
                   }),
@@ -1118,6 +1730,8 @@ function JiraAttachment({ attachment, issueKey }) {
 }
 
 function IssueDetail({ issue, status, projects, mapping, links, baseRef, onOpenIssue, onIssueChanged, onMappingSaved, onLinksChanged, onPin, readOnly = false }) {
+  const cacheOrigin = String(status?.base_url || '').trim()
+  const cacheScope = cacheScopeKey(cacheOrigin)
   const [busyAction, setBusyAction] = useState('')
   const [commentDraft, setCommentDraft] = useState('')
   const [error, setError] = useState('')
@@ -1125,7 +1739,7 @@ function IssueDetail({ issue, status, projects, mapping, links, baseRef, onOpenI
   const [transitionId, setTransitionId] = useState('')
   const [relatedChats, setRelatedChats] = useState([])
   const [availableWorktrees, setAvailableWorktrees] = useState([])
-  const [linkedWorktree, setLinkedWorktree] = useState(() => readTicketWorktree(issue?.key))
+  const [linkedWorktree, setLinkedWorktree] = useState(() => readTicketWorktree(issue?.key, cacheOrigin))
   const [scanningChats, setScanningChats] = useState(false)
   const [unlinkingChatKey, setUnlinkingChatKey] = useState('')
   const scanGeneration = useRef(0)
@@ -1143,10 +1757,10 @@ function IssueDetail({ issue, status, projects, mapping, links, baseRef, onOpenI
 
   useEffect(() => {
     scanGeneration.current += 1
-    setLinkedWorktree(readTicketWorktree(issue?.key))
+    setLinkedWorktree(readTicketWorktree(issue?.key, cacheOrigin))
     setRelatedChats([])
     setAvailableWorktrees([])
-  }, [issue?.key])
+  }, [cacheScope, issue?.key])
 
   useEffect(() => {
     let alive = true
@@ -1176,7 +1790,7 @@ function IssueDetail({ issue, status, projects, mapping, links, baseRef, onOpenI
     traceWorkOpen(issue?.key, 'resume-requested')
     try {
       const route = await resolveSessionRoute(link)
-      await host.openSession(link.session_id, {
+      await host.openSession(linkId(link), {
         awaitHydration: true,
         expectHistory: true,
         forceResume: true,
@@ -1265,9 +1879,9 @@ function IssueDetail({ issue, status, projects, mapping, links, baseRef, onOpenI
       path: paths[0],
       branch: String(links.find(link => link?.worktree_path === paths[0])?.branch || '')
     }
-    writeTicketWorktree(issue.key, inferred)
+    writeTicketWorktree(issue.key, inferred, cacheOrigin)
     setLinkedWorktree(inferred)
-  }, [issue?.key, linkedWorktree, links])
+  }, [issue?.key, linkedWorktree, links, cacheScope])
 
   const attachRelatedChat = useCallback(async chat => {
     const sessionId = String(chat?.session_id || chat?.id || '').trim()
@@ -1303,7 +1917,7 @@ function IssueDetail({ issue, status, projects, mapping, links, baseRef, onOpenI
   }, [issue?.id, issue?.key, onLinksChanged])
 
   const unlinkChat = useCallback(async link => {
-    const sessionId = String(link?.session_id || '').trim()
+    const sessionId = linkId(link)
     if (!sessionId || !issue?.id || !issue?.key) return
     scanGeneration.current += 1
     setScanningChats(false)
@@ -1440,10 +2054,10 @@ function IssueDetail({ issue, status, projects, mapping, links, baseRef, onOpenI
     if (!worktree) return
     scanGeneration.current += 1
     setScanningChats(false)
-    writeTicketWorktree(issue.key, worktree)
+    writeTicketWorktree(issue.key, worktree, cacheOrigin)
     setLinkedWorktree(worktree)
     host.notify({ kind: 'success', message: `Linked ${worktree.branch || worktree.path} to ${issue.key}. Chats in it will attach automatically.` })
-  }, [availableWorktrees, issue?.key])
+  }, [availableWorktrees, issue?.key, cacheScope])
 
   const useCurrentWorktree = useCallback(async () => {
     setBusyAction('current-worktree')
@@ -1460,7 +2074,7 @@ function IssueDetail({ issue, status, projects, mapping, links, baseRef, onOpenI
         throw new Error(`The current chat is not in ${mapping.hermes_project_label || issue.project_key}.`)
       }
       const worktree = { path, branch: String(session.git_branch || ''), lastActive: Number(session.last_active || 0) }
-      writeTicketWorktree(issue.key, worktree)
+      writeTicketWorktree(issue.key, worktree, cacheOrigin)
       setLinkedWorktree(worktree)
       host.notify({ kind: 'success', message: `Linked the current worktree to ${issue.key}.` })
     } catch (cause) {
@@ -1468,15 +2082,15 @@ function IssueDetail({ issue, status, projects, mapping, links, baseRef, onOpenI
     } finally {
       setBusyAction('')
     }
-  }, [issue?.key, issue?.project_key, mapping?.hermes_project_id, mapping?.hermes_project_label, mapping?.repo_path])
+  }, [issue?.key, issue?.project_key, mapping?.hermes_project_id, mapping?.hermes_project_label, mapping?.repo_path, cacheScope])
 
   const unlinkWorktree = useCallback(() => {
     scanGeneration.current += 1
     setScanningChats(false)
-    writeTicketWorktree(issue.key, null)
+    writeTicketWorktree(issue.key, null, cacheOrigin)
     setLinkedWorktree(null)
     host.notify({ kind: 'success', message: `Unlinked the worktree from ${issue.key}. Existing chat links were kept.` })
-  }, [issue?.key])
+  }, [issue?.key, cacheScope])
 
   useEffect(() => {
     if (readOnly || !issue?.key) return
@@ -1499,6 +2113,7 @@ function IssueDetail({ issue, status, projects, mapping, links, baseRef, onOpenI
         method: 'POST',
         body: { transition_id: suggestedTransition.id, idempotency_key: mutationKey }
       })
+      await invalidateIssueBatchCache(readActiveOwner(), status?.base_url)
       const [updated, choices] = await Promise.all([
         api(`/issues/${encodeURIComponent(issue.key)}`, { timeoutMs: 30_000 }),
         api(`/issues/${encodeURIComponent(issue.key)}/transitions`)
@@ -1512,7 +2127,7 @@ function IssueDetail({ issue, status, projects, mapping, links, baseRef, onOpenI
     } finally {
       setBusyAction('')
     }
-  }, [issue?.key, onIssueChanged, suggestedTransition])
+  }, [issue?.key, onIssueChanged, status?.base_url, suggestedTransition])
 
   const draftJiraUpdate = useCallback(async () => {
     const cwd = String(linkedWorktree?.path || links.find(link => link.worktree_path)?.worktree_path || mapping?.repo_path || '')
@@ -1550,7 +2165,7 @@ function IssueDetail({ issue, status, projects, mapping, links, baseRef, onOpenI
         status: String(issue.status || '').slice(0, 100),
         description: String(issue.description || '').slice(0, 12_000),
         linkedSessions: links.map(link => ({
-          sessionId: String(link.session_id || ''),
+          sessionId: linkId(link),
           title: String(link.chat_title || ''),
           archived: Boolean(link.archived),
           worktreePath: String(link.worktree_path || '')
@@ -1596,6 +2211,7 @@ function IssueDetail({ issue, status, projects, mapping, links, baseRef, onOpenI
         method: 'POST',
         body: { body, idempotency_key: mutationKey }
       })
+      await invalidateIssueBatchCache(readActiveOwner(), status?.base_url)
       setCommentDraft('')
       onIssueChanged?.({
         ...issue,
@@ -1608,7 +2224,7 @@ function IssueDetail({ issue, status, projects, mapping, links, baseRef, onOpenI
     } finally {
       setBusyAction('')
     }
-  }, [commentDraft, issue, onIssueChanged])
+  }, [commentDraft, issue, onIssueChanged, status?.base_url])
 
   const moveIssue = useCallback(async () => {
     if (!transitionId) return
@@ -1621,6 +2237,7 @@ function IssueDetail({ issue, status, projects, mapping, links, baseRef, onOpenI
         method: 'POST',
         body: { transition_id: transitionId, idempotency_key: mutationKey }
       })
+      await invalidateIssueBatchCache(readActiveOwner(), status?.base_url)
       const [updated, choices] = await Promise.all([
         api(`/issues/${encodeURIComponent(issue.key)}`, { timeoutMs: 30_000 }),
         api(`/issues/${encodeURIComponent(issue.key)}/transitions`)
@@ -1635,7 +2252,7 @@ function IssueDetail({ issue, status, projects, mapping, links, baseRef, onOpenI
     } finally {
       setBusyAction('')
     }
-  }, [issue?.key, onIssueChanged, transitionId])
+  }, [issue?.key, onIssueChanged, status?.base_url, transitionId])
 
   const startWork = useCallback(async () => {
     if (!mapping && !linkedWorktree?.path) {
@@ -1721,7 +2338,7 @@ function IssueDetail({ issue, status, projects, mapping, links, baseRef, onOpenI
       linked = true
       traceWorkOpen(issue.key, 'link-persisted')
       const createdWorktree = { path: worktree.path, branch: worktree.branch, lastActive: Date.now() }
-      writeTicketWorktree(issue.key, createdWorktree)
+      writeTicketWorktree(issue.key, createdWorktree, cacheOrigin)
       setLinkedWorktree(createdWorktree)
       try {
         traceWorkOpen(issue.key, 'open-requested')
@@ -1776,7 +2393,7 @@ function IssueDetail({ issue, status, projects, mapping, links, baseRef, onOpenI
     } finally {
       setBusyAction('')
     }
-  }, [baseRef, issue, linkedWorktree, links.length, mapping, onLinksChanged, status])
+  }, [baseRef, issue, linkedWorktree, links.length, mapping, onLinksChanged, status, cacheScope])
 
   if (!issue) return jsx(PanelEmpty, { icon: 'issues', title: 'Select a Jira ticket' })
 
@@ -2332,6 +2949,7 @@ function JiraPage() {
   const [mapping, setMapping] = useState(null)
   const [links, setLinks] = useState([])
   const [workStates, setWorkStates] = useState(() => readWorkStateCache())
+  const [liveTicketStates, setLiveTicketStates] = useState({})
   const [workingSessionIds, setWorkingSessionIds] = useState(() => new Set())
   const [settings, setSettings] = useState(null)
   const [activeView, setActiveView] = useState('assigned')
@@ -2355,6 +2973,11 @@ function JiraPage() {
   const saveTimer = useRef(null)
   const settingsSaveGeneration = useRef(0)
   const workStateGeneration = useRef(0)
+  const workStateScopeRef = useRef('')
+  const lastCacheScopeRef = useRef('')
+  const jiraOriginRef = useRef('')
+  const activeCacheScope = cacheScopeKey(status?.base_url)
+  jiraOriginRef.current = String(status?.base_url || '').trim()
 
   useEffect(() => {
     const syncFromHash = () => setSelectedKey(issueKeyFromHash())
@@ -2362,6 +2985,39 @@ function JiraPage() {
     window.addEventListener('hashchange', syncFromHash)
     return () => window.removeEventListener('hashchange', syncFromHash)
   }, [])
+
+  useEffect(() => {
+    const unsubscribe = subscribeLiveStatuses(snapshot => {
+      const next = {}
+      for (const entry of Array.isArray(snapshot?.entries) ? snapshot.entries : []) {
+        const key = String(entry?.ticketKey || '').trim().toUpperCase()
+        if (!key) continue
+        const current = next[key]
+        if (!current || liveStatusPriority(entry.state) > liveStatusPriority(current)) next[key] = entry.state
+      }
+      setLiveTicketStates(next)
+    })
+    return unsubscribe
+  }, [])
+
+  useEffect(() => {
+    const byIdentity = new Map()
+    for (const issue of issues) {
+      for (const link of Array.isArray(workStates?.[issue.key]?.links) ? workStates[issue.key].links : []) {
+        const candidate = { ...link, ticketKey: issue.key }
+        byIdentity.set(sessionLinkIdentity(candidate), candidate)
+      }
+    }
+    for (const link of Array.isArray(links) ? links : []) {
+      const candidate = { ...link, ticketKey: selectedKey || detail?.key || '' }
+      byIdentity.set(sessionLinkIdentity(candidate), candidate)
+    }
+    publishJiraContext({
+      links: [...byIdentity.values()],
+      selectedKey,
+      title: detail?.summary || detail?.key || selectedKey
+    })
+  }, [detail?.key, detail?.summary, issues, links, selectedKey, workStates])
 
   useEffect(() => {
     if (!selectedKey && hashHasIssueParam()) host.navigate(jiraRoute(''))
@@ -2414,7 +3070,9 @@ function JiraPage() {
     const append = Boolean(options.append)
     const token = String(options.nextPageToken || '')
     const pageSize = Number(options.pageSize) || 50
-    const cached = !append && !options.force ? readIssueCache(nextJql, pageSize) : null
+    const origin = String(options.origin || jiraOriginRef.current || '').trim()
+    const owner = options.owner || readActiveOwner()
+    const cached = !append && !options.force ? readIssueCache(nextJql, pageSize, origin, owner) : null
     const generation = ++requestGeneration.current
     if (append) {
       setLoadingMore(true)
@@ -2439,12 +3097,12 @@ function JiraPage() {
       if (append) {
         setIssues(current => {
           const merged = [...new Map([...current, ...rows].map(issue => [issue.id || issue.key, issue])).values()]
-          writeIssueCache(nextJql, pageSize, merged, nextToken)
+          writeIssueCache(nextJql, pageSize, merged, nextToken, origin, owner)
           return merged
         })
       } else {
         setIssues(rows)
-        writeIssueCache(nextJql, pageSize, rows, nextToken)
+        writeIssueCache(nextJql, pageSize, rows, nextToken, origin, owner)
       }
     } catch (cause) {
       if (generation !== requestGeneration.current) return
@@ -2483,7 +3141,7 @@ function JiraPage() {
         setSubmittedJql(nextJql)
         setSettingsDraft(formatted)
         lastSavedSettings.current = formatted
-        if (nextStatus?.configured) return loadIssues(nextJql, { pageSize: nextSettings?.pageSize })
+        if (nextStatus?.configured) return loadIssues(nextJql, { pageSize: nextSettings?.pageSize, origin: nextStatus?.base_url })
         setLoading(false)
       })
       .catch(cause => {
@@ -2495,6 +3153,30 @@ function JiraPage() {
       alive = false
     }
   }, [loadIssues])
+
+  useEffect(() => {
+    const previousScope = lastCacheScopeRef.current
+    lastCacheScopeRef.current = activeCacheScope
+    if (!activeCacheScope || !previousScope || previousScope === activeCacheScope) return
+    requestGeneration.current += 1
+    workStateGeneration.current += 1
+    setIssues([])
+    setNextPageToken('')
+    setWorkStates({})
+    setDetectedLanes([])
+    setDetail(null)
+    setMapping(null)
+    setLinks([])
+    setSelectedKey('')
+    host.navigate(jiraRoute(''))
+    if (status?.configured && submittedJql) {
+      void loadIssues(submittedJql, {
+        force: true,
+        pageSize: settings?.pageSize,
+        origin: status.base_url
+      })
+    }
+  }, [activeCacheScope])
 
   useEffect(() => {
     if (!settingsDraft || settingsDraft === lastSavedSettings.current) return
@@ -2640,9 +3322,14 @@ function JiraPage() {
 
   useEffect(() => {
     const generation = ++workStateGeneration.current
-    const cached = readWorkStateCache()
+    const cacheOrigin = String(status?.base_url || '').trim()
+    const cacheOwner = readActiveOwner()
+    const cacheScope = cacheScopeKey(cacheOrigin, cacheOwner)
+    const scopeChanged = Boolean(workStateScopeRef.current && workStateScopeRef.current !== cacheScope)
+    workStateScopeRef.current = cacheScope
+    const cached = readWorkStateCache(cacheOrigin, cacheOwner)
     setWorkStates(current => {
-      const next = { ...cached, ...current }
+      const next = { ...(scopeChanged ? {} : current), ...cached }
       for (const issue of issues) {
         next[issue.key] = { ...(next[issue.key] || {}), loading: true }
       }
@@ -2650,9 +3337,28 @@ function JiraPage() {
     })
     if (issues.length === 0) return
 
-    Promise.all(issues.map(async issue => {
+    const commitEntries = entries => {
+      if (generation !== workStateGeneration.current) return
+      setWorkStates(current => {
+        const next = { ...current, ...Object.fromEntries(entries) }
+        writeWorkStateCache(next, cacheOrigin, cacheOwner)
+        return next
+      })
+    }
+    const owner = readActiveOwner()
+    if (!owner) {
+      commitEntries(issues.map(issue => [issue.key, {
+        ...(cached[issue.key] || {}),
+        loading: false,
+        refreshFailed: true
+      }]))
+      return
+    }
+    const fallbackIndividual = (targetIssues = issues) => Promise.all(targetIssues.map(async issue => {
       try {
-        const result = await api(`/links/${encodeURIComponent(issue.id)}`)
+        const path = issueLinksPath(issue.id, owner)
+        if (!path) throw new Error('Jira link owner is unavailable.')
+        const result = await api(path)
         return [issue.key, {
           links: filterDetachedLinks(issue.key, result?.links, result?.detached, status?.base_url),
           loading: false,
@@ -2661,19 +3367,51 @@ function JiraPage() {
       } catch {
         return [issue.key, { ...(cached[issue.key] || {}), loading: false, refreshFailed: true }]
       }
-    })).then(entries => {
-      if (generation !== workStateGeneration.current) return
-      setWorkStates(current => {
-        const next = { ...current, ...Object.fromEntries(entries) }
-        writeWorkStateCache(next)
-        return next
-      })
+    }))
+
+    fetchIssueBatch(issues.map(issue => issue.key), {
+      includeLinks: true,
+      origin: status?.base_url,
+      owner
     })
-  }, [issueWorkSignature, status?.base_url])
+      .then(async result => {
+        const items = Array.isArray(result?.items) ? result.items : []
+        const failedKeys = new Set(items
+          .filter(item => item?.error)
+          .map(item => String(item?.issue?.key || item?.issue_key || '').trim().toUpperCase())
+          .filter(Boolean))
+        const entries = items.map(item => {
+          const key = String(item?.issue?.key || item?.issue_key || '').trim().toUpperCase()
+          return [key, {
+            links: filterDetachedLinks(key, item?.links, [], status?.base_url),
+            loading: false,
+            refreshFailed: false,
+            storedAt: Date.now()
+          }]
+        }).filter(([key]) => key && !failedKeys.has(key))
+        if (failedKeys.size > 0) {
+          const failedIssues = issues.filter(issue => failedKeys.has(String(issue.key || '').trim().toUpperCase()))
+          const fallbackEntries = await fallbackIndividual(failedIssues)
+          if (entries.length || fallbackEntries.length) return commitEntries([...entries, ...fallbackEntries])
+        }
+        if (entries.length === 0) return fallbackIndividual().then(commitEntries)
+        commitEntries(entries)
+      })
+      .catch(() => fallbackIndividual().then(commitEntries))
+  }, [issueWorkSignature, activeCacheScope])
 
   const reloadLinks = useCallback(async () => {
     if (!detail?.id) return
-    const result = await api(`/links/${encodeURIComponent(detail.id)}`)
+    const owner = readActiveOwner()
+    const cacheOrigin = String(status?.base_url || '').trim()
+    const cacheOwner = owner
+    const path = issueLinksPath(detail.id, owner)
+    if (!path) {
+      setLinks([])
+      return
+    }
+    await invalidateIssueBatchCache(owner, status?.base_url)
+    const result = await api(path)
     const nextLinks = filterDetachedLinks(detail.key, result?.links, result?.detached, status?.base_url)
     setLinks(nextLinks)
     setWorkStates(current => {
@@ -2681,10 +3419,10 @@ function JiraPage() {
         ...current,
         [detail.key]: { links: nextLinks, loading: false, storedAt: Date.now() }
       }
-      writeWorkStateCache(next)
+      writeWorkStateCache(next, cacheOrigin, cacheOwner)
       return next
     })
-  }, [detail?.id, detail?.key, status?.base_url])
+  }, [detail?.id, detail?.key, status?.base_url, activeCacheScope])
 
   useEffect(() => {
     if (!selectedKey) {
@@ -2698,7 +3436,10 @@ function JiraPage() {
     api(`/issues/${encodeURIComponent(selectedKey)}`, { timeoutMs: 30_000 })
       .then(async nextDetail => {
         if (!alive) return
-        const linksResult = await api(`/links/${encodeURIComponent(nextDetail.id)}`)
+        const owner = readActiveOwner()
+        const linksPath = issueLinksPath(nextDetail.id, owner)
+        if (!linksPath) throw new Error('Jira link owner is unavailable.')
+        const linksResult = await api(linksPath)
         if (!alive) return
         const mappingResult = nextDetail?.project_key
           ? await api(`/mappings/${encodeURIComponent(nextDetail.project_key)}`)
@@ -2741,7 +3482,7 @@ function JiraPage() {
       return () => { alive = false }
     }
 
-    const cached = readLaneCache(projectKeys)
+    const cached = readLaneCache(projectKeys, status?.base_url)
     setDetectedLanes(mergeLaneDefinitions(cached, issueStatuses))
     Promise.all(laneProbeKeys.map(async probe => {
       try {
@@ -2754,10 +3495,10 @@ function JiraPage() {
       if (!alive) return
       const lanes = mergeLaneDefinitions(cached, issueStatuses, ...results)
       setDetectedLanes(lanes)
-      writeLaneCache(projectKeys, lanes)
+      writeLaneCache(projectKeys, lanes, status?.base_url)
     })
     return () => { alive = false }
-  }, [laneProbeSignature])
+  }, [laneProbeSignature, activeCacheScope])
 
   const attentionByKey = useMemo(() => Object.fromEntries(
     issues.map(issue => [issue.key, issueAttentionReasons(issue, workStates[issue.key])])
@@ -2879,6 +3620,7 @@ function JiraPage() {
         method: 'POST',
         body: { transition_id: transition.id, idempotency_key: mutationKey }
       })
+      await invalidateIssueBatchCache(readActiveOwner(), status?.base_url)
       const updated = await api(`/issues/${encodeURIComponent(issueKey)}`, { timeoutMs: 30_000 })
       setIssues(rows => rows.map(issue => issue.key === issueKey ? { ...issue, ...updated } : issue))
       if (selectedKey === issueKey) setDetail(updated)
@@ -3065,7 +3807,8 @@ function JiraPage() {
                     onOpen: openTicket,
                     onMove: moveIssueToLane,
                     workingSessionIds,
-                    workStates
+                    workStates,
+                    liveTicketStates
                   }, lane.key)
                 ),
                 nextPageToken
@@ -3218,6 +3961,7 @@ export default {
   defaultEnabled: true,
   register(ctx) {
     pluginContext = ctx
+    installLiveStatus(ctx)
     ctx.registerMany([
       {
         id: 'page',
@@ -3236,6 +3980,7 @@ export default {
         area: PALETTE_AREA,
         data: {
           id: 'jira-browser.open',
+          action: 'jira-browser.open',
           label: 'Open Jira Browser',
           keywords: ['jira', 'issues', 'tickets', 'worktree'],
           run: () => host.navigate(ROUTE)

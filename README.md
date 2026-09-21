@@ -16,6 +16,8 @@ A native Jira workspace for Hermes Desktop. It presents Jira issues on a Kanban-
 - Highlights a ticket card with a live native status while linked Hermes sessions are working, waiting for input, starting, idle, failed, or archived.
 - Mirrors linked-session status in the native Hermes status bar/title bar, with a palette command and rebindable **Open Jira Browser** keybind (`⌘⇧J` / `Ctrl+Shift+J`).
 - Keeps completion and needs-input notifications opt-in from the command palette and deduplicated across repeated live updates.
+- Shows an owner-qualified Jira context strip in the native composer when the focused chat is linked, with explicit bounded insertion actions for one comment or attachment metadata; insertion never submits a message.
+- Loads linked issue data through a shared, scope-qualified query cache in bounded batches of at most 50 issue keys, with a compatibility fallback to per-ticket reads.
 - Deep-links exact tickets with `/jira?issue=PROJECT-123`; the in-route drawer follows hash navigation.
 - Pins a read-only ticket companion beside chat when the Desktop `host.openWorkspace` contract is available, without opening a session.
 - Provides read-only repository, branch, diff, commit, ahead/behind, pull-request, and CI context for a ticket when its mapped Jira worktree exists.
@@ -106,7 +108,8 @@ Do not commit this configuration file. The repository's `.gitignore` excludes co
    - **Open work session** for the first session in the ticket worktree.
    - **Resume work** to reopen a linked session.
    - **New chat** to create another session in the same linked worktree.
-5. Use **Scan chats** to discover related sessions. Exact linked-worktree matches attach automatically unless you explicitly unlinked that session.
+5. Use the native composer attachment menu for **Insert Jira comment into composer** or **Insert Jira attachment metadata into composer**. These actions add bounded, explicitly labelled untrusted reference text to the draft and never send it.
+6. Use **Scan chats** to discover related sessions. Exact linked-worktree matches attach automatically unless you explicitly unlinked that session.
 
 ## Settings
 
@@ -132,6 +135,19 @@ GET /issues/{issue_key}/repository-context?base_ref=main
 
 The backend resolves the repository from the stored Jira project mapping and then checks the canonical `.worktrees/jira-{ISSUE-KEY}` worktree. It returns an explicit `unavailable` state when the mapping, repository, worktree, Git base ref, or GitHub CLI context is absent. The optional `base_ref` is validated before Git compares ahead/behind state. No renderer-provided filesystem path is accepted.
 
+The bounded issue batch endpoint is used for board link/status refreshes:
+
+```text
+POST /issues/batch
+{"issue_keys":["PROJECT-123"],"include_transitions":false,"include_links":true,"include_details":false,"connection_id":"local","profile_name":"default","target_profile":"default"}
+```
+
+The request accepts at most 50 validated issue keys, deduplicates keys, limits concurrent Jira work, and scopes returned links by Jira origin plus connection/source-profile/target-profile owner. The focused-chat context endpoint requires the complete owner tuple and returns bounded, untrusted issue/comment/attachment metadata only:
+
+```text
+GET /links/session/{stored_session_id}/context?connection_id=local&profile_name=default&target_profile=default
+```
+
 ## Development
 
 Run the complete local quality gate from the repository root:
@@ -152,7 +168,9 @@ The suite covers Jira normalization and security, attachment handling, settings,
 
 ## Repository layout
 
-- `desktop/plugin.js` — Hermes Desktop route, board, drawers, sessions, and settings UI.
+- `desktop/plugin.js` — Hermes Desktop route, board, drawers, sessions, settings UI, and self-contained live status integration.
+- `desktop/data.js` — scoped issue batching, cache, offline snapshot, and mutation invalidation seam.
+- `desktop/chat_context.js` — bounded composer context helpers for legacy Desktop builds.
 - `dashboard/plugin_api.py` — namespaced FastAPI routes.
 - `dashboard/jira_service.py` — Jira client, configuration, settings, Git worktrees, and link storage.
 - `dashboard/manifest.json` — Dashboard plugin manifest.

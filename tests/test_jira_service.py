@@ -4,6 +4,7 @@ import importlib.util
 import json
 import os
 import stat
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -670,6 +671,49 @@ class StoreTests(unittest.TestCase):
             with mock.patch.object(jira_service.sqlite3, "connect", side_effect=swap_then_connect):
                 with self.assertRaises(ValueError):
                     store._connect()
+    def test_store_migration_quarantines_legacy_rows_without_fabricating_owner(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "jira.sqlite3"
+            with sqlite3.connect(path) as database:
+                database.execute(
+                    """
+                    CREATE TABLE session_links (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        issue_id TEXT NOT NULL,
+                        issue_key TEXT NOT NULL,
+                        session_id TEXT NOT NULL,
+                        project_id TEXT,
+                        worktree_path TEXT,
+                        branch TEXT,
+                        created_at TEXT NOT NULL,
+                        UNIQUE(issue_id, session_id)
+                    )
+                    """
+                )
+                database.execute(
+                    "INSERT INTO session_links(issue_id, issue_key, session_id, created_at) VALUES (?, ?, ?, ?)",
+                    ("10001", "DEMO-42", "legacy-session", "2026-01-01T00:00:00Z"),
+                )
+            path.chmod(0o600)
+
+            store = jira_service.JiraStore(path)
+            with store._connect() as database:
+                row = database.execute(
+                    "SELECT jira_origin, connection_id, profile_name, target_profile FROM session_links"
+                ).fetchone()
+
+            self.assertEqual(tuple(row), ("", "", "", ""))
+            self.assertEqual(
+                store.links_for_issue(
+                    "10001",
+                    jira_origin="https://jira.example.invalid",
+                    connection_id="local",
+                    profile_name="default",
+                    target_profile="default",
+                ),
+                [],
+            )
+
     def test_mutation_receipt_replays_completed_result_and_rejects_conflicts(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = jira_service.JiraStore(Path(tmp) / "jira.sqlite3")
@@ -1396,6 +1440,8 @@ class JiraClientTests(unittest.TestCase):
             captured["body"] = json.loads(request.data.decode("utf-8"))
 
             class Response:
+                status = 204
+
                 def __enter__(self):
                     return self
 
@@ -1415,6 +1461,35 @@ class JiraClientTests(unittest.TestCase):
         self.assertEqual(captured["method"], "POST")
         self.assertEqual(captured["body"], {"transition": {"id": "31"}})
         self.assertEqual(result, {"transition_id": "31"})
+
+    def test_transition_issue_rejects_empty_normal_success_as_ambiguous(self):
+        client = jira_service.JiraClient(jira_service.JiraConfig(
+            base_url="https://jira.example.invalid",
+            email="dev@example.com",
+            api_token="very-secret",
+        ))
+
+        class Response:
+            status = 200
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return None
+
+            def read(self, _limit=-1):
+                return b"{}"
+
+        opener = mock.Mock()
+        opener.open.return_value = Response()
+        with mock.patch.object(jira_service.urllib.request, "build_opener", return_value=opener):
+            with self.assertRaises(jira_service.JiraAmbiguousError):
+                client.transition_issue("DEMO-42", "31")
+
+    def test_transition_validator_rejects_unmarked_empty_payload(self):
+        with self.assertRaises(jira_service.JiraAmbiguousError):
+            jira_service._validate_transition_response({}, "31")
 
 
 if __name__ == "__main__":

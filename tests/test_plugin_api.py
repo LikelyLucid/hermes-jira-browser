@@ -9,6 +9,8 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+from pydantic import ValidationError
+
 
 MODULE_PATH = Path(__file__).resolve().parents[1] / "dashboard" / "plugin_api.py"
 spec = importlib.util.spec_from_file_location("jira_browser_plugin_api", MODULE_PATH)
@@ -30,6 +32,7 @@ class JiraBrowserApiTests(unittest.TestCase):
         self.assertIn("/status", paths)
         self.assertIn("/settings", paths)
         self.assertIn("/issues", paths)
+        self.assertIn("/issues/batch", paths)
         self.assertIn("/issues/{issue_key}", paths)
         self.assertIn("/issues/{issue_key}/repository-context", paths)
         self.assertIn("/issues/{issue_key}/attachments/{attachment_id}/preview", paths)
@@ -41,6 +44,113 @@ class JiraBrowserApiTests(unittest.TestCase):
         self.assertIn("/worktrees/cleanup", paths)
         self.assertIn("/links/{issue_id}", paths)
         self.assertIn("/links/{issue_id}/{session_id}", paths)
+
+    def test_issue_batch_is_bounded_deduplicated_and_concurrency_limited(self):
+        client = mock.Mock()
+        client.config.base_url = "https://jira.example.invalid"
+        client.issue_summary.side_effect = lambda key: {"id": key + "-id", "key": key, "summary": "safe"}
+        client.transitions.side_effect = lambda key: [{"id": "31", "name": "Done"}]
+        payload = plugin_api.IssueBatchRequest(
+            issue_keys=["demo-1", "DEMO-2", "DEMO-1"],
+            include_links=False,
+            include_details=False,
+            include_transitions=True,
+            connection_id="local",
+            profile_name="default",
+            target_profile="default",
+        )
+        with mock.patch.object(plugin_api.SERVICE, "active_profile_name", return_value="default"), mock.patch.object(
+            plugin_api, "_client", return_value=client
+        ):
+            result = asyncio.run(plugin_api.issue_batch(payload))
+
+        self.assertEqual(result["requested_items"], 2)
+        self.assertTrue(result["bounded"])
+        self.assertEqual([item["issue"]["key"] for item in result["items"]], ["DEMO-1", "DEMO-2"])
+        self.assertEqual(client.issue_summary.call_count, 2)
+        self.assertEqual(client.transitions.call_count, 2)
+
+    def test_issue_batch_passes_complete_owner_to_link_reads(self):
+        client = mock.Mock()
+        client.config.base_url = "https://jira.example.invalid"
+        client.issue_summary.return_value = {"id": "1001", "key": "DEMO-1", "summary": "safe"}
+        store = mock.Mock()
+        store.links_for_issue.return_value = []
+        payload = plugin_api.IssueBatchRequest(
+            issue_keys=["DEMO-1"],
+            include_links=True,
+            include_details=False,
+            include_transitions=False,
+            connection_id="local",
+            profile_name="default",
+            target_profile="default",
+        )
+        with mock.patch.object(plugin_api.SERVICE, "active_profile_name", return_value="default"), mock.patch.object(
+            plugin_api, "_client", return_value=client
+        ), mock.patch.object(plugin_api, "_store", return_value=store):
+            result = asyncio.run(plugin_api.issue_batch(payload))
+
+        self.assertEqual(result["items"][0]["links"], [])
+        store.links_for_issue.assert_called_once_with(
+            "1001",
+            jira_origin="https://jira.example.invalid",
+            connection_id="local",
+            profile_name="default",
+            target_profile="default",
+        )
+
+        with self.assertRaises(ValidationError):
+            plugin_api.IssueBatchRequest(issue_keys=["DEMO-1"])
+
+    def test_issue_batch_rejects_invalid_keys_before_loading_jira(self):
+        payload = plugin_api.IssueBatchRequest(
+            issue_keys=["not-a-jira-key"],
+            include_links=False,
+            connection_id="local",
+            profile_name="default",
+            target_profile="default",
+        )
+        with mock.patch.object(plugin_api, "_client") as client:
+            with self.assertRaises(plugin_api.HTTPException):
+                asyncio.run(plugin_api.issue_batch(payload))
+        client.assert_not_called()
+
+    def test_focused_session_context_requires_owner_and_bounds_untrusted_content(self):
+        missing = asyncio.run(plugin_api.focused_session_context("session-1"))
+        self.assertEqual(missing, {"available": False, "reason": "owner_required"})
+
+        client = mock.Mock()
+        client.config.base_url = "https://jira.example.invalid/"
+        client.issue.return_value = {
+            "id": "1001",
+            "key": "DEMO-1",
+            "summary": "A" * 1_000,
+            "status": "In Progress",
+            "comments": [{"id": "c1", "body": "B" * 10_000}],
+            "attachments": [{"id": "a1", "filename": "file.txt", "mime_type": "text/plain", "size": "12"}],
+        }
+        store = mock.Mock()
+        store.link_for_session_owner.return_value = {
+            "session_id": "session-1",
+            "issue_id": "1001",
+            "issue_key": "DEMO-1",
+            "connection_id": "local",
+            "profile_name": "default",
+            "target_profile": "default",
+        }
+        with mock.patch.object(plugin_api.SERVICE, "active_profile_name", return_value="default"), mock.patch.object(
+            plugin_api, "_client", return_value=client
+        ), mock.patch.object(plugin_api, "_store", return_value=store):
+            result = asyncio.run(
+                plugin_api.focused_session_context(
+                    "session-1", profile_name="default", connection_id="local", target_profile="default"
+                )
+            )
+
+        self.assertTrue(result["available"])
+        self.assertEqual(len(result["context"]["summary"]), plugin_api.MAX_CHAT_CONTEXT_SUMMARY_CHARS)
+        self.assertEqual(len(result["context"]["comments"][0]["body"]), plugin_api.MAX_CHAT_CONTEXT_COMMENT_CHARS)
+        self.assertEqual(result["context"]["issue_url"], "https://jira.example.invalid/browse/DEMO-1")
 
     def test_status_is_sanitised(self):
         with mock.patch.object(
