@@ -832,20 +832,53 @@ class StoreTests(unittest.TestCase):
                 issue_id="10001",
                 issue_key="DEMO-42",
                 session_id="session-1",
+                jira_origin="https://jira.example.invalid",
+                connection_id="local",
+                profile_name="default",
+                target_profile="default",
                 project_id="p_123",
                 worktree_path="/repo/example_project/.worktrees/jira-DEMO-42",
                 branch="jira/DEMO-42-fix",
             )
 
             self.assertEqual(store.get_project_mapping("DEMO")["hermes_project_id"], "p_123")
-            links = store.links_for_issue("10001")
+            links = store.links_for_issue(
+                "10001",
+                jira_origin="https://jira.example.invalid",
+                connection_id="local",
+                profile_name="default",
+                target_profile="default",
+            )
             self.assertEqual(len(links), 1)
             self.assertEqual(links[0]["session_id"], "session-1")
             self.assertEqual(links[0]["branch"], "jira/DEMO-42-fix")
 
-            self.assertTrue(store.unlink_session(issue_id="10001", session_id="session-1"))
-            self.assertEqual(store.links_for_issue("10001"), [])
-            self.assertFalse(store.unlink_session(issue_id="10001", session_id="session-1"))
+            self.assertTrue(store.unlink_session(
+                issue_id="10001",
+                session_id="session-1",
+                jira_origin="https://jira.example.invalid",
+                connection_id="local",
+                profile_name="default",
+                target_profile="default",
+            ))
+            self.assertEqual(
+                store.links_for_issue(
+                    "10001",
+                    jira_origin="https://jira.example.invalid",
+                    connection_id="local",
+                    profile_name="default",
+                    target_profile="default",
+                ),
+                [],
+            )
+            self.assertFalse(store.unlink_session(
+                issue_id="10001",
+                session_id="session-1",
+                jira_origin="https://jira.example.invalid",
+                connection_id="local",
+                profile_name="default",
+                target_profile="default",
+            ))
 
     def test_session_links_include_title_and_keep_archived_chats(self):
         class FakeSessionDB:
@@ -860,7 +893,13 @@ class StoreTests(unittest.TestCase):
 
         module = types.ModuleType("hermes_state")
         module.SessionDB = FakeSessionDB
-        links = [{"session_id": "session-1", "branch": "jira/DEMO-42"}]
+        links = [{
+            "session_id": "session-1",
+            "branch": "jira/DEMO-42",
+            "connection_id": "local",
+            "profile_name": "default",
+            "target_profile": "default",
+        }]
         with mock.patch.dict(sys.modules, {"hermes_state": module}):
             result = jira_service.enrich_session_links(links)
 

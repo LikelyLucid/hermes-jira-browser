@@ -340,9 +340,9 @@ class JiraBrowserApiTests(unittest.TestCase):
             issue_id="10001",
             issue_key="DEMO-42",
             session_id="session-1",
-            connection_id="work-vps",
-            profile_name="coder",
-            target_profile="coder",
+            connection_id="local",
+            profile_name="default",
+            target_profile="default",
         )
         with mock.patch.object(plugin_api, "_store", return_value=store), mock.patch.object(
             plugin_api, "_client", return_value=client
@@ -365,12 +365,13 @@ class JiraBrowserApiTests(unittest.TestCase):
             issue_key="DEMO-42",
             session_id="session-1",
             jira_origin="https://jira.example.invalid",
-            connection_id="work-vps",
-            profile_name="coder",
-            target_profile="coder",
+            connection_id="local",
+            profile_name="default",
+            target_profile="default",
             project_id="p_1",
             worktree_path="/trusted/repo/.worktrees/jira-DEMO-42",
             branch="jira/DEMO-42",
+            clear_detachment=False,
         )
 
     def test_unlink_removes_only_the_ticket_session_association(self):
@@ -384,8 +385,9 @@ class JiraBrowserApiTests(unittest.TestCase):
             result = asyncio.run(plugin_api.unlink_session(
                 "10001",
                 "session-1",
-                connection_id=" work-vps ",
-                profile_name=" coder ",
+                connection_id=" local ",
+                profile_name=" default ",
+                target_profile=" default ",
             ))
 
         self.assertEqual(result, {"unlinked": True})
@@ -393,14 +395,27 @@ class JiraBrowserApiTests(unittest.TestCase):
             issue_id="10001",
             session_id="session-1",
             jira_origin="https://jira.example.invalid",
-            connection_id="work-vps",
-            profile_name="coder",
+            connection_id="local",
+            profile_name="default",
+            target_profile="default",
         )
 
     def test_issue_links_include_archived_chat_title(self):
         store = mock.Mock()
-        raw = [{"session_id": "session-1"}]
-        detached = [{"session_id": "session-2", "connection_id": "work-vps", "profile_name": "coder"}]
+        raw = [{
+            "session_id": "session-1",
+            "jira_origin": "https://jira.example.invalid",
+            "connection_id": "local",
+            "profile_name": "default",
+            "target_profile": "default",
+        }]
+        detached = [{
+            "session_id": "session-2",
+            "jira_origin": "https://jira.example.invalid",
+            "connection_id": "local",
+            "profile_name": "default",
+            "target_profile": "default",
+        }]
         enriched = [{"session_id": "session-1", "chat_title": "Fix milk totals", "archived": True, "available": True}]
         store.links_for_issue.return_value = raw
         store.detached_links_for_issue.return_value = detached
@@ -413,12 +428,29 @@ class JiraBrowserApiTests(unittest.TestCase):
             "enrich_session_links",
             return_value=enriched,
         ) as enrich:
-            result = asyncio.run(plugin_api.issue_links("10001"))
+            result = asyncio.run(plugin_api.issue_links(
+                "10001",
+                connection_id="local",
+                profile_name="default",
+                target_profile="default",
+            ))
 
         self.assertEqual(result["links"], enriched)
         self.assertEqual(result["detached"], detached)
-        store.links_for_issue.assert_called_once_with("10001", jira_origin="https://jira.example.invalid")
-        store.detached_links_for_issue.assert_called_once_with("10001", jira_origin="https://jira.example.invalid")
+        store.links_for_issue.assert_called_once_with(
+            "10001",
+            jira_origin="https://jira.example.invalid",
+            connection_id="local",
+            profile_name="default",
+            target_profile="default",
+        )
+        store.detached_links_for_issue.assert_called_once_with(
+            "10001",
+            jira_origin="https://jira.example.invalid",
+            connection_id="local",
+            profile_name="default",
+            target_profile="default",
+        )
         enrich.assert_called_once_with(raw)
 
     def test_project_sessions_use_server_side_mapping_and_include_archived(self):

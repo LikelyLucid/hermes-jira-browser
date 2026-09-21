@@ -1464,26 +1464,30 @@ class JiraStore:
     def _create_session_links_table(db: sqlite3.Connection) -> None:
         db.execute(
             """
-                CREATE TABLE IF NOT EXISTS session_links (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    issue_id TEXT NOT NULL,
-                    issue_key TEXT NOT NULL,
-                    jira_origin TEXT NOT NULL DEFAULT '',
-                    connection_id TEXT NOT NULL DEFAULT 'local',
-                    profile_name TEXT NOT NULL DEFAULT 'default',
-                    target_profile TEXT NOT NULL DEFAULT 'default',
-                    session_id TEXT NOT NULL,
-                    project_id TEXT,
-                    worktree_path TEXT,
-                    branch TEXT,
-                    detached INTEGER NOT NULL DEFAULT 0,
-                    created_at TEXT NOT NULL,
-                    UNIQUE(jira_origin, issue_id, connection_id, profile_name, target_profile, session_id)
-                );
-                CREATE INDEX IF NOT EXISTS session_links_issue_idx
-                    ON session_links(jira_origin, issue_id, detached, created_at DESC);
-                """
+            CREATE TABLE IF NOT EXISTS session_links (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                issue_id TEXT NOT NULL,
+                issue_key TEXT NOT NULL,
+                jira_origin TEXT NOT NULL DEFAULT '',
+                connection_id TEXT NOT NULL DEFAULT 'local',
+                profile_name TEXT NOT NULL DEFAULT 'default',
+                target_profile TEXT NOT NULL DEFAULT 'default',
+                session_id TEXT NOT NULL,
+                project_id TEXT,
+                worktree_path TEXT,
+                branch TEXT,
+                detached INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL,
+                UNIQUE(jira_origin, issue_id, connection_id, profile_name, target_profile, session_id)
             )
+            """
+        )
+        db.execute(
+            """
+            CREATE INDEX IF NOT EXISTS session_links_issue_idx
+                ON session_links(jira_origin, issue_id, detached, created_at DESC)
+            """
+        )
 
     def reserve_mutation(
         self,
