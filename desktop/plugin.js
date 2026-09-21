@@ -40,6 +40,9 @@ const ISSUE_KEY_PATTERN = /^[A-Z][A-Z0-9]+-\d+$/
 const DEFAULT_JQL = 'assignee = currentUser() AND statusCategory != Done ORDER BY updated DESC'
 const ISSUE_CACHE_KEY = 'issue-list-cache-v1'
 const ISSUE_CACHE_LIMIT = 6
+const VIEW_STATE_KEY = 'saved-view-state-v1'
+const VIEW_STATE_LIMIT = 40
+const VIEW_FILTER_LIMIT = 160
 const LANE_CACHE_KEY = 'workflow-lane-cache-v1'
 const WORK_STATE_CACHE_KEY = 'ticket-work-state-cache-v1'
 const WORKTREE_LINKS_KEY = 'ticket-worktree-links-v1'
@@ -1013,6 +1016,50 @@ function cacheScopeKey(origin = '', owner = null) {
   ].map(value => String(value || '').trim())
   if (values.some(value => !value)) return ''
   return values.map(value => encodeURIComponent(value)).join('::')
+}
+
+function isLikelyOfflineError(error) {
+  const message = errorText(error, '').toLowerCase()
+  return /offline|network|fetch|timeout|timed out|gateway|unavailable|econn|enotfound|connection/.test(message)
+}
+
+function isQuickFilter(value) {
+  return QUICK_FILTER_OPTIONS.some(option => option.value === value) ? value : 'all'
+}
+
+function viewStateId(viewId, origin = '', owner = null) {
+  const scope = cacheScopeKey(origin, owner)
+  const id = String(viewId || '').trim()
+  return scope && id ? `${scope}:${encodeURIComponent(id)}` : ''
+}
+
+function readSavedViewState(viewId, origin = '', owner = null) {
+  const key = viewStateId(viewId, origin, owner)
+  if (!key) return null
+  const states = pluginContext?.storage.get(VIEW_STATE_KEY, {}) || {}
+  const entry = states[key]
+  return entry && typeof entry === 'object' ? entry : null
+}
+
+function writeSavedViewState(viewId, state = {}, origin = '', owner = null) {
+  const key = viewStateId(viewId, origin, owner)
+  if (!pluginContext || !key) return
+  const current = pluginContext.storage.get(VIEW_STATE_KEY, {}) || {}
+  const next = {
+    ...current,
+    [key]: {
+      filter: String(state.filter || '').trim().slice(0, VIEW_FILTER_LIMIT),
+      quickFilter: isQuickFilter(state.quickFilter),
+      attentionOnly: state.attentionOnly === true,
+      storedAt: Date.now()
+    }
+  }
+  const bounded = Object.fromEntries(
+    Object.entries(next)
+      .sort((left, right) => Number(right[1]?.storedAt || 0) - Number(left[1]?.storedAt || 0))
+      .slice(0, VIEW_STATE_LIMIT)
+  )
+  pluginContext.storage.set(VIEW_STATE_KEY, bounded)
 }
 
 function issueCacheId(jql, pageSize, scope = '') {
@@ -3109,7 +3156,9 @@ function SettingsDrawer({
   onCopyJson,
   onCopyPath,
   onCreateFriendlyView,
+  onDuplicateView,
   onFieldChange,
+  onMoveView,
   onReload,
   onRemoveView,
   onViewChange,
@@ -3287,13 +3336,44 @@ function SettingsDrawer({
                       placeholder: 'id',
                       value: String(view.id || '')
                     }),
-                    jsx(Button, {
-                      'aria-label': `Remove ${view.label || view.id}`,
-                      disabled: views.length <= 1,
-                      onClick: () => onRemoveView(index),
-                      size: 'icon-xs',
-                      variant: 'ghost',
-                      children: jsx(Codicon, { name: 'trash', size: '0.78rem' })
+                    jsxs('div', {
+                      className: 'flex items-center justify-end gap-0.5',
+                      children: [
+                        jsx(Button, {
+                          'aria-label': `Duplicate ${view.label || view.id}`,
+                          onClick: () => onDuplicateView(index),
+                          size: 'icon-xs',
+                          title: 'Duplicate',
+                          variant: 'ghost',
+                          children: jsx(Codicon, { name: 'copy', size: '0.75rem' })
+                        }),
+                        jsx(Button, {
+                          'aria-label': `Move saved view up: ${view.label || view.id}`,
+                          disabled: index === 0,
+                          onClick: () => onMoveView(index, -1),
+                          size: 'icon-xs',
+                          title: 'Move saved view up',
+                          variant: 'ghost',
+                          children: jsx(Codicon, { name: 'chevron-up', size: '0.75rem' })
+                        }),
+                        jsx(Button, {
+                          'aria-label': `Move saved view down: ${view.label || view.id}`,
+                          disabled: index === views.length - 1,
+                          onClick: () => onMoveView(index, 1),
+                          size: 'icon-xs',
+                          title: 'Move saved view down',
+                          variant: 'ghost',
+                          children: jsx(Codicon, { name: 'chevron-down', size: '0.75rem' })
+                        }),
+                        jsx(Button, {
+                          'aria-label': `Remove ${view.label || view.id}`,
+                          disabled: views.length <= 1,
+                          onClick: () => onRemoveView(index),
+                          size: 'icon-xs',
+                          variant: 'ghost',
+                          children: jsx(Codicon, { name: 'trash', size: '0.78rem' })
+                        })
+                      ]
                     })
                   ]
                 }),
@@ -3567,18 +3647,18 @@ function JiraPage() {
     const pageSize = Number(options.pageSize) || 50
     const origin = String(options.origin || jiraOriginRef.current || '').trim()
     const owner = options.owner || readActiveOwner()
-    const cached = !append && !options.force ? readIssueCache(nextJql, pageSize, origin, owner) : null
+    const cached = !append ? readIssueCache(nextJql, pageSize, origin, owner) : null
     const generation = ++requestGeneration.current
     if (append) {
       setLoadingMore(true)
-    } else if (cached) {
+    } else if (cached && !options.force) {
       setIssues(cached.issues)
       setNextPageToken(String(cached.nextPageToken || ''))
       setLoading(false)
-      setCacheState('Cached · refreshing…')
+      setCacheState(`Cached · last updated ${relativeDate(cached.storedAt) || 'recently'} · refreshing…`)
     } else {
       setLoading(true)
-      setCacheState('')
+      setCacheState(cached ? 'Refreshing cached results…' : '')
     }
     setError('')
     try {
@@ -3588,7 +3668,7 @@ function JiraPage() {
       const rows = Array.isArray(result?.issues) ? result.issues : []
       const nextToken = String(result?.next_page_token || '')
       setNextPageToken(nextToken)
-      setCacheState('Updated just now')
+      setCacheState('Live · updated just now')
       if (append) {
         setIssues(current => {
           const merged = [...new Map([...current, ...rows].map(issue => [issue.id || issue.key, issue])).values()]
@@ -3602,10 +3682,13 @@ function JiraPage() {
     } catch (cause) {
       if (generation !== requestGeneration.current) return
       if (cached) {
+        setIssues(current => current.length > 0 ? current : cached.issues)
+        setNextPageToken(String(cached.nextPageToken || ''))
         setError('Could not refresh Jira tickets. Showing cached results.')
-        setCacheState('Cached')
+        setCacheState(`Stale · last updated ${relativeDate(cached.storedAt) || 'recently'}`)
       } else {
-        setError(errorText(cause, 'Could not load Jira tickets.'))
+        setError(`${isLikelyOfflineError(cause) ? 'Offline: ' : ''}${errorText(cause, 'Could not load Jira tickets.')}`)
+        setCacheState(isLikelyOfflineError(cause) ? 'Offline' : 'Error')
         if (!append) {
           setIssues([])
           setNextPageToken('')
@@ -3617,6 +3700,14 @@ function JiraPage() {
         setLoadingMore(false)
       }
     }
+  }, [])
+
+  const restoreViewState = useCallback((viewId, origin = jiraOriginRef.current, owner = null) => {
+    const saved = readSavedViewState(viewId, origin, owner || readActiveOwner())
+    setFilter(String(saved?.filter || '').slice(0, VIEW_FILTER_LIMIT))
+    setQuickFilter(isQuickFilter(saved?.quickFilter))
+    setAttentionOnly(saved?.attentionOnly === true)
+    setCollapsedLanes({})
   }, [])
 
   useEffect(() => {
@@ -3634,6 +3725,7 @@ function JiraPage() {
         setSettings(nextSettings)
         setActiveView(String(view?.id || 'assigned'))
         setSubmittedJql(nextJql)
+        restoreViewState(String(view?.id || 'assigned'), nextStatus?.base_url)
         setSettingsDraft(formatted)
         lastSavedSettings.current = formatted
         if (nextStatus?.configured) return loadIssues(nextJql, { pageSize: nextSettings?.pageSize, origin: nextStatus?.base_url })
@@ -3647,7 +3739,7 @@ function JiraPage() {
     return () => {
       alive = false
     }
-  }, [loadIssues])
+  }, [loadIssues, restoreViewState])
 
   useEffect(() => {
     const previousScope = lastCacheScopeRef.current
@@ -3674,6 +3766,11 @@ function JiraPage() {
       })
     }
   }, [activeCacheScope])
+
+  useEffect(() => {
+    if (!activeView || !activeCacheScope) return
+    writeSavedViewState(activeView, { filter, quickFilter, attentionOnly }, status?.base_url, readActiveOwner())
+  }, [activeCacheScope, activeView, attentionOnly, filter, quickFilter, status?.base_url])
 
   useEffect(() => {
     if (!settingsDraft || settingsDraft === lastSavedSettings.current) return
@@ -3787,11 +3884,10 @@ function JiraPage() {
     }))
     setActiveView(nextId)
     setSubmittedJql(nextJql)
-    setQuickFilter('all')
-    setAttentionOnly(false)
+    restoreViewState(nextId)
     if (status?.configured) void loadIssues(nextJql, { pageSize: editableSettings.pageSize })
     host.notify({ kind: 'success', message: `Saved view “${nextLabel}”.` })
-  }, [editableSettings.pageSize, loadIssues, mutateSettingsDraft, status?.configured])
+  }, [editableSettings.pageSize, loadIssues, mutateSettingsDraft, restoreViewState, status?.configured])
 
   const addBacklogView = useCallback(() => {
     mutateSettingsDraft(current => {
@@ -3822,6 +3918,41 @@ function JiraPage() {
       while (ids.has(`view-${number}`)) number += 1
       views.push({ id: `view-${number}`, label: `New view ${number}`, jql: DEFAULT_JQL, layout: 'board', sort: 'updated', density: 'comfortable' })
       return { ...current, views }
+    })
+  }, [mutateSettingsDraft])
+
+  const duplicateSavedView = useCallback(index => {
+    const views = Array.isArray(editableSettings.views) ? editableSettings.views : []
+    const source = views[index]
+    if (!source) return
+    const ids = new Set(views.map(view => String(view?.id || '')))
+    const base = String(source.id || 'view').replace(/[^a-zA-Z0-9_-]/g, '-').slice(0, 56) || 'view'
+    let duplicateId = `${base}-copy`
+    let suffix = 2
+    while (ids.has(duplicateId)) duplicateId = `${base}-${suffix++}`
+    const duplicateLabel = `${String(source.label || source.id || 'Saved view').trim()} copy`.slice(0, 100)
+    mutateSettingsDraft(current => {
+      const currentViews = Array.isArray(current.views) ? [...current.views] : []
+      if (currentViews.some(view => String(view?.id || '') === duplicateId)) return current
+      currentViews.splice(index + 1, 0, { ...source, id: duplicateId, label: duplicateLabel })
+      return { ...current, defaultView: current.defaultView, views: currentViews }
+    })
+    setActiveView(duplicateId)
+    setSubmittedJql(String(source.jql || DEFAULT_JQL))
+    restoreViewState(duplicateId)
+    if (status?.configured) void loadIssues(String(source.jql || DEFAULT_JQL), { pageSize: editableSettings.pageSize })
+    host.notify({ kind: 'success', message: `Duplicated view “${source.label || source.id}”.` })
+  }, [editableSettings.pageSize, editableSettings.views, loadIssues, mutateSettingsDraft, restoreViewState, status?.configured])
+
+  const reorderSavedView = useCallback((index, direction) => {
+    mutateSettingsDraft(current => {
+      const views = Array.isArray(current.views) ? [...current.views] : []
+      const target = index + direction
+      if (!views[index] || target < 0 || target >= views.length) return current
+      const moved = views[index]
+      views[index] = views[target]
+      views[target] = moved
+      return { ...current, defaultView: current.defaultView, views }
     })
   }, [mutateSettingsDraft])
 
@@ -4131,10 +4262,9 @@ function JiraPage() {
     if (!view) return
     setActiveView(nextId)
     setSubmittedJql(view.jql)
-    setQuickFilter('all')
-    setAttentionOnly(false)
+    restoreViewState(nextId)
     loadIssues(view.jql, { pageSize: editableSettings?.pageSize })
-  }, [editableSettings, loadIssues])
+  }, [editableSettings, loadIssues, restoreViewState])
 
   const openTicket = useCallback(issueKey => {
     const key = normaliseIssueKey(issueKey)
@@ -4473,9 +4603,17 @@ function JiraPage() {
       error
         ? jsxs('div', {
             className: 'mb-3 flex shrink-0 items-center gap-2 rounded-md bg-destructive/10 px-3 py-2 text-xs text-destructive',
+            role: 'alert',
             children: [
               jsx(Codicon, { name: 'warning', size: '0.875rem' }),
-              jsx('span', { className: 'min-w-0 flex-1', children: error })
+              jsx('span', { className: 'min-w-0 flex-1', children: error }),
+              jsx(Button, {
+                disabled: loading,
+                onClick: () => loadIssues(submittedJql, { force: true, pageSize: editableSettings?.pageSize }),
+                size: 'xs',
+                variant: 'ghost',
+                children: 'Retry'
+              })
             ]
           })
         : null,
@@ -4610,7 +4748,9 @@ function JiraPage() {
                   onCopyJson: copySettingsJson,
                   onCopyPath: copySettingsPath,
                   onCreateFriendlyView: createFriendlyView,
+                  onDuplicateView: duplicateSavedView,
                   onFieldChange: updateSettingsField,
+                  onMoveView: reorderSavedView,
                   onReload: reloadSettingsFile,
                   onRemoveView: removeSavedView,
                   onViewChange: updateSavedView,

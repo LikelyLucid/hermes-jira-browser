@@ -8,7 +8,10 @@ A native Jira workspace for Hermes Desktop. It presents Jira issues on a Board/L
 - Discovers Jira workflow lanes, including empty lanes, from available transitions.
 - Supports saved JQL views, pagination, stale-while-revalidate caches, and an attention view.
 - Gives each saved view its own Board/List layout, sort order, and comfortable/compact density, with a friendly builder for common queues that do not require hand-written JQL.
+- Makes saved views easier to curate with duplicate, move up/down, and remove controls while preserving the active/default view.
+- Remembers the search text, quick filter, and attention-only state separately for each Jira view and owner scope.
 - Provides quick filters for attention, blocked, unassigned, unlinked, working, and stale tickets, plus `/`, `j`/`k`, `b`/`l`, `r`, and `Escape` keyboard shortcuts.
+- Keeps cached tickets visible when refresh fails and labels live, cached, stale, offline, and error states with an explicit Retry action.
 - Keeps list scanning useful with previous/next ticket navigation inside the detail drawer.
 - Shows full issue metadata, descriptions, comments, parent/subtasks, components, versions, and attachments.
 - Renders authenticated image thumbnails without exposing Jira credentials to the Desktop renderer.
@@ -122,7 +125,7 @@ Settings are written atomically with mode `0600` to:
 $HERMES_HOME/jira-browser/settings.json
 ```
 
-The drawer uses plain-language controls for common settings: choose a **Board** for moving active work through workflow columns or a **List** for scanning a backlog, choose the view to open by default, set how many tickets load at once, and choose the base ref for new worktrees. Saved views are named Jira searches with independent layout, sort, and density preferences; the **Backlog** preset opens as a compact, priority-sorted list. Use **Create a saved view** to build common assigned/unassigned, open/completed, blocked/review, and label-based queues without writing JQL. On the ticket surface, quick filters narrow the current result set without changing the saved query, and the keyboard hint shows `/` to filter, `j`/`k` to move, `b`/`l` to switch layout, `r` to refresh, and `Escape` to close. Advanced users can expand the credential-free JSON editor, but most users never need it. Credentials are never stored there.
+The drawer uses plain-language controls for common settings: choose a **Board** for moving active work through workflow columns or a **List** for scanning a backlog, choose the view to open by default, set how many tickets load at once, and choose the base ref for new worktrees. Saved views are named Jira searches with independent layout, sort, and density preferences; the **Backlog** preset opens as a compact, priority-sorted list. Use **Create a saved view** to build common assigned/unassigned, open/completed, blocked/review, and label-based queues without writing JQL. Duplicate a view to keep its query and presentation as a starting point, or move it up/down to organize the picker. On the ticket surface, quick filters narrow the current result set without changing the saved query, and each view remembers its search/filter state in owner-scoped Desktop storage. Failed refreshes keep bounded cached results visible and expose a stale/offline/error label plus **Retry**. The keyboard hint shows `/` to filter, `j`/`k` to move, `b`/`l` to switch layout, `r` to refresh, and `Escape` to close. Advanced users can expand the credential-free JSON editor, but most users never need it. Credentials are never stored there.
 
 ## Desktop compatibility
 

@@ -23,7 +23,7 @@ class DesktopPluginTests(unittest.TestCase):
         self.assertIn("resolvedOwner?.targetProfile", source)
         self.assertIn("readWorkStateCache(cacheOrigin, cacheOwner)", source)
         self.assertIn("readTicketWorktree(issue?.key, cacheOrigin)", source)
-        self.assertIn("Cached · refreshing…", source)
+        self.assertIn("Cached · last updated", source)
 
     def test_status_lanes_match_the_native_kanban_board_shape(self):
         source = PLUGIN.read_text(encoding="utf-8")
@@ -109,7 +109,7 @@ class DesktopPluginTests(unittest.TestCase):
         self.assertIn("? jsxs('div', {\n                className: 'min-h-0 flex-1 overflow-auto", source)
         self.assertIn("children: loadingMore ? 'Loading…' : 'Load more tickets'", source)
 
-    def test_saved_views_have_human_preferences_and_a_friendly_builder(self):
+    def test_saved_view_management_supports_human_builder_and_per_view_preferences(self):
         source = PLUGIN.read_text(encoding="utf-8")
 
         self.assertIn("function FriendlyViewBuilder", source)
@@ -120,6 +120,39 @@ class DesktopPluginTests(unittest.TestCase):
         self.assertIn("view.layout", source)
         self.assertIn("view.sort", source)
         self.assertIn("view.density", source)
+
+    def test_saved_view_management_supports_duplicate_and_reorder(self):
+        source = PLUGIN.read_text(encoding="utf-8")
+
+        self.assertIn("const duplicateSavedView = useCallback", source)
+        self.assertIn("const reorderSavedView = useCallback", source)
+        self.assertIn("onDuplicateView", source)
+        self.assertIn("onMoveView", source)
+        self.assertIn("Duplicate", source)
+        self.assertIn("Move saved view up", source)
+        self.assertIn("Move saved view down", source)
+        self.assertIn("defaultView: current.defaultView", source)
+
+    def test_saved_view_search_state_is_scoped_and_restored(self):
+        source = PLUGIN.read_text(encoding="utf-8")
+
+        self.assertIn("const VIEW_STATE_KEY = 'saved-view-state-v1'", source)
+        self.assertIn("function readSavedViewState", source)
+        self.assertIn("function writeSavedViewState", source)
+        self.assertIn("const restoreViewState = useCallback", source)
+        self.assertIn("setFilter(String(saved?.filter || '')", source)
+        self.assertIn("setQuickFilter(isQuickFilter(saved?.quickFilter)", source)
+        self.assertIn("writeSavedViewState(activeView", source)
+
+    def test_refresh_states_preserve_cache_and_offer_retry(self):
+        source = PLUGIN.read_text(encoding="utf-8")
+
+        self.assertIn("function isLikelyOfflineError", source)
+        self.assertIn("Stale · last updated", source)
+        self.assertIn("Offline", source)
+        self.assertIn("role: 'alert'", source)
+        self.assertIn("children: 'Retry'", source)
+        self.assertIn("Showing cached results", source)
 
     def test_ticket_surface_has_quick_filters_sorting_and_density_controls(self):
         source = PLUGIN.read_text(encoding="utf-8")
