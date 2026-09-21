@@ -19,6 +19,10 @@ class DesktopPluginTests(unittest.TestCase):
         self.assertIn("const ISSUE_CACHE_KEY = 'issue-list-cache-v1'", source)
         self.assertIn("pluginContext.storage.get(ISSUE_CACHE_KEY", source)
         self.assertIn("pluginContext.storage.set(ISSUE_CACHE_KEY", source)
+        self.assertIn("function cacheScopeKey", source)
+        self.assertIn("resolvedOwner?.targetProfile", source)
+        self.assertIn("readWorkStateCache(cacheOrigin, cacheOwner)", source)
+        self.assertIn("readTicketWorktree(issue?.key, cacheOrigin)", source)
         self.assertIn("Cached · refreshing…", source)
 
     def test_status_lanes_match_the_native_kanban_board_shape(self):

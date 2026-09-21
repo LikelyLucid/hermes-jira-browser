@@ -48,6 +48,7 @@ class LiveStatusTests(unittest.TestCase):
     def test_ticket_state_aggregation_preserves_highest_priority(self):
         source = self._source()
         self.assertIn("function liveStatusPriority", source)
+        self.assertIn("if (String(entry?.ownerKey || '') !== activeOwnerKey) continue", source)
         self.assertIn("liveStatusPriority(entry.state) > liveStatusPriority(current)", source)
 
     def test_issue_batch_client_rejects_invalid_keys_instead_of_silently_dropping(self):

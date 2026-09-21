@@ -2988,8 +2988,15 @@ function JiraPage() {
 
   useEffect(() => {
     const unsubscribe = subscribeLiveStatuses(snapshot => {
+      const activeOwner = readActiveOwner()
+      const activeOwnerKey = activeOwner ? liveOwnerKey(activeOwner) : ''
       const next = {}
+      if (!activeOwnerKey) {
+        setLiveTicketStates(next)
+        return
+      }
       for (const entry of Array.isArray(snapshot?.entries) ? snapshot.entries : []) {
+        if (String(entry?.ownerKey || '') !== activeOwnerKey) continue
         const key = String(entry?.ticketKey || '').trim().toUpperCase()
         if (!key) continue
         const current = next[key]
@@ -3163,6 +3170,8 @@ function JiraPage() {
     setIssues([])
     setNextPageToken('')
     setWorkStates({})
+    setLiveTicketStates({})
+    setWorkingSessionIds(new Set())
     setDetectedLanes([])
     setDetail(null)
     setMapping(null)
