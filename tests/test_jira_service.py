@@ -924,6 +924,114 @@ class StoreTests(unittest.TestCase):
                 target_profile="default",
             ))
 
+    def test_store_migrates_pre_target_owner_unique_constraint_before_linking(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "jira.sqlite3"
+            with sqlite3.connect(path) as database:
+                database.execute(
+                    """
+                    CREATE TABLE session_links (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        issue_id TEXT NOT NULL,
+                        issue_key TEXT NOT NULL,
+                        jira_origin TEXT NOT NULL DEFAULT '',
+                        connection_id TEXT NOT NULL DEFAULT 'local',
+                        profile_name TEXT NOT NULL DEFAULT 'default',
+                        target_profile TEXT NOT NULL DEFAULT 'default',
+                        session_id TEXT NOT NULL,
+                        project_id TEXT,
+                        worktree_path TEXT,
+                        branch TEXT,
+                        detached INTEGER NOT NULL DEFAULT 0,
+                        created_at TEXT NOT NULL,
+                        UNIQUE(jira_origin, issue_id, connection_id, profile_name, session_id)
+                    )
+                    """
+                )
+                database.execute(
+                    """
+                    INSERT INTO session_links
+                        (issue_id, issue_key, jira_origin, connection_id, profile_name,
+                         target_profile, session_id, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        "10001",
+                        "DEMO-42",
+                        "https://jira.example.invalid",
+                        "local",
+                        "default",
+                        "default",
+                        "session-1",
+                        "2026-01-01T00:00:00Z",
+                    ),
+                )
+            path.chmod(0o600)
+
+            store = jira_service.JiraStore(path)
+            with store._connect() as database:
+                table_sql = "".join(str(database.execute(
+                    "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'session_links'"
+                ).fetchone()[0]).lower().split())
+            self.assertIn(
+                "unique(jira_origin,issue_id,connection_id,profile_name,target_profile,session_id)",
+                table_sql,
+            )
+            store.link_session(
+                issue_id="10002",
+                issue_key="DEMO-43",
+                session_id="session-1",
+                jira_origin="https://jira.example.invalid",
+                connection_id="local",
+                profile_name="default",
+                target_profile="default",
+                move_existing=True,
+            )
+            self.assertEqual(
+                store.links_for_issue(
+                    "10002",
+                    jira_origin="https://jira.example.invalid",
+                    connection_id="local",
+                    profile_name="default",
+                    target_profile="default",
+                )[0]["session_id"],
+                "session-1",
+            )
+
+    def test_manual_link_moves_a_chat_to_a_new_ticket_and_tombstones_the_old_one(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = jira_service.JiraStore(Path(tmp) / "jira.sqlite3")
+            common = {
+                "session_id": "session-1",
+                "jira_origin": "https://jira.example.invalid",
+                "connection_id": "local",
+                "profile_name": "default",
+                "target_profile": "default",
+            }
+            store.link_session(issue_id="10001", issue_key="DEMO-42", **common)
+            moved = store.link_session(
+                issue_id="10002",
+                issue_key="DEMO-43",
+                move_existing=True,
+                **common,
+            )
+
+            self.assertEqual(moved["issue_key"], "DEMO-43")
+            self.assertEqual(
+                store.links_for_issue("10001", **{key: common[key] for key in ("jira_origin", "connection_id", "profile_name", "target_profile")}),
+                [],
+            )
+            old_detached = store.detached_links_for_issue(
+                "10001",
+                **{key: common[key] for key in ("jira_origin", "connection_id", "profile_name", "target_profile")},
+            )
+            self.assertEqual([row["session_id"] for row in old_detached], ["session-1"])
+            new_links = store.links_for_issue(
+                "10002",
+                **{key: common[key] for key in ("jira_origin", "connection_id", "profile_name", "target_profile")},
+            )
+            self.assertEqual([row["session_id"] for row in new_links], ["session-1"])
+
     def test_session_links_include_title_and_keep_archived_chats(self):
         class FakeSessionDB:
             def __init__(self, read_only=False):

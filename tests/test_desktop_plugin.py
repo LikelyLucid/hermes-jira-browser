@@ -162,7 +162,15 @@ class DesktopPluginTests(unittest.TestCase):
         self.assertIn("const attachRelatedChat = useCallback", source)
         self.assertIn("Scan chats", source)
 
-    def test_linked_chats_can_be_unlinked_without_deleting_the_chat(self):
+    def test_manual_link_can_move_a_chat_from_another_ticket(self):
+        source = PLUGIN.read_text(encoding="utf-8")
+        manual = source[source.index("const linkCurrent"):source.index("const attachRelatedChat")]
+        attach = source[source.index("const attachRelatedChat"):source.index("const unlinkChat")]
+        automatic = source[source.index("const worktreeSessions"):source.index("const related =")]
+        self.assertIn("move_existing: true", manual)
+        self.assertIn("move_existing: true", attach)
+        self.assertIn("move_existing: false", automatic)
+
         source = PLUGIN.read_text(encoding="utf-8")
 
         self.assertIn("const DETACHED_CHAT_LINKS_KEY = 'detached-ticket-chat-links-v1'", source)

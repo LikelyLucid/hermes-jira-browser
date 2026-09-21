@@ -453,6 +453,7 @@ class JiraBrowserApiTests(unittest.TestCase):
             connection_id="local",
             profile_name="default",
             target_profile="default",
+            move_existing=True,
         )
         with mock.patch.object(plugin_api, "_store", return_value=store), mock.patch.object(
             plugin_api, "_client", return_value=client
@@ -482,6 +483,7 @@ class JiraBrowserApiTests(unittest.TestCase):
             worktree_path="/trusted/repo/.worktrees/jira-DEMO-42",
             branch="jira/DEMO-42",
             clear_detachment=False,
+            move_existing=True,
         )
 
     def test_unlink_removes_only_the_ticket_session_association(self):

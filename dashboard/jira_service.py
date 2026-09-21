@@ -1739,6 +1739,7 @@ class JiraStore:
         worktree_path: str | None = None,
         branch: str | None = None,
         clear_detachment: bool = False,
+        move_existing: bool = False,
     ) -> dict[str, Any]:
         if not all((issue_id.strip(), issue_key.strip(), session_id.strip())):
             raise ValueError("Issue id, issue key, and session id are required.")
@@ -1749,6 +1750,24 @@ class JiraStore:
             target_profile,
         )
         with self._connect() as db:
+            moved_count = 0
+            if move_existing:
+                cursor = db.execute(
+                    """
+                    UPDATE session_links SET detached = 1
+                    WHERE session_id = ? AND jira_origin = ? AND connection_id = ?
+                      AND profile_name = ? AND target_profile = ? AND issue_id <> ? AND detached = 0
+                    """,
+                    (
+                        session_id.strip(),
+                        origin,
+                        connection,
+                        profile,
+                        target,
+                        issue_id.strip(),
+                    ),
+                )
+                moved_count = max(0, int(cursor.rowcount))
             db.execute(
                 """
                 INSERT INTO session_links
@@ -1787,7 +1806,10 @@ class JiraStore:
                 """,
                 (origin, issue_id.strip(), connection, profile, target, session_id.strip()),
             ).fetchone()
-        return dict(row) if row else {}
+        result = dict(row) if row else {}
+        if move_existing:
+            result["moved_count"] = moved_count
+        return result
 
     def links_for_issue(
         self,

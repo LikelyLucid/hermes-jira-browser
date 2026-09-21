@@ -1850,20 +1850,22 @@ function IssueDetail({ issue, status, projects, mapping, links, baseRef, onOpenI
         targetProfile: currentOwner?.targetProfile
       })
       if (currentLinkIdentity !== focusedLinkIdentity) throw new Error('The focused chat changed; link the current chat again.')
-      await api('/links', {
+      const result = await api('/links', {
         method: 'POST',
         body: {
           issue_id: issue.id,
           issue_key: issue.key,
           session_id: sessionId,
           clear_detachment: true,
+          move_existing: true,
           ...sessionOwnerFields(owner)
         }
       })
       const linkCandidate = { session_id: sessionId, ...sessionOwnerFields(owner) }
       writeChatDetached(issue.key, linkCandidate, false, status?.base_url)
       await onLinksChanged()
-      host.notify({ kind: 'success', message: `Linked the current chat to ${issue.key}.` })
+      const moved = Number(result?.link?.moved_count || 0)
+      host.notify({ kind: 'success', message: moved > 0 ? `Moved the current chat to ${issue.key}.` : `Linked the current chat to ${issue.key}.` })
     } catch (cause) {
       setError(errorText(cause, 'Could not link the current chat.'))
     } finally {
@@ -1894,13 +1896,14 @@ function IssueDetail({ issue, status, projects, mapping, links, baseRef, onOpenI
       const route = await resolveSessionRoute(chat)
       await verifySessionOwner(sessionId, route)
       const owner = ownerFromRoute(route)
-      await api('/links', {
+      const result = await api('/links', {
         method: 'POST',
         body: {
           issue_id: issue.id,
           issue_key: issue.key,
           session_id: sessionId,
           clear_detachment: true,
+          move_existing: true,
           ...sessionOwnerFields(owner)
         }
       })
@@ -1908,7 +1911,8 @@ function IssueDetail({ issue, status, projects, mapping, links, baseRef, onOpenI
       writeChatDetached(issue.key, linkCandidate, false, status?.base_url)
       setRelatedChats(current => current.filter(candidate => sessionLinkIdentity(candidate) !== sessionLinkIdentity(linkCandidate)))
       await onLinksChanged()
-      host.notify({ kind: 'success', message: `Attached the chat to ${issue.key}.` })
+      const moved = Number(result?.link?.moved_count || 0)
+      host.notify({ kind: 'success', message: moved > 0 ? `Moved the chat to ${issue.key}.` : `Attached the chat to ${issue.key}.` })
     } catch (cause) {
       setError(errorText(cause, 'Could not attach the related chat.'))
     } finally {
@@ -1994,6 +1998,7 @@ function IssueDetail({ issue, status, projects, mapping, links, baseRef, onOpenI
               issue_key: issue.key,
               session_id: sessionId,
               clear_detachment: false,
+              move_existing: false,
               ...sessionOwnerFields(owner)
             }
           })
