@@ -238,6 +238,37 @@ class JiraNormalisationTests(unittest.TestCase):
 
         self.assertEqual(jira_service.adf_to_text(value), "First\n\n• Second")
 
+    def test_search_fields_include_subtasks_for_progress_chips(self):
+        self.assertIn("subtasks", jira_service.SEARCH_FIELDS)
+        self.assertIn("subtasks", jira_service.DETAIL_FIELDS)
+
+        payload = {
+            "issues": [
+                {
+                    "id": "10001",
+                    "key": "BUG-1",
+                    "fields": {
+                        "summary": "Parent bug",
+                        "status": {"name": "In Progress", "statusCategory": {"key": "indeterminate"}},
+                        "subtasks": [
+                            {
+                                "id": "10002",
+                                "key": "BUG-2",
+                                "fields": {
+                                    "summary": "Child fix",
+                                    "status": {"name": "Done", "statusCategory": {"key": "done"}},
+                                },
+                            }
+                        ],
+                    },
+                }
+            ]
+        }
+
+        issue = jira_service.normalise_search(payload)["issues"][0]
+        self.assertEqual([child["key"] for child in issue["subtasks"]], ["BUG-2"])
+        self.assertEqual(issue["subtasks"][0]["status_category"], "done")
+
     def test_adf_traversal_stops_at_depth_node_and_output_limits(self):
         value = {"type": "doc", "content": [{"type": "text", "text": "x"}] * 20}
         for _ in range(10):
@@ -294,6 +325,10 @@ class JiraNormalisationTests(unittest.TestCase):
                         "issuetype": {"name": "Bug"},
                         "assignee": {"displayName": "Alex"},
                         "project": {"key": "DEMO", "name": "Example Project"},
+                        "parent": {
+                            "key": "DEMO-1",
+                            "fields": {"summary": "Parent story"},
+                        },
                         "updated": "2026-09-18T08:00:00.000+1200",
                     },
                 }
@@ -306,7 +341,65 @@ class JiraNormalisationTests(unittest.TestCase):
         self.assertEqual(result["issues"][0]["key"], "DEMO-42")
         self.assertEqual(result["issues"][0]["project_key"], "DEMO")
         self.assertEqual(result["issues"][0]["status_category"], "indeterminate")
+        self.assertEqual(result["issues"][0]["parent_key"], "DEMO-1")
+        self.assertEqual(result["issues"][0]["parent_summary"], "Parent story")
         self.assertEqual(result["next_page_token"], "next-token")
+
+    def test_normalises_story_points_from_the_selected_field(self):
+        payload = {
+            "id": "10001",
+            "key": "DEMO-42",
+            "fields": {
+                "summary": "Story point bug",
+                "customfield_10016": "3.5",
+            },
+        }
+
+        result = jira_service._normalise_issue(
+            payload,
+            story_points_field={"id": "customfield_10016", "name": "Story Points"},
+        )
+
+        self.assertEqual(result["story_points"], 3.5)
+        self.assertEqual(
+            result["story_points_field"],
+            {"id": "customfield_10016", "name": "Story Points"},
+        )
+
+    def test_normalises_missing_or_non_numeric_story_points_as_none(self):
+        field = {"id": "customfield_10016", "name": "Story Points"}
+        for value in (None, "", "not-a-number", True):
+            with self.subTest(value=value):
+                result = jira_service._normalise_issue(
+                    {"id": "10001", "key": "DEMO-42", "fields": {"customfield_10016": value}},
+                    story_points_field=field,
+                )
+                self.assertIsNone(result["story_points"])
+
+    def test_normalises_detail_issue_hierarchy(self):
+        payload = {
+            "id": "10001",
+            "key": "DEMO-1",
+            "fields": {
+                "summary": "Parent story",
+                "subtasks": [
+                    {
+                        "id": "10002",
+                        "key": "DEMO-2",
+                        "fields": {
+                            "summary": "Child task",
+                            "status": {"name": "Done", "statusCategory": {"key": "done"}},
+                            "issuetype": {"name": "Sub-task"},
+                        },
+                    }
+                ],
+            },
+        }
+
+        result = jira_service._normalise_issue(payload, detail=True)
+
+        self.assertEqual(result["subtasks"][0]["key"], "DEMO-2")
+        self.assertEqual(result["subtasks"][0]["status_category"], "done")
 
     def test_detail_normalises_attachments_and_associates_comment_media_by_filename(self):
         payload = {
@@ -1120,16 +1213,87 @@ class StoreTests(unittest.TestCase):
 
 
 class SettingsTests(unittest.TestCase):
-    def test_missing_settings_use_assigned_to_me_default(self):
+    def test_missing_settings_use_current_sprint_default_with_all_tickets_view(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "missing.json"
             settings = jira_service.load_settings(path)
             self.assertTrue(path.exists())
 
-        self.assertEqual(settings["defaultView"], "assigned")
+        self.assertEqual(settings["defaultView"], "current-sprint")
+        self.assertEqual(settings["version"], 3)
         self.assertEqual(settings["viewMode"], "board")
+        self.assertEqual(settings["storyPointsField"], "auto")
         self.assertIn("Backlog", [view["label"] for view in settings["views"]])
-        self.assertIn("assignee = currentUser()", settings["views"][0]["jql"])
+        self.assertIn("Bugs", [view["label"] for view in settings["views"]])
+        self.assertEqual(settings["views"][0]["label"], "My current sprint")
+        self.assertEqual(settings["views"][0]["jql"], "sprint in openSprints() AND assignee = currentUser() ORDER BY updated DESC")
+        self.assertEqual(next(view["jql"] for view in settings["views"] if view["id"] == "all"), "ORDER BY updated DESC")
+
+    def test_legacy_builtin_views_gain_sprint_and_all_once_without_losing_customizations(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "settings.json"
+            legacy = {
+                **jira_service.DEFAULT_SETTINGS,
+                "version": 1,
+                "defaultView": "assigned",
+                "views": [
+                    {"id": "assigned", "label": "Assigned to me", "jql": "assignee = currentUser() AND statusCategory != Done ORDER BY updated DESC"},
+                    {"id": "custom", "label": "Custom", "jql": "project = DEMO"},
+                ],
+            }
+            path.write_text(json.dumps(legacy), encoding="utf-8")
+            migrated = jira_service.load_settings(path)
+            self.assertEqual(migrated["defaultView"], "current-sprint")
+            self.assertEqual(migrated["version"], 3)
+            self.assertEqual(migrated["views"][0]["id"], "current-sprint")
+            self.assertIn("all", [view["id"] for view in migrated["views"]])
+            self.assertEqual(next(view["jql"] for view in migrated["views"] if view["id"] == "custom"), "project = DEMO")
+            self.assertEqual(jira_service.load_settings(path), migrated)
+            migrated["views"] = [view for view in migrated["views"] if view["id"] != "all"]
+            jira_service.save_settings(migrated, path)
+            self.assertEqual(jira_service.load_settings(path), migrated)
+
+    def test_partially_migrated_legacy_settings_do_not_restore_a_removed_view(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "settings.json"
+            settings = {**jira_service.DEFAULT_SETTINGS, "version": 1}
+            settings["views"] = [view for view in settings["views"] if view["id"] != "all"]
+            path.write_text(json.dumps(settings), encoding="utf-8")
+            loaded = jira_service.load_settings(path)
+            self.assertNotIn("all", [view["id"] for view in loaded["views"]])
+            self.assertEqual(loaded["version"], 3)
+
+    def test_prior_sprint_default_migrates_only_the_old_builtin_query(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "settings.json"
+            old_sprint = {**jira_service.DEFAULT_SETTINGS["views"][0], "label": "Current sprint", "jql": "sprint in openSprints() ORDER BY updated DESC"}
+            settings = {**jira_service.DEFAULT_SETTINGS, "version": 2, "views": [old_sprint, *jira_service.DEFAULT_SETTINGS["views"][1:]]}
+            path.write_text(json.dumps(settings), encoding="utf-8")
+            upgraded = jira_service.load_settings(path)
+            self.assertEqual(upgraded["version"], 3)
+            self.assertEqual(upgraded["views"][0]["jql"], "sprint in openSprints() AND assignee = currentUser() ORDER BY updated DESC")
+            self.assertEqual(upgraded["views"][0]["label"], "My current sprint")
+            self.assertEqual(jira_service.load_settings(path), upgraded)
+            for prior_version in (1, 2):
+                custom = {**settings, "version": prior_version, "views": [{**old_sprint, "jql": "project = DEMO AND sprint in openSprints()"}, *settings["views"][1:]]}
+                path.write_text(json.dumps(custom), encoding="utf-8")
+                retained = jira_service.load_settings(path)
+                self.assertEqual(retained["views"][0]["jql"], custom["views"][0]["jql"])
+                self.assertEqual(retained["version"], 3)
+
+    def test_legacy_explicit_custom_default_is_preserved(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "settings.json"
+            legacy = {
+                **jira_service.DEFAULT_SETTINGS,
+                "version": 1,
+                "defaultView": "reported",
+                "views": [view for view in jira_service.DEFAULT_SETTINGS["views"] if view["id"] not in {"current-sprint", "all"}],
+            }
+            path.write_text(json.dumps(legacy), encoding="utf-8")
+            migrated = jira_service.load_settings(path)
+            self.assertEqual(migrated["defaultView"], "reported")
+            self.assertIn("all", [view["id"] for view in migrated["views"]])
 
     def test_default_views_include_human_preferences(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1152,6 +1316,7 @@ class SettingsTests(unittest.TestCase):
             "pageSize": 50,
             "baseRef": "HEAD",
             "groupByStatus": True,
+            "storyPointsField": "customfield_10016",
             "views": [{
                 "id": "mine",
                 "label": "Mine",
@@ -1165,6 +1330,7 @@ class SettingsTests(unittest.TestCase):
         settings = jira_service.validate_settings(value)
 
         self.assertEqual(settings["views"][0]["layout"], "list")
+        self.assertEqual(settings["storyPointsField"], "customfield_10016")
         self.assertEqual(settings["views"][0]["sort"], "priority")
         self.assertEqual(settings["views"][0]["density"], "compact")
 
@@ -1197,6 +1363,7 @@ class SettingsTests(unittest.TestCase):
                 "pageSize": 25,
                 "baseRef": "main",
                 "groupByStatus": False,
+                "storyPointsField": "auto",
                 "views": [
                     {
                         "id": "mine",
@@ -1210,6 +1377,29 @@ class SettingsTests(unittest.TestCase):
             self.assertEqual(saved, value)
             self.assertEqual(jira_service.load_settings(path), value)
             self.assertEqual(json.loads(path.read_text(encoding="utf-8")), value)
+
+    def test_story_points_field_setting_accepts_auto_none_or_custom_field_id(self):
+        base = {
+            "version": 1,
+            "defaultView": "mine",
+            "viewMode": "list",
+            "pageSize": 25,
+            "baseRef": "HEAD",
+            "groupByStatus": False,
+            "views": [{"id": "mine", "label": "Mine", "jql": "project = DEMO"}],
+        }
+
+        self.assertEqual(jira_service.validate_settings(base)["storyPointsField"], "auto")
+        self.assertEqual(
+            jira_service.validate_settings({**base, "storyPointsField": "none"})["storyPointsField"],
+            "none",
+        )
+        self.assertEqual(
+            jira_service.validate_settings({**base, "storyPointsField": "customfield_10101"})["storyPointsField"],
+            "customfield_10101",
+        )
+        with self.assertRaisesRegex(ValueError, "storyPointsField"):
+            jira_service.validate_settings({**base, "storyPointsField": "Story Points"})
 
     def test_settings_reject_invalid_default_view(self):
         value = {
@@ -1508,6 +1698,69 @@ class JiraClientTests(unittest.TestCase):
         self.assertTrue(captured["authorization"].startswith("Basic "))
         self.assertEqual(result["issues"], [])
         self.assertNotIn("very-secret", json.dumps(result))
+
+    def test_client_auto_detects_story_points_and_requests_the_detected_field(self):
+        config = jira_service.JiraConfig(
+            base_url="https://jira.example.invalid",
+            email="dev@example.com",
+            api_token="very-secret",
+        )
+        client = jira_service.JiraClient(config)
+        calls = []
+
+        def fake_request(path, params=None, **_kwargs):
+            calls.append((path, params or {}))
+            if path == "/rest/api/3/field/search":
+                return {"values": [{
+                    "id": "customfield_10016",
+                    "name": "Story Points",
+                    "schema": {"custom": "com.atlassian.jira.plugin.system.customfieldtypes:float"},
+                }]}
+            return {
+                "issues": [{
+                    "id": "10001",
+                    "key": "DEMO-42",
+                    "fields": {"summary": "Bug", "customfield_10016": 3},
+                }],
+                "isLast": True,
+            }
+
+        with mock.patch.object(client, "_request", side_effect=fake_request):
+            result = client.search("issuetype = Bug", max_results=25)
+
+        self.assertEqual(calls[0][0], "/rest/api/3/field/search")
+        self.assertIn("customfield_10016", calls[1][1]["fields"].split(","))
+        self.assertEqual(result["story_points_field"], {"id": "customfield_10016", "name": "Story Points"})
+        self.assertEqual(result["issues"][0]["story_points"], 3)
+
+    def test_client_explicit_story_points_override_does_not_require_field_discovery(self):
+        client = jira_service.JiraClient(
+            jira_service.JiraConfig(
+                base_url="https://jira.example.invalid",
+                email="dev@example.com",
+                api_token="very-secret",
+            ),
+            story_points_field="customfield_10101",
+        )
+        calls = []
+
+        def fake_request(path, params=None, **_kwargs):
+            calls.append((path, params or {}))
+            return {
+                "issues": [{
+                    "id": "10001",
+                    "key": "DEMO-42",
+                    "fields": {"summary": "Bug", "customfield_10101": "5.5"},
+                }],
+                "isLast": True,
+            }
+
+        with mock.patch.object(client, "_request", side_effect=fake_request):
+            result = client.search("issuetype = Bug")
+
+        self.assertEqual([path for path, _params in calls], ["/rest/api/3/search/jql"])
+        self.assertEqual(result["issues"][0]["story_points"], 5.5)
+        self.assertEqual(result["story_points_field"]["id"], "customfield_10101")
 
     def test_add_comment_posts_adf_and_returns_normalised_comment(self):
         config = jira_service.JiraConfig(

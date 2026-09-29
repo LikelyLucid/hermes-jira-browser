@@ -10,6 +10,7 @@ import base64
 import errno
 import hashlib
 import json
+import math
 import os
 import re
 import sqlite3
@@ -32,9 +33,13 @@ from hermes_constants import get_hermes_home, profile_name_for_home
 
 SEARCH_FIELDS = (
     "summary,status,priority,issuetype,assignee,reporter,project,labels,"
-    "created,updated,resolutiondate,description"
+    "created,updated,resolutiondate,description,parent,subtasks"
 )
-DETAIL_FIELDS = f"{SEARCH_FIELDS},parent,subtasks,fixVersions,components,attachment"
+DETAIL_FIELDS = f"{SEARCH_FIELDS},subtasks,fixVersions,components,attachment"
+STORY_POINTS_FIELD_PATTERN = re.compile(r"customfield_\d+\Z", re.IGNORECASE)
+STORY_POINTS_FIELD_AUTO = "auto"
+STORY_POINTS_FIELD_NONE = "none"
+STORY_POINTS_FIELD_SEARCH_LIMIT = 100
 MAX_JIRA_JSON_BYTES = 16 * 1024 * 1024
 MAX_JIRA_CONFIG_BYTES = 1 * 1024 * 1024
 MAX_JIRA_COMMENT_ID_BYTES = 256
@@ -54,14 +59,33 @@ SAFE_ATTACHMENT_PREVIEW_TYPES = frozenset({
     "image/png",
     "image/webp",
 })
+LEGACY_SPRINT_JQL = "sprint in openSprints() ORDER BY updated DESC"
+ASSIGNED_SPRINT_JQL = "sprint in openSprints() AND assignee = currentUser() ORDER BY updated DESC"
 DEFAULT_SETTINGS: dict[str, Any] = {
-    "version": 1,
-    "defaultView": "assigned",
+    "version": 3,
+    "defaultView": "current-sprint",
     "viewMode": "board",
     "pageSize": 50,
     "baseRef": "HEAD",
     "groupByStatus": True,
+    "storyPointsField": STORY_POINTS_FIELD_AUTO,
     "views": [
+        {
+            "id": "current-sprint",
+            "label": "My current sprint",
+            "jql": ASSIGNED_SPRINT_JQL,
+            "layout": "board",
+            "sort": "updated",
+            "density": "comfortable",
+        },
+        {
+            "id": "all",
+            "label": "All tickets",
+            "jql": "ORDER BY updated DESC",
+            "layout": "list",
+            "sort": "updated",
+            "density": "compact",
+        },
         {
             "id": "assigned",
             "label": "Assigned to me",
@@ -74,6 +98,14 @@ DEFAULT_SETTINGS: dict[str, Any] = {
             "id": "backlog",
             "label": "Backlog",
             "jql": "statusCategory != Done ORDER BY priority DESC, updated DESC",
+            "layout": "list",
+            "sort": "priority",
+            "density": "compact",
+        },
+        {
+            "id": "bugs",
+            "label": "Bugs",
+            "jql": "issuetype = Bug ORDER BY priority DESC, updated DESC",
             "layout": "list",
             "sort": "priority",
             "density": "compact",
@@ -406,6 +438,77 @@ def _name(value: Any, key: str = "name") -> str | None:
     return str(value.get(key)) if isinstance(value, Mapping) and value.get(key) is not None else None
 
 
+def _mapping(value: Any) -> Mapping[str, Any]:
+    return value if isinstance(value, Mapping) else {}
+
+
+def _normalise_story_points_field(value: Any) -> dict[str, str] | None:
+    field = _mapping(value)
+    field_id = str(field.get("id") or "").strip()
+    if not field_id:
+        return None
+    name = str(field.get("name") or field_id).strip()[:200]
+    return {"id": field_id, "name": name or field_id}
+
+
+def _normalise_story_points_value(value: Any) -> int | float | None:
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(number) or number < 0:
+        return None
+    return int(number) if number.is_integer() else number
+
+
+def _story_points_fields(base_fields: str, story_points_field: Mapping[str, Any] | None) -> str:
+    field_id = str(story_points_field.get("id") or "").strip() if isinstance(story_points_field, Mapping) else ""
+    if not field_id:
+        return base_fields
+    fields = [field.strip() for field in base_fields.split(",") if field.strip()]
+    if field_id not in fields:
+        fields.append(field_id)
+    return ",".join(fields)
+
+
+def _story_points_field_setting(value: Any) -> str:
+    if value is None:
+        return STORY_POINTS_FIELD_AUTO
+    if not isinstance(value, str):
+        raise ValueError("settings.storyPointsField must be 'auto', 'none', or a customfield id.")
+    setting = value.strip()
+    if setting.casefold() in {STORY_POINTS_FIELD_AUTO, STORY_POINTS_FIELD_NONE}:
+        return setting.casefold()
+    if not STORY_POINTS_FIELD_PATTERN.fullmatch(setting):
+        raise ValueError("settings.storyPointsField must be 'auto', 'none', or a customfield id.")
+    return setting
+
+
+def _story_points_field_candidate(value: Any) -> dict[str, str] | None:
+    field = _mapping(value)
+    field_id = str(field.get("id") or "").strip()
+    name = str(field.get("name") or "").strip()
+    if not field_id or not name:
+        return None
+    if not STORY_POINTS_FIELD_PATTERN.fullmatch(field_id):
+        return None
+    search_text = " ".join([
+        name,
+        *(str(item) for item in field.get("clauseNames", []) if item),
+    ]).casefold()
+    if not re.search(r"story\s*points?", search_text):
+        return None
+    return {"id": field_id, "name": name[:200]}
+
+
+def _story_points_field_rank(value: Mapping[str, Any]) -> tuple[int, str]:
+    name = str(value.get("name") or "").casefold()
+    exact = name in {"story point", "story points", "story point estimate", "story point estimates"}
+    return (0 if exact else 1, name)
+
+
 def _normalise_attachment(attachment: Mapping[str, Any]) -> dict[str, Any]:
     mime_type = str(attachment.get("mimeType") or "application/octet-stream").strip().lower()
     try:
@@ -584,13 +687,22 @@ def _validate_transition_response(payload: Any, transition_id: str) -> None:
     raise JiraAmbiguousError(invalid_response)
 
 
-def _normalise_issue(issue: Mapping[str, Any], *, detail: bool = False) -> dict[str, Any]:
-    fields = issue.get("fields") if isinstance(issue.get("fields"), Mapping) else {}
-    status = fields.get("status") if isinstance(fields.get("status"), Mapping) else {}
-    status_category = status.get("statusCategory") if isinstance(status.get("statusCategory"), Mapping) else {}
-    project = fields.get("project") if isinstance(fields.get("project"), Mapping) else {}
-    assignee = fields.get("assignee") if isinstance(fields.get("assignee"), Mapping) else {}
-    reporter = fields.get("reporter") if isinstance(fields.get("reporter"), Mapping) else {}
+def _normalise_issue(
+    issue: Mapping[str, Any],
+    *,
+    detail: bool = False,
+    story_points_field: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    story_points_field = _normalise_story_points_field(story_points_field)
+    fields = _mapping(issue.get("fields"))
+    status = _mapping(fields.get("status"))
+    status_category = _mapping(status.get("statusCategory"))
+    project = _mapping(fields.get("project"))
+    assignee = _mapping(fields.get("assignee"))
+    reporter = _mapping(fields.get("reporter"))
+    parent = _mapping(fields.get("parent"))
+    parent_fields = _mapping(parent.get("fields"))
+    story_points_id = str(story_points_field.get("id") or "") if story_points_field else ""
     result: dict[str, Any] = {
         "id": str(issue.get("id") or ""),
         "key": str(issue.get("key") or ""),
@@ -608,7 +720,20 @@ def _normalise_issue(issue: Mapping[str, Any], *, detail: bool = False) -> dict[
         "updated": fields.get("updated"),
         "resolution_date": fields.get("resolutiondate"),
         "description": adf_to_text(fields.get("description")),
+        "parent_key": str(parent.get("key") or "") if parent else "",
+        "parent_summary": str(parent_fields.get("summary") or "") if parent_fields else "",
+        "story_points": _normalise_story_points_value(fields.get(story_points_id)) if story_points_id else None,
+        "story_points_field": story_points_field,
     }
+    subtasks_value = fields.get("subtasks")
+    if isinstance(subtasks_value, list):
+        result["subtasks"] = [
+            _normalise_issue(value, story_points_field=story_points_field)
+            for value in subtasks_value
+            if isinstance(value, Mapping)
+        ]
+    elif detail:
+        result["subtasks"] = []
     if detail:
         attachments = [
             _normalise_attachment(attachment)
@@ -633,22 +758,27 @@ def _normalise_issue(issue: Mapping[str, Any], *, detail: bool = False) -> dict[
             for value in (fields.get("fixVersions") if isinstance(fields.get("fixVersions"), list) else [])
             if (name := _name(value))
         ]
-        parent = fields.get("parent") if isinstance(fields.get("parent"), Mapping) else None
-        result["parent"] = _normalise_issue(parent) if parent else None
-        result["subtasks"] = [
-            _normalise_issue(value)
-            for value in (fields.get("subtasks") if isinstance(fields.get("subtasks"), list) else [])
-            if isinstance(value, Mapping)
-        ]
+        result["parent"] = _normalise_issue(parent, story_points_field=story_points_field) if parent else None
     return result
 
 
-def normalise_search(payload: Mapping[str, Any]) -> dict[str, Any]:
-    issues = payload.get("issues") if isinstance(payload.get("issues"), list) else []
+def normalise_search(
+    payload: Mapping[str, Any],
+    *,
+    story_points_field: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    story_points_field = _normalise_story_points_field(story_points_field)
+    raw_issues = payload.get("issues")
+    issues: list[Any] = raw_issues if isinstance(raw_issues, list) else []
     return {
-        "issues": [_normalise_issue(issue) for issue in issues if isinstance(issue, Mapping)],
+        "issues": [
+            _normalise_issue(issue, story_points_field=story_points_field)
+            for issue in issues
+            if isinstance(issue, Mapping)
+        ],
         "next_page_token": payload.get("nextPageToken"),
         "is_last": bool(payload.get("isLast", not payload.get("nextPageToken"))),
+        "story_points_field": story_points_field,
     }
 
 
@@ -662,8 +792,8 @@ def validate_settings(value: Mapping[str, Any]) -> dict[str, Any]:
     raw_views = value.get("views")
     if not isinstance(raw_views, list) or not raw_views:
         raise ValueError("settings.views must contain at least one saved view.")
-    if len(raw_views) > 20:
-        raise ValueError("settings.views supports at most 20 saved views.")
+    if len(raw_views) > 21:
+        raise ValueError("settings.views supports at most 21 saved views.")
 
     views: list[dict[str, Any]] = []
     seen: set[str] = set()
@@ -714,15 +844,48 @@ def validate_settings(value: Mapping[str, Any]) -> dict[str, Any]:
     group_by_status = value.get("groupByStatus", True)
     if not isinstance(group_by_status, bool):
         raise ValueError("settings.groupByStatus must be true or false.")
+    story_points_field = _story_points_field_setting(value.get("storyPointsField"))
     return {
-        "version": 1,
+        "version": value.get("version") if value.get("version") in (2, 3) else 1,
         "defaultView": default_view,
         "viewMode": view_mode,
         "pageSize": page_size,
         "baseRef": base_ref,
         "groupByStatus": group_by_status,
+        "storyPointsField": story_points_field,
         "views": views,
     }
+
+
+def _with_builtin_views(settings: Mapping[str, Any]) -> dict[str, Any]:
+    views = [dict(view) for view in settings.get("views", []) if isinstance(view, Mapping)]
+    if settings.get("version") == 3:
+        return dict(settings)
+    for view in views:
+        if view.get("id") == "current-sprint" and view.get("jql") == LEGACY_SPRINT_JQL:
+            view["jql"] = ASSIGNED_SPRINT_JQL
+            if view.get("label") == "Current sprint":
+                view["label"] = "My current sprint"
+    if settings.get("version") == 2:
+        return {**settings, "version": 3, "views": views}
+    present = {str(view.get("id") or "") for view in views}
+    if present.intersection({"current-sprint", "all"}):
+        return {**settings, "version": 3, "views": views}
+    if not present.intersection({"assigned", "backlog", "bugs", "reported", "recent"}):
+        return dict(settings)
+    missing = [view for view in DEFAULT_SETTINGS["views"] if view["id"] in {"current-sprint", "all", "bugs"} and view["id"] not in present]
+    if len(views) + len(missing) > 21:
+        return dict(settings)
+    for view in reversed(missing):
+        if view["id"] in {"current-sprint", "all"}:
+            views.insert(0, dict(view))
+        else:
+            views.append(dict(view))
+    assigned = next((view for view in views if view["id"] == "assigned"), None)
+    default_view = settings["defaultView"]
+    if default_view == "assigned" and assigned and assigned["jql"] == "assignee = currentUser() AND statusCategory != Done ORDER BY updated DESC":
+        default_view = "current-sprint"
+    return {**settings, "version": 3, "defaultView": default_view, "views": views}
 
 
 def load_settings(path: str | Path | None = None) -> dict[str, Any]:
@@ -733,7 +896,7 @@ def load_settings(path: str | Path | None = None) -> dict[str, Any]:
         return save_settings(DEFAULT_SETTINGS, settings_path)
     except (OSError, json.JSONDecodeError) as exc:
         raise ValueError(f"Jira Browser settings at {settings_path} are not valid JSON.") from exc
-    settings = validate_settings(raw)
+    settings = _with_builtin_views(validate_settings(raw))
     if settings != raw:
         return save_settings(settings, settings_path)
     return settings
@@ -800,9 +963,55 @@ class JiraResponse(dict[str, Any]):
 
 
 class JiraClient:
-    def __init__(self, config: JiraConfig, *, timeout: int = 20):
+    def __init__(
+        self,
+        config: JiraConfig,
+        *,
+        timeout: int = 20,
+        story_points_field: str = STORY_POINTS_FIELD_AUTO,
+    ):
         self.config = config
         self.timeout = timeout
+        self.story_points_field_setting = _story_points_field_setting(story_points_field)
+        self._story_points_field_resolved = False
+        self._resolved_story_points_field: dict[str, str] | None = None
+
+    def resolve_story_points_field(self) -> dict[str, str] | None:
+        if self._story_points_field_resolved:
+            return self._resolved_story_points_field
+        self._story_points_field_resolved = True
+        setting = self.story_points_field_setting
+        if setting == STORY_POINTS_FIELD_NONE:
+            return None
+        if setting != STORY_POINTS_FIELD_AUTO:
+            self._resolved_story_points_field = {"id": setting, "name": setting}
+            return self._resolved_story_points_field
+        try:
+            payload = self._request(
+                "/rest/api/3/field/search",
+                {
+                    "query": "story point",
+                    "maxResults": STORY_POINTS_FIELD_SEARCH_LIMIT,
+                },
+            )
+            raw_values = payload.get("values")
+            values: list[Any] = raw_values if isinstance(raw_values, list) else []
+            candidates = [
+                candidate
+                for value in values
+                if (candidate := _story_points_field_candidate(value)) is not None
+            ]
+            self._resolved_story_points_field = min(candidates, key=_story_points_field_rank) if candidates else None
+        except Exception:
+            # Story point metadata is optional. A Jira instance without the
+            # field-search permission must still return ordinary issues.
+            self._resolved_story_points_field = None
+        return self._resolved_story_points_field
+
+    def _known_story_points_field(self) -> dict[str, str] | None:
+        if self.story_points_field_setting != STORY_POINTS_FIELD_AUTO:
+            return self.resolve_story_points_field()
+        return self._resolved_story_points_field if self._story_points_field_resolved else None
 
     def _request(
         self,
@@ -908,23 +1117,28 @@ class JiraClient:
 
     def search(self, jql: str, *, max_results: int = 50, next_page_token: str | None = None) -> dict[str, Any]:
         max_results = max(1, min(100, int(max_results)))
+        story_points_field = self.resolve_story_points_field()
         payload = self._request(
             "/rest/api/3/search/jql",
             {
                 "jql": jql.strip() or "assignee = currentUser() ORDER BY updated DESC",
                 "maxResults": max_results,
-                "fields": SEARCH_FIELDS,
+                "fields": _story_points_fields(SEARCH_FIELDS, story_points_field),
                 "nextPageToken": next_page_token,
             },
         )
-        return normalise_search(payload)
+        return normalise_search(payload, story_points_field=story_points_field)
 
     def issue(self, issue_key: str) -> dict[str, Any]:
         safe_key = urllib.parse.quote(issue_key.strip(), safe="-")
         if not safe_key:
             raise ValueError("issue_key is required")
-        payload = self._request(f"/rest/api/3/issue/{safe_key}", {"fields": DETAIL_FIELDS})
-        result = _normalise_issue(payload, detail=True)
+        story_points_field = self._known_story_points_field()
+        payload = self._request(
+            f"/rest/api/3/issue/{safe_key}",
+            {"fields": _story_points_fields(DETAIL_FIELDS, story_points_field)},
+        )
+        result = _normalise_issue(payload, detail=True, story_points_field=story_points_field)
         attachments = result.get("attachments") if isinstance(result.get("attachments"), list) else []
         comments: list[dict[str, Any]] = []
         start_at = 0
@@ -954,8 +1168,12 @@ class JiraClient:
         safe_key = urllib.parse.quote(issue_key.strip(), safe="-")
         if not safe_key:
             raise ValueError("issue_key is required")
-        payload = self._request(f"/rest/api/3/issue/{safe_key}", {"fields": SEARCH_FIELDS})
-        return _normalise_issue(payload)
+        story_points_field = self._known_story_points_field()
+        payload = self._request(
+            f"/rest/api/3/issue/{safe_key}",
+            {"fields": _story_points_fields(SEARCH_FIELDS, story_points_field)},
+        )
+        return _normalise_issue(payload, story_points_field=story_points_field)
 
     def attachments(self, issue_key: str) -> list[dict[str, Any]]:
         safe_key = urllib.parse.quote(issue_key.strip(), safe="-")

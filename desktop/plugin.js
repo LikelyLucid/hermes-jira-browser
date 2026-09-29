@@ -37,7 +37,10 @@ const ID = 'jira-browser'
 const ROUTE = '/jira'
 const ISSUE_QUERY_PARAM = 'issue'
 const ISSUE_KEY_PATTERN = /^[A-Z][A-Z0-9]+-\d+$/
-const DEFAULT_JQL = 'assignee = currentUser() AND statusCategory != Done ORDER BY updated DESC'
+const DEFAULT_JQL = 'sprint in openSprints() AND assignee = currentUser() ORDER BY updated DESC'
+const LEGACY_SPRINT_JQL = 'sprint in openSprints() ORDER BY updated DESC'
+const SPRINT_VIEW = { id: 'current-sprint', label: 'My current sprint', jql: DEFAULT_JQL, layout: 'board', sort: 'updated', density: 'comfortable' }
+const ALL_VIEW = { id: 'all', label: 'All tickets', jql: 'ORDER BY updated DESC', layout: 'list', sort: 'updated', density: 'compact' }
 const ISSUE_CACHE_KEY = 'issue-list-cache-v1'
 const ISSUE_CACHE_LIMIT = 6
 const VIEW_STATE_KEY = 'saved-view-state-v1'
@@ -52,8 +55,19 @@ const DRAWER_DEFAULT_WIDTH = 416
 const DRAWER_MIN_WIDTH = 320
 const DRAWER_MAX_WIDTH = 760
 const BOARD_MIN_WIDTH = 320
+const FOCUS_REFRESH_MIN_MS = 120_000
+const PR_STATUS_CACHE_KEY = 'pull-request-status-cache-v1'
+const PR_STATUS_CACHE_LIMIT = 60
+const PR_STATUS_MAX_AGE_MS = 30 * 60_000
+const PR_PREWARM_LIMIT = 6
+const COMMENT_DRAFT_CACHE_KEY = 'comment-draft-cache-v1'
+let activeDraftScope = ''
+const COMMENT_DRAFT_CACHE_LIMIT = 20
+const COMMENT_DRAFT_MAX_AGE_MS = 7 * 24 * 60 * 60_000
+const COMMENT_DRAFT_TEXT_LIMIT = 8_000
 
 let pluginContext = null
+let removeAllSnapshot = null
 const companionDisposers = new Map()
 
 const LIVE_STATUS_NOTIFICATIONS_KEY = 'live-status-notifications-v1'
@@ -284,8 +298,8 @@ function LiveStatusContribution({ titlebar = false }) {
   return jsx('button', {
     'aria-label': `Open Jira${selectedKey ? ` ${selectedKey}` : ''}`,
     className: titlebar
-      ? 'inline-flex h-7 max-w-80 items-center gap-1.5 rounded px-2 text-xs text-(--ui-text-tertiary) transition-colors hover:bg-(--chrome-action-hover) hover:text-foreground'
-      : 'inline-flex h-full min-w-0 items-center gap-1 rounded-none px-1.5 text-[0.6875rem] text-(--ui-text-tertiary) transition-colors hover:bg-(--chrome-action-hover) hover:text-foreground',
+      ? 'inline-flex h-7 max-w-80 items-center gap-1.5 rounded px-2 text-xs text-(--ui-text-tertiary) transition-colors hover:bg-(--chrome-action-hover) hover:text-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-(--dt-composer-ring)'
+      : 'inline-flex h-full min-w-0 items-center gap-1 rounded-none px-1.5 text-[0.6875rem] text-(--ui-text-tertiary) transition-colors hover:bg-(--chrome-action-hover) hover:text-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-(--dt-composer-ring)',
     onClick: () => host.navigate(selectedKey ? jiraRoute(selectedKey) : ROUTE),
     title: snapshot.notificationsEnabled ? 'Jira live notifications on' : 'Jira live notifications off',
     type: 'button',
@@ -571,6 +585,12 @@ function relativeDate(value) {
   return `${Math.round(seconds / 604800)}w`
 }
 
+function absoluteDate(value) {
+  const date = new Date(value || '')
+  if (Number.isNaN(date.getTime())) return ''
+  return date.toLocaleString()
+}
+
 function statusTone(issue) {
   if (issue?.status_category === 'done') return 'good'
   if (issue?.status_category === 'indeterminate') return 'warn'
@@ -584,6 +604,14 @@ function statusColor(issueOrLane) {
   return 'var(--ui-text-secondary)'
 }
 
+const COMPLETED_STATUS_NAMES = new Set(['done', 'closed', 'resolved'])
+
+function isCompletedIssue(issue) {
+  const category = String(issue?.status_category || '').trim().toLowerCase()
+  const status = String(issue?.status || '').trim().toLowerCase()
+  return category === 'done' || COMPLETED_STATUS_NAMES.has(status)
+}
+
 function settingsViewMode(settings) {
   const explicit = String(settings?.viewMode || '').trim().toLowerCase()
   if (explicit === 'list' || explicit === 'board') return explicit
@@ -593,6 +621,7 @@ function settingsViewMode(settings) {
 const VIEW_SORT_OPTIONS = [
   { value: 'updated', label: 'Recently updated' },
   { value: 'priority', label: 'Highest priority' },
+  { value: 'points', label: 'Story points' },
   { value: 'status', label: 'Status' },
   { value: 'key', label: 'Ticket key' }
 ]
@@ -602,11 +631,39 @@ const VIEW_DENSITY_OPTIONS = [
   { value: 'compact', label: 'Compact' }
 ]
 
+const SHORTCUT_ROWS = [
+  ['/', 'Focus filter'],
+  ['j / k', 'Next / previous ticket'],
+  ['⇧ j / ⇧ k', 'Jump 10 rows'],
+  ['Home / End', 'First / last ticket'],
+  ['n', 'Next ticket needing attention'],
+  ['⇧ n', 'Previous attention ticket'],
+  ['b / l', 'Board / list layout'],
+  ['r', 'Refresh tickets'],
+  ['c', 'Copy ticket key(s)'],
+  ['p', 'Pin beside chat'],
+  ['⇧ p', 'Pin detected PR for this ticket'],
+  ['o', 'Open in Jira'],
+  ['a', 'Attach PR link · top ticket when closed'],
+  ['⇧ a', 'Attach PR · attention ticket needing a link'],
+  ['y', 'Copy active JQL'],
+  ['v', 'Toggle list/board'],
+  ['x', 'Collapse/expand lanes'],
+  [',', 'Open settings'],
+  ['?', 'Toggle this help'],
+  ['Esc', 'Blur → import/disarm → help → panels → filter']
+]
+const SHORTCUT_HINT = SHORTCUT_ROWS.map(([keys]) => keys).join(' · ')
+const SHORTCUT_TITLE = `Keyboard shortcuts: ${SHORTCUT_ROWS.map(([keys, label]) => `${keys} ${label}`).join(' · ')}`
+
 const QUICK_FILTER_OPTIONS = [
-  { value: 'all', label: 'All tickets' },
+  { value: 'all', label: 'All in view' },
   { value: 'attention', label: 'Needs attention' },
   { value: 'blocked', label: 'Blocked or on hold' },
   { value: 'unassigned', label: 'Unassigned' },
+  { value: 'unestimated', label: 'Unestimated' },
+  { value: 'has-pr', label: 'Linked pull request', hint: 'gh-checked or attached manually' },
+  { value: 'no-pr', label: 'Pull request absent', hint: 'gh-verified with no recent PR' },
   { value: 'no-linked', label: 'No linked chat' },
   { value: 'working', label: 'Work in progress' },
   { value: 'stale', label: 'Stale tickets' }
@@ -642,6 +699,16 @@ function sortIssues(issues, sort = 'updated') {
       return priorityRank(left.priority) - priorityRank(right.priority)
         || String(right.updated || '').localeCompare(String(left.updated || ''))
     }
+    if (sort === 'points') {
+      const leftPoints = storyPointsValue(left)
+      const rightPoints = storyPointsValue(right)
+      if (leftPoints === null && rightPoints === null) {
+        return String(right.updated || '').localeCompare(String(left.updated || ''))
+      }
+      if (leftPoints === null) return 1
+      if (rightPoints === null) return -1
+      return rightPoints - leftPoints || String(right.updated || '').localeCompare(String(left.updated || ''))
+    }
     if (sort === 'status') {
       return String(left.status || '').localeCompare(String(right.status || ''))
         || String(right.updated || '').localeCompare(String(left.updated || ''))
@@ -651,15 +718,48 @@ function sortIssues(issues, sort = 'updated') {
   })
 }
 
-function matchesQuickFilter(filter, issue, workState, attentionReasons = [], liveState = 'idle', workingSessionIds = null) {
+function matchesQuickFilter(filter, issue, workState, attentionReasons = [], liveState = 'idle', workingSessionIds = null, prStatusByKey = null) {
   if (filter === 'attention') return attentionReasons.length > 0 || ['failed', 'waiting'].includes(liveState)
   if (filter === 'blocked') return attentionReasons.some(reason => reason === 'Blocked')
   if (filter === 'unassigned') return !String(issue?.assignee || '').trim()
+  if (filter === 'unestimated') return hasStoryPointsField(issue) && storyPointsValue(issue) === null
+  if (filter === 'has-pr') {
+    const entry = (prStatusByKey || readPrStatusCache())[issue.key]
+    return Boolean(entry && entry.pr !== false)
+  }
+  if (filter === 'no-pr') {
+    const entry = (prStatusByKey || readPrStatusCache())[issue.key]
+    return Boolean(entry && entry.pr === false)
+  }
   if (filter === 'no-linked') return workState && !workState.loading && !workState.refreshFailed && (workState.links || []).length === 0
   if (filter === 'working') return ['working', 'starting'].includes(liveState)
     || (Array.isArray(workState?.links) && workState.links.some(link => workingSessionIds?.has(sessionLinkIdentity(link))))
   if (filter === 'stale') return attentionReasons.some(reason => String(reason).startsWith('Stale '))
   return true
+}
+
+function countQuickFilters(issues, workStates, attentionByKey, liveTicketStates, workingSessionIds, prStatusByKey) {
+  const counts = Object.fromEntries(QUICK_FILTER_OPTIONS.map(option => [option.value, 0]))
+  for (const issue of issues) {
+    const workState = workStates[issue.key]
+    const attention = attentionByKey[issue.key] || []
+    const liveState = liveTicketStates[issue.key] || 'idle'
+    for (const option of QUICK_FILTER_OPTIONS) {
+      if (matchesQuickFilter(option.value, issue, workState, attention, liveState, workingSessionIds, prStatusByKey)) {
+        counts[option.value] += 1
+      }
+    }
+  }
+  return counts
+}
+
+function reuseUnchangedSet(previous, next) {
+  return previous.size === next.size && [...next].every(value => previous.has(value)) ? previous : next
+}
+
+function reuseUnchangedRecord(previous, next) {
+  const keys = Object.keys(next)
+  return Object.keys(previous).length === keys.length && keys.every(key => previous[key] === next[key]) ? previous : next
 }
 
 function escapeJqlValue(value) {
@@ -1027,6 +1127,332 @@ function isQuickFilter(value) {
   return QUICK_FILTER_OPTIONS.some(option => option.value === value) ? value : 'all'
 }
 
+function normaliseCollapsedLaneKeys(value) {
+  if (!Array.isArray(value)) return []
+  return [...new Set(value.filter(key => typeof key === 'string' && key.trim()).map(key => key.slice(0, 120)))].slice(0, 64)
+}
+
+let prStatusSnapshot = null
+const prStatusSubscribers = new Set()
+
+function readPrStatusCache(force = false) {
+  const base = readPrStatusCacheRaw(force)
+  const overrides = readPrLinkOverrides()
+  const overrideEntries = Object.fromEntries(
+    Object.entries(overrides)
+      .filter(([, entry]) => entry && typeof entry === 'object' && typeof entry.url === 'string')
+      .map(([key, entry]) => [key, {
+        url: entry.url,
+        number: String(entry.number || ''),
+        state: 'manual',
+        fetchedAt: Number(entry.savedAt) || 0
+      }])
+  )
+  return { ...overrideEntries, ...base }
+}
+
+function readPrStatusCacheRaw(force = false) {
+  if (prStatusSnapshot && !force) return prStatusSnapshot
+  const stored = pluginContext?.storage.get(PR_STATUS_CACHE_KEY, {}) || {}
+  const now = Date.now()
+  prStatusSnapshot = Object.fromEntries(
+    Object.entries(stored)
+      .filter(([, entry]) => entry && typeof entry === 'object'
+        && Number(entry.fetchedAt) > 0 && now - Number(entry.fetchedAt) < PR_STATUS_MAX_AGE_MS)
+      .slice(0, PR_STATUS_CACHE_LIMIT)
+  )
+  return prStatusSnapshot
+}
+
+function writePrStatus(issueKey, entry) {
+  const key = String(issueKey || '').trim()
+  if (!pluginContext || !key) return
+  const current = { ...readPrStatusCacheRaw(true) }
+  if (entry && typeof entry === 'object') current[key] = { ...entry, fetchedAt: Number(entry.fetchedAt) || Date.now() }
+  else delete current[key]
+  prStatusSnapshot = current
+  try { pluginContext.storage.set(PR_STATUS_CACHE_KEY, current) } catch { /* optional storage */ }
+  for (const listener of prStatusSubscribers) {
+    try { listener(current) } catch { /* listeners are best effort */ }
+  }
+}
+
+function subscribePrStatus(listener) {
+  prStatusSubscribers.add(listener)
+  listener(readPrStatusCache())
+  return () => prStatusSubscribers.delete(listener)
+}
+
+const PR_LINK_OVERRIDES_KEY = 'pull-request-link-overrides-v1'
+const PR_LINK_OVERRIDES_LIMIT = 100
+
+function readPrLinkOverrides() {
+  if (!pluginContext) return {}
+  try {
+    const stored = pluginContext.storage.get(PR_LINK_OVERRIDES_KEY, {})
+    return stored && typeof stored === 'object' && !Array.isArray(stored) ? stored : {}
+  } catch { return {} }
+}
+
+function prLinkOverrideValid(url) {
+  try {
+    const parsed = new URL(String(url || '').trim())
+    if (parsed.protocol !== 'https:' && parsed.protocol !== 'http:') return ''
+    return parsed.toString()
+  } catch { return '' }
+}
+
+function prLinkDrift(entry, detected) {
+  if (!entry || !detected || detected.pr === false || !detected.url) return null
+  const manualUrl = prLinkOverrideValid(entry.url)
+  const detectedUrl = prLinkOverrideValid(detected.url)
+  if (!manualUrl || !detectedUrl) return null
+  const pullNumber = url => Number((String(url).match(/\/pull\/(\d+)/) || [])[1] || 0)
+  const manualNumber = Number(entry.number) > 0 ? Number(entry.number) : pullNumber(manualUrl)
+  const detectedNumber = Number(detected.number) > 0 ? Number(detected.number) : pullNumber(detectedUrl)
+  if (manualNumber && detectedNumber) return manualNumber !== detectedNumber ? { ...detected, url: detectedUrl } : null
+  return manualUrl !== detectedUrl ? { ...detected, url: detectedUrl } : null
+}
+
+function shiftAttachTarget(issues, attentionByKey, attachedOverrides, prStatuses) {
+  const attentionIssues = issues.filter(issue => (attentionByKey?.[issue.key] || []).length > 0)
+  if (!attentionIssues.length) return null
+  return attentionIssues.find(issue => !attachedOverrides[issue.key] && !prStatuses[issue.key]?.pr)
+    || attentionIssues.find(issue => !attachedOverrides[issue.key])
+    || attentionIssues[0]
+}
+
+function writePrLinkOverride(issueKey, url) {
+  const key = String(issueKey || '').trim()
+  if (!pluginContext || !key) return
+  try {
+    const current = { ...readPrLinkOverrides() }
+    const valid = url ? prLinkOverrideValid(url) : ''
+    if (url && !valid) return
+    if (valid) {
+      const numberMatch = valid.match(/\/pull\/(\d+)/)
+      current[key] = { url: valid, number: numberMatch ? numberMatch[1] : '', state: 'manual', savedAt: Date.now() }
+      const bounded = Object.entries(current)
+        .sort((left, right) => Number(right[1]?.savedAt || 0) - Number(left[1]?.savedAt || 0))
+        .slice(0, PR_LINK_OVERRIDES_LIMIT)
+      pluginContext.storage.set(PR_LINK_OVERRIDES_KEY, Object.fromEntries(bounded))
+    } else {
+      delete current[key]
+      pluginContext.storage.set(PR_LINK_OVERRIDES_KEY, current)
+    }
+  } catch { /* optional storage */ }
+  prStatusSnapshot = null
+  for (const listener of prStatusSubscribers) {
+    try { listener(readPrStatusCache()) } catch { /* listeners are best effort */ }
+  }
+}
+
+function clearPrLinkOverrides() {
+  if (!pluginContext) return
+  try {
+    pluginContext.storage.set(PR_LINK_OVERRIDES_KEY, {})
+  } catch { /* optional storage */ }
+  prStatusSnapshot = null
+  for (const listener of prStatusSubscribers) {
+    try { listener(readPrStatusCache()) } catch { /* listeners are best effort */ }
+  }
+}
+
+function restorePrLinkOverrides(map) {
+  const entries = Object.entries(map || {})
+    .filter(([key, value]) => ISSUE_KEY_PATTERN.test(key) && prLinkOverrideValid(value?.url ?? value))
+    .slice(0, PR_LINK_OVERRIDES_LIMIT)
+  if (!pluginContext || !entries.length) return 0
+  try {
+    const restored = {}
+    for (const [key, value] of entries) {
+      const url = prLinkOverrideValid(value?.url ?? value)
+      const numberMatch = url.match(/\/pull\/(\d+)/)
+      restored[key] = { url, number: numberMatch ? numberMatch[1] : '', state: 'manual', savedAt: Number(value?.savedAt) || Date.now() }
+    }
+    pluginContext.storage.set(PR_LINK_OVERRIDES_KEY, restored)
+  } catch { /* optional storage */ }
+  prStatusSnapshot = null
+  for (const listener of prStatusSubscribers) {
+    try { listener(readPrStatusCache()) } catch { /* listeners are best effort */ }
+  }
+  return entries.length
+}
+
+function parsePrLinkImport(text) {
+  try {
+    const data = JSON.parse(String(text || ''))
+    if (!data || typeof data !== 'object' || Array.isArray(data)) return null
+    const entries = []
+    let skipped = 0
+    for (const [key, entry] of Object.entries(data)) {
+      const url = entry && typeof entry === 'object' ? prLinkOverrideValid(entry.url) : ''
+      if (ISSUE_KEY_PATTERN.test(key) && url) entries.push([key, url])
+      else skipped += 1
+    }
+    return { entries, skipped }
+  } catch { return null }
+}
+
+function prStatusTone(state) {
+  const value = String(state || '').toLowerCase()
+  if (value === 'open') return 'bg-emerald-500/10 text-emerald-400'
+  if (value === 'merged') return 'bg-fuchsia-500/10 text-fuchsia-400'
+  return 'bg-foreground/5 text-(--ui-text-quaternary)'
+}
+
+function PrStatusBadge({ entry, className = '', issueKey = '' }) {
+  if (!entry || entry.pr === false) return null
+  const state = String(entry.state || '').toLowerCase() || 'linked'
+  const checkedAt = Number(entry.fetchedAt) || 0
+  const checkedLabel = checkedAt > 0
+    ? Date.now() - checkedAt < 60_000
+      ? 'just now'
+      : `${Math.round((Date.now() - checkedAt) / 60_000)} min ago`
+    : 'earlier'
+  const pinUrl = state === 'manual' ? '' : prLinkOverrideValid(entry.url)
+  // A cached detection shadows the manual entry in readPrStatusCache, so the
+  // state field alone can't mean "attached" — check overrides directly.
+  const canPin = Boolean(issueKey && Number(entry.number) > 0 && pinUrl && !readPrLinkOverrides()[issueKey])
+  const badgeText = state === 'manual'
+      ? `Pull request${entry.number ? ` #${entry.number}` : ''} · attached manually`
+      : `Pull request${entry.number ? ` #${entry.number}` : ''} · ${state} · checked ${checkedLabel} · ${canPin ? 'not attached · pin it locally from here or the ticket drawer' : 'open the ticket for PR actions'}`
+  const badge = jsx('span', {
+    className: `shrink-0 rounded px-1 py-px text-[0.55rem] font-medium uppercase tracking-wide ${prStatusTone(state)} ${className}`,
+    'aria-label': badgeText,
+    title: badgeText,
+    children: 'PR'
+  })
+  if (!canPin) return badge
+  return jsxs(Fragment, {
+    children: [
+      badge,
+      // Pointer-only pin: rows are <button> elements, so a nested interactive
+      // element would be invalid — keyboard users pin from the ticket drawer.
+      jsx('span', {
+        'aria-hidden': 'true',
+        className: 'inline-flex shrink-0 cursor-pointer items-center rounded px-0.5 text-(--ui-text-quaternary) transition-colors hover:bg-(--chrome-action-hover) hover:text-foreground',
+        onClick: event => {
+          event.stopPropagation()
+          writePrLinkOverride(issueKey, pinUrl)
+          host.notify({ kind: 'success', message: `Detected pull request ${entry.number ? `#${entry.number} ` : ''}pinned to ${issueKey}.` })
+          // Also fetch detection info so drift tracking and lane freshness
+          // have data for tickets pinned straight from the list (best effort,
+          // positive results only — a negative result must not hide the badge).
+          api(`/issues/${encodeURIComponent(issueKey)}/repository-context?base_ref=${encodeURIComponent('HEAD')}`, { timeoutMs: 10_000 })
+            .then(result => {
+              const github = result?.github && typeof result.github === 'object' ? result.github : null
+              if (!result?.available || !github || github.available !== true) return
+              const pullRequest = github.pull_request && typeof github.pull_request === 'object' ? github.pull_request : null
+              if (pullRequest) writePrStatus(issueKey, { number: pullRequest.number || '', state: String(pullRequest.state || ''), url: String(pullRequest.url || ''), fetchedAt: Date.now() })
+            })
+            .catch(() => { /* best effort: drift data fills in on the next drawer or refresh */ })
+        },
+        title: `Pin detected #${entry.number} to ${issueKey} · stored locally, not in Jira`,
+        children: jsx(Codicon, { name: 'attach', size: '0.6rem' })
+      })
+    ]
+  })
+}
+
+function NarrowingChip({ label, onClear }) {
+  return jsxs('button', {
+    className: 'inline-flex max-w-56 items-center gap-1 rounded-full border border-(--ui-stroke-tertiary) bg-(--ui-bg-quaternary) px-2 py-0.5 text-[0.6rem] text-(--ui-text-tertiary) transition-colors hover:bg-(--chrome-action-hover) hover:text-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-(--dt-composer-ring)',
+    onClick: onClear,
+    title: `Clear: ${label}`,
+    type: 'button',
+    children: [
+      jsx('span', { className: 'truncate', children: label }),
+      jsx(Codicon, { name: 'close', size: '0.6rem' })
+    ]
+  })
+}
+
+function withSprintViews(settings) {
+  const views = settings?.views
+  if (!Array.isArray(views) || settings?.version === 3) return settings
+  const priorSprint = views.find(view => view?.id === SPRINT_VIEW.id && view?.jql === LEGACY_SPRINT_JQL)
+  if (priorSprint) return {
+    ...settings,
+    views: views.map(view => view === priorSprint ? {
+      ...view,
+      jql: DEFAULT_JQL,
+      label: view.label === 'Current sprint' ? SPRINT_VIEW.label : view.label
+    } : view)
+  }
+  if (settings?.version === 2 || !views.some(view =>
+    ['assigned', 'backlog', 'bugs', 'reported', 'recent'].includes(view?.id)
+  )) return settings
+  const present = new Set(views.map(view => view.id))
+  if (present.has(SPRINT_VIEW.id) || present.has(ALL_VIEW.id)) return settings
+  const missing = [SPRINT_VIEW, ALL_VIEW].filter(view => !present.has(view.id))
+  if (!missing.length || views.length + missing.length > 21) return settings
+  const assigned = views.find(view => view.id === 'assigned')
+  const defaultView = settings.defaultView === 'assigned'
+    && assigned?.jql === 'assignee = currentUser() AND statusCategory != Done ORDER BY updated DESC'
+    ? SPRINT_VIEW.id : settings.defaultView
+  return { ...settings, defaultView, views: [...missing, ...views] }
+}
+
+const LAST_ACTIVE_VIEW_KEY = 'last-active-view-v2'
+
+function readLastActiveViewId() {
+  if (!pluginContext) return ''
+  try {
+    return String(pluginContext.storage.get(LAST_ACTIVE_VIEW_KEY, '') || '').slice(0, 120)
+  } catch { return '' }
+}
+
+function writeLastActiveViewId(viewId) {
+  if (!pluginContext) return
+  try {
+    pluginContext.storage.set(LAST_ACTIVE_VIEW_KEY, String(viewId || '').slice(0, 120))
+  } catch { /* optional storage */ }
+}
+
+function commentDraftId(scope, issueKey) {
+  return `${String(scope || '')}::${String(issueKey || '')}`
+}
+
+function readCommentDraft(scope, issueKey) {
+  if (!pluginContext) return ''
+  try {
+    const entry = (pluginContext.storage.get(COMMENT_DRAFT_CACHE_KEY, {}) || {})[commentDraftId(scope, issueKey)]
+    if (!entry || typeof entry !== 'object') return ''
+    if (Date.now() - Number(entry.savedAt || 0) > COMMENT_DRAFT_MAX_AGE_MS) return ''
+    return typeof entry.text === 'string' ? entry.text : ''
+  } catch { return '' }
+}
+
+function writeCommentDraft(scope, issueKey, text) {
+  if (!pluginContext) return
+  try {
+    const id = commentDraftId(scope, issueKey)
+    const current = { ...(pluginContext.storage.get(COMMENT_DRAFT_CACHE_KEY, {}) || {}) }
+    const value = String(text || '').slice(0, COMMENT_DRAFT_TEXT_LIMIT)
+    if (value) current[id] = { text: value, savedAt: Date.now() }
+    else delete current[id]
+    const bounded = Object.fromEntries(
+      Object.entries(current)
+        .filter(([, entry]) => entry && typeof entry === 'object' && Date.now() - Number(entry.savedAt || 0) < COMMENT_DRAFT_MAX_AGE_MS)
+        .sort((left, right) => Number(right[1]?.savedAt || 0) - Number(left[1]?.savedAt || 0))
+        .slice(0, COMMENT_DRAFT_CACHE_LIMIT)
+    )
+    pluginContext.storage.set(COMMENT_DRAFT_CACHE_KEY, bounded)
+  } catch { /* optional storage */ }
+}
+
+function commentDraftMarker(scope, issueKey) {
+  const draft = readCommentDraft(scope, issueKey)
+  if (!String(draft || '').trim()) return null
+  return jsx('span', {
+    'aria-label': 'Unsent comment draft saved',
+    className: 'mr-1 inline-block h-1.5 w-1.5 shrink-0 rounded-full bg-(--dt-composer-ring) align-middle',
+    role: 'img',
+    title: 'Unsent comment draft saved for this ticket'
+  })
+}
+
 function viewStateId(viewId, origin = '', owner = null) {
   const scope = cacheScopeKey(origin, owner)
   const id = String(viewId || '').trim()
@@ -1051,6 +1477,7 @@ function writeSavedViewState(viewId, state = {}, origin = '', owner = null) {
       filter: String(state.filter || '').trim().slice(0, VIEW_FILTER_LIMIT),
       quickFilter: isQuickFilter(state.quickFilter),
       attentionOnly: state.attentionOnly === true,
+      collapsedLanes: normaliseCollapsedLaneKeys(state.collapsedLanes),
       storedAt: Date.now()
     }
   }
@@ -1094,6 +1521,10 @@ function writeIssueCache(jql, pageSize, issues, nextPageToken, origin = '', owne
       .slice(0, ISSUE_CACHE_LIMIT)
   )
   pluginContext.storage.set(ISSUE_CACHE_KEY, trimmed)
+}
+
+function reuseUnchangedIssues(current, next) {
+  return current.length === next.length && JSON.stringify(current) === JSON.stringify(next) ? current : next
 }
 
 function laneCacheId(projectKeys, scope = '') {
@@ -1149,6 +1580,35 @@ function writeWorkStateCache(states, origin = '', owner = null) {
       .slice(0, 8)
   )
   pluginContext.storage.set(WORK_STATE_CACHE_KEY, bounded)
+}
+
+function reuseCachedWorkStates(current, cached) {
+  let next = current
+  for (const [key, state] of Object.entries(cached)) {
+    if (current[key] && Number(current[key].storedAt || 0) >= Number(state?.storedAt || 0)) continue
+    if (next === current) next = { ...current }
+    next[key] = state
+  }
+  return next
+}
+
+function cachedViewState(issues, origin = '', owner = null) {
+  const cachedWork = readWorkStateCache(origin, owner)
+  const workStates = Object.fromEntries(issues
+    .filter(issue => cachedWork[issue.key])
+    .map(issue => [issue.key, cachedWork[issue.key]]))
+  const projectKeys = [...new Set(issues.map(issue => String(issue?.project_key || '').trim().toUpperCase()).filter(Boolean))]
+  const statuses = issues.map(issue => ({ label: issue.status || 'No status', category: issue.status_category || 'new' }))
+  const cachedLanes = readLaneCache(projectKeys, origin, owner)
+  const lanes = mergeLaneDefinitions(cachedLanes, statuses)
+  return { workStates, lanes, laneReady: projectKeys.length === 0 || cachedLanes.length > 0, laneKey: projectKeys.join('|') }
+}
+
+function viewEnrichmentReady(issues, workStates, lanesReady) {
+  return lanesReady && issues.every(issue => {
+    const state = workStates[issue.key]
+    return state && state.loading !== true && (Array.isArray(state.links) || state.refreshFailed === true)
+  })
 }
 
 function readTicketWorktree(issueKey, origin = '', owner = null) {
@@ -1337,6 +1797,14 @@ function mergeLaneDefinitions(...collections) {
   return [...lanes.values()].sort((left, right) => left.rank - right.rank || left.label.localeCompare(right.label))
 }
 
+function reuseUnchangedLanes(current, next) {
+  if (current.length === next.length && current.every((lane, index) =>
+    lane.key === next[index].key && lane.label === next[index].label
+    && lane.category === next[index].category && lane.rank === next[index].rank
+  )) return current
+  return next
+}
+
 function issueAttentionReasons(issue, workState) {
   const reasons = []
   const status = String(issue?.status || '').toLowerCase()
@@ -1375,109 +1843,182 @@ function chatMatchReason(session, issue) {
   return ''
 }
 
-function IssueRowTitle({ issue }) {
-  return jsxs('span', {
-    className: 'flex min-w-0 items-baseline gap-1.5',
-    children: [
-      jsx('span', {
-        className: 'shrink-0 font-mono text-[0.64rem] font-medium text-(--ui-text-tertiary)',
-        children: issue.key
-      }),
-      jsx('span', { className: 'min-w-0 truncate', children: issue.summary })
-    ]
+function storyPointsValue(issue) {
+  const value = Number(issue?.story_points)
+  return Number.isFinite(value) && value >= 0 ? value : null
+}
+
+function hasStoryPointsField(issue) {
+  return Boolean(String(issue?.story_points_field?.id || '').trim())
+}
+
+function storyPointsText(issue) {
+  const value = storyPointsValue(issue)
+  return value === null ? '—' : String(value)
+}
+
+function issueParent(issue) {
+  const parent = issue?.parent && typeof issue.parent === 'object' ? issue.parent : null
+  return {
+    key: String(parent?.key || issue?.parent_key || '').trim(),
+    summary: String(parent?.summary || issue?.parent_summary || '').trim()
+  }
+}
+
+function JiraParentMarker({ issue, className }) {
+  const { key } = issueParent(issue)
+  if (!key) return null
+  return jsx('span', {
+    className,
+    title: `Sub-task of ${key}`,
+    children: `↳ ${key}`
   })
 }
 
-function JiraCard({ issue, active, attentionReasons = [], density = 'comfortable', onOpen, workState, workingSessionIds, liveState = 'idle' }) {
-  const tone = statusColor(issue)
+function ticketWorkPresentation(issue, workState, workingSessionIds, liveState = 'idle') {
   const linkedWork = Array.isArray(workState?.links) ? workState.links : []
-  const branch = linkedWork.find(link => link.branch)?.branch || ''
   const liveWorking = liveStatusSnapshot.entries.some(entry => entry.ticketKey === issue.key && entry.state === 'working')
-  const working = linkedWork.some(link => workingSessionIds?.has(sessionLinkIdentity(link)))
-    || liveWorking || liveState === 'working' || liveState === 'starting'
-  const liveAttention = ['failed', 'waiting'].includes(liveState)
+  return {
+    linkedWork,
+    branch: linkedWork.find(link => link.branch)?.branch || '',
+    working: linkedWork.some(link => workingSessionIds?.has(sessionLinkIdentity(link)))
+      || liveWorking || liveState === 'working' || liveState === 'starting',
+    liveAttention: ['failed', 'waiting'].includes(liveState)
+  }
+}
+
+function JiraCard({ issue, active, attentionReasons = [], density = 'comfortable', onOpen, workState, workingSessionIds, liveState = 'idle', prEntry = null }) {
+  const subtasks = Array.isArray(issue?.subtasks) ? issue.subtasks : []
+  const subtaskCompleted = subtasks.filter(isCompletedIssue).length
+  const compact = density === 'compact'
+  const tone = statusColor(issue)
+  const parentKey = issueParent(issue).key
+  const { linkedWork, branch, working, liveAttention } = ticketWorkPresentation(issue, workState, workingSessionIds, liveState)
   return jsxs('div', {
-    className: `group relative flex cursor-grab flex-col ${density === 'compact' ? 'gap-1.5 p-2' : 'gap-2 p-2.5'} rounded-md border border-(--ui-stroke-tertiary) border-l-2 bg-(--ui-bg-elevated) transition-colors hover:bg-primary/[0.06] active:cursor-grabbing${working ? ' border-(--dt-composer-ring) ring-1 ring-(--dt-composer-ring) bg-[color-mix(in_srgb,var(--dt-composer-ring)_10%,transparent)]' : active ? ' border-(--dt-composer-ring) bg-[color-mix(in_srgb,var(--dt-composer-ring)_7%,transparent)]' : ''}`,
+    'data-jira-row': issue.key,
+    'aria-label': `Open ${issue.key}: ${issue.summary || issue.key}${issue.priority ? ` · ${issue.priority} priority` : ''}${issue.assignee ? ` · assigned to ${issue.assignee}` : ''}${hasStoryPointsField(issue) ? ` · ${storyPointsText(issue)} story points` : ''}${working ? ' · working' : ''}${attentionReasons.length ? ` · ${attentionReasons.join(', ')}` : ''}`,
+    className: `group relative flex cursor-grab flex-col ${compact ? 'gap-1.5 p-2' : 'gap-2 p-2.5'} rounded-md border border-(--ui-stroke-tertiary) border-l-2 bg-(--ui-bg-elevated) transition-colors hover:bg-primary/[0.06] focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-(--dt-composer-ring) active:cursor-grabbing${working ? ' border-(--dt-composer-ring) ring-1 ring-(--dt-composer-ring) bg-[color-mix(in_srgb,var(--dt-composer-ring)_10%,transparent)]' : active ? ' border-(--dt-composer-ring) bg-[color-mix(in_srgb,var(--dt-composer-ring)_7%,transparent)]' : ''}`,
     draggable: true,
     onClick: () => onOpen(issue.key),
+    onKeyDown: event => {
+      if (event.key !== 'Enter' && event.key !== ' ') return
+      event.preventDefault()
+      onOpen(issue.key)
+    },
     onDragStart: event => {
       event.dataTransfer.setData('text/plain', issue.key)
       event.dataTransfer.effectAllowed = 'move'
       event.dataTransfer.setDragImage(event.currentTarget, event.nativeEvent.offsetX, event.nativeEvent.offsetY)
     },
+    role: 'button',
     style: { borderLeftColor: tone },
+    tabIndex: 0,
     children: [
       jsxs('div', {
-        className: 'flex min-w-0 items-center gap-1.5',
+        className: 'flex min-w-0 items-center gap-1.5 whitespace-nowrap',
         children: [
+          commentDraftMarker(activeDraftScope, issue.key),
           jsx('span', { className: 'shrink-0 font-mono text-[0.625rem] font-medium text-(--ui-text-tertiary)', children: issue.key }),
-          issue.issue_type ? jsx('span', { className: 'ml-auto truncate text-[0.6rem] text-(--ui-text-quaternary)', children: issue.issue_type }) : null
+          jsx(PrStatusBadge, { entry: prEntry, issueKey: issue.key }),
+          jsx(JiraParentMarker, {
+            issue,
+            className: 'ml-auto min-w-0 max-w-32 truncate text-[0.6rem] text-(--ui-text-quaternary)'
+          }),
+          !parentKey && issue.issue_type
+            ? jsx('span', { className: 'ml-auto min-w-0 max-w-32 truncate text-[0.6rem] text-(--ui-text-quaternary)', children: issue.issue_type })
+            : null
         ]
       }),
       jsx('span', {
-        className: 'line-clamp-3 text-[0.8125rem] font-medium leading-snug text-foreground',
+        className: compact ? 'truncate whitespace-nowrap text-[0.75rem] font-medium leading-snug text-foreground' : 'line-clamp-2 text-[0.8125rem] font-medium leading-snug text-foreground',
+        title: issue.summary || issue.key,
         children: issue.summary || issue.key
       }),
       jsxs('div', {
-        className: 'flex items-center gap-2 whitespace-nowrap text-[0.625rem] text-(--ui-text-tertiary)',
+        className: 'flex min-w-0 items-center gap-2 whitespace-nowrap text-[0.625rem] text-(--ui-text-tertiary)',
         children: [
           issue.priority
             ? jsxs('span', {
-                className: 'inline-flex min-w-0 items-center gap-1',
-                children: [jsx(Codicon, { name: 'arrow-up', size: '0.7rem' }), jsx('span', { className: 'truncate', children: issue.priority })]
+                className: 'inline-flex min-w-0 max-w-24 items-center gap-1',
+                'aria-label': `Priority: ${issue.priority}`,
+                role: compact ? 'img' : undefined,
+                title: `Priority: ${issue.priority}`,
+                children: [jsx(Codicon, { name: 'arrow-up', size: '0.7rem' }), compact ? null : jsx('span', { className: 'truncate whitespace-nowrap', children: issue.priority })]
+              })
+            : null,
+          hasStoryPointsField(issue)
+            ? jsxs('span', {
+                className: 'inline-flex shrink-0 items-center gap-1',
+                title: 'Story points',
+                children: [jsx('span', { className: 'text-(--ui-text-quaternary)', children: 'SP' }), storyPointsText(issue)]
+              })
+            : null,
+          subtasks.length
+            ? jsxs('span', {
+                className: 'inline-flex shrink-0 items-center gap-1',
+                title: `Subtasks: ${subtaskCompleted} of ${subtasks.length} completed`,
+                children: [jsx(Codicon, { name: 'list-tree', size: '0.7rem' }), `${subtaskCompleted}/${subtasks.length}`]
               })
             : null,
           issue.assignee
             ? jsxs('span', {
-                className: 'inline-flex min-w-0 items-center gap-1',
-                children: [jsx(Codicon, { name: 'account', size: '0.7rem' }), jsx('span', { className: 'truncate', children: issue.assignee })]
+                className: 'inline-flex min-w-0 max-w-32 items-center gap-1',
+                'aria-label': `Assignee: ${issue.assignee}`,
+                role: compact ? 'img' : undefined,
+                title: `Assignee: ${issue.assignee}`,
+                children: [jsx(Codicon, { name: 'account', size: '0.7rem' }), compact ? null : jsx('span', { className: 'truncate whitespace-nowrap', children: issue.assignee })]
               })
             : null,
-          jsx('span', { className: 'ml-auto shrink-0 text-(--ui-text-quaternary)', children: relativeDate(issue.updated) })
+          jsx('span', { className: 'ml-auto shrink-0 text-(--ui-text-quaternary)', title: absoluteDate(issue.updated), children: relativeDate(issue.updated) })
         ]
       }),
       linkedWork.length || attentionReasons.length || working || liveAttention
         ? jsxs('div', {
-            className: 'flex flex-wrap items-center gap-1 border-t border-(--ui-stroke-tertiary) pt-1.5 text-[0.6rem] text-(--ui-text-tertiary)',
+            className: `${compact ? 'flex-nowrap overflow-hidden' : 'flex-wrap'} flex min-w-0 items-center gap-1 border-t border-(--ui-stroke-tertiary) pt-1.5 text-[0.6rem] text-(--ui-text-tertiary)`,
             children: [
               liveState !== 'idle' && liveState !== 'working' && liveState !== 'starting'
                 ? jsx('span', {
-                    className: `inline-flex items-center gap-1 rounded px-1.5 py-0.5 ${liveState === 'failed' ? 'bg-red-500/10 text-red-400' : 'bg-amber-500/10 text-amber-400'}`,
-                    title: 'Live chat state',
-                    children: liveStatusLabel(liveState)
+                    'aria-label': liveStatusLabel(liveState),
+                    className: liveState === 'failed' ? 'text-red-400' : 'text-amber-400',
+                    role: 'img',
+                    title: `Live chat: ${liveStatusLabel(liveState)}`,
+                    children: jsx(Codicon, { name: 'warning', size: '0.72rem' })
                   })
                 : null,
               working
-                ? jsxs('span', {
-                    className: 'inline-flex items-center gap-1 rounded bg-[color-mix(in_srgb,var(--dt-composer-ring)_14%,transparent)] px-1.5 py-0.5 text-(--dt-composer-ring)',
-                    children: [
-                      jsx(Codicon, { className: 'animate-pulse', name: 'loading~spin', size: '0.65rem' }),
-                      jsx('span', { children: 'Working' })
-                    ]
+                ? jsx('span', {
+                    'aria-label': 'Working',
+                    className: 'text-(--dt-composer-ring)',
+                    role: 'img',
+                    title: 'Chat working on this ticket',
+                    children: jsx(Codicon, { className: 'animate-pulse', name: 'loading~spin', size: '0.72rem' })
                   })
                 : null,
               linkedWork.length
                 ? jsxs('span', {
-                    className: 'inline-flex items-center gap-1 rounded bg-foreground/5 px-1.5 py-0.5',
-                    title: 'Linked work',
+                    'aria-label': `${linkedWork.length} linked chat${linkedWork.length === 1 ? '' : 's'}`,
+                    className: 'inline-flex items-center gap-1 text-(--ui-text-tertiary)',
+                    title: `${linkedWork.length} linked chat${linkedWork.length === 1 ? '' : 's'}`,
                     children: [
-                      jsx(Codicon, { name: 'comment-discussion', size: '0.65rem' }),
-                      `${linkedWork.length} chat${linkedWork.length === 1 ? '' : 's'}`
+                      jsx(Codicon, { name: 'comment-discussion', size: '0.72rem' }),
+                      linkedWork.length
                     ]
                   })
                 : null,
               branch
                 ? jsxs('span', {
-                    className: 'inline-flex min-w-0 items-center gap-1 rounded bg-foreground/5 px-1.5 py-0.5',
-                    title: branch,
-                    children: [jsx(Codicon, { name: 'git-branch', size: '0.65rem' }), jsx('span', { className: 'max-w-24 truncate', children: branch })]
+                    className: 'inline-flex min-w-0 items-center gap-1 text-(--ui-text-quaternary)',
+                    title: `Worktree: ${branch}`,
+                    children: [jsx(Codicon, { name: 'git-branch', size: '0.72rem' }), jsx('span', { className: 'max-w-24 truncate', children: branch })]
                   })
                 : null,
               attentionReasons[0]
                 ? jsx('span', {
-                    className: 'truncate rounded bg-amber-500/10 px-1.5 py-0.5 text-amber-400',
+                    'aria-label': attentionReasons.join(' · '),
+                    className: 'ml-auto shrink-0 text-amber-400',
+                    role: 'img',
                     title: attentionReasons.join(' · '),
-                    children: attentionReasons[0]
+                    children: jsx(Codicon, { name: 'bell', size: '0.72rem' })
                   })
                 : null
             ]
@@ -1487,30 +2028,34 @@ function JiraCard({ issue, active, attentionReasons = [], density = 'comfortable
   })
 }
 
-function JiraListRow({ issue, active, attentionReasons = [], density = 'comfortable', listGrid, onOpen, workState, workingSessionIds, liveState = 'idle' }) {
+function JiraListRow({ issue, active, attentionReasons = [], density = 'comfortable', gridTemplateColumns, onOpen, showStoryPoints = false, workState, workingSessionIds, liveState = 'idle', prEntry = null }) {
   const compact = density === 'compact'
-  const linkedWork = Array.isArray(workState?.links) ? workState.links : []
-  const working = linkedWork.some(link => workingSessionIds?.has(sessionLinkIdentity(link)))
-    || liveStatusSnapshot.entries.some(entry => entry.ticketKey === issue.key && entry.state === 'working')
-    || liveState === 'working'
-    || liveState === 'starting'
-  const liveAttention = ['failed', 'waiting'].includes(liveState)
+  const { linkedWork, working, liveAttention } = ticketWorkPresentation(issue, workState, workingSessionIds, liveState)
   const status = issue.status || 'No status'
+  const subtasks = Array.isArray(issue?.subtasks) ? issue.subtasks : []
+  const subtaskCompleted = subtasks.filter(isCompletedIssue).length
   return jsxs('button', {
     'aria-current': active ? 'true' : undefined,
-    className: `${listGrid} grid w-full min-w-0 items-center ${compact ? 'gap-2 border-b border-l-2 border-(--ui-stroke-tertiary) px-2 py-1' : 'gap-3 rounded-md border border-(--ui-stroke-tertiary) border-l-2 bg-(--ui-bg-elevated) px-3 py-2'} text-left transition-colors hover:bg-primary/[0.06] focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-(--dt-composer-ring)${working ? ' ring-1 ring-(--dt-composer-ring) bg-[color-mix(in_srgb,var(--dt-composer-ring)_10%,transparent)]' : active ? ' border-(--dt-composer-ring) bg-[color-mix(in_srgb,var(--dt-composer-ring)_7%,transparent)]' : ''}`,
+    'data-jira-row': issue.key,
+    className: `grid w-full min-w-0 items-center ${compact ? 'gap-2 border-b border-l-2 border-(--ui-stroke-tertiary) px-2 py-1' : 'gap-3 rounded-md border border-(--ui-stroke-tertiary) border-l-2 bg-(--ui-bg-elevated) px-3 py-2'} whitespace-nowrap text-left transition-colors hover:bg-primary/[0.06] focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-(--dt-composer-ring)${working ? ' ring-1 ring-(--dt-composer-ring) bg-[color-mix(in_srgb,var(--dt-composer-ring)_10%,transparent)]' : active ? ' border-(--dt-composer-ring) bg-[color-mix(in_srgb,var(--dt-composer-ring)_7%,transparent)]' : ''}`,
     onClick: () => onOpen(issue.key),
-    style: { borderLeftColor: statusColor(issue) },
+    style: { gridTemplateColumns, borderLeftColor: statusColor(issue) },
     type: 'button',
     children: [
+      commentDraftMarker(activeDraftScope, issue.key),
       jsxs('span', {
-        className: 'min-w-0',
+        className: 'min-w-0 overflow-hidden',
         children: [
           jsxs('span', {
             className: `flex min-w-0 ${compact ? 'items-center gap-1.5' : 'items-baseline gap-2'}`,
             children: [
-              jsx('span', { className: `shrink-0 font-mono ${compact ? 'text-[0.6rem]' : 'text-[0.65rem] font-medium'} text-(--ui-text-tertiary)`, children: issue.key }),
-              jsx('span', { className: compact ? 'truncate text-[0.68rem] text-(--ui-text-secondary)' : 'truncate text-xs font-medium text-foreground', children: issue.summary || issue.key })
+              jsx('span', { className: `shrink-0 font-mono ${compact ? 'text-[0.68rem]' : 'text-[0.65rem] font-medium'} text-(--ui-text-tertiary)`, children: issue.key }),
+              jsx(PrStatusBadge, { entry: prEntry, issueKey: issue.key }),
+              jsx(JiraParentMarker, {
+                issue,
+                className: 'shrink-0 max-w-24 truncate text-[0.58rem] text-(--ui-text-quaternary)'
+              }),
+              jsx('span', { className: 'truncate text-xs font-medium text-foreground', children: issue.summary || issue.key })
             ]
           }),
           !compact && issue.issue_type
@@ -1519,14 +2064,24 @@ function JiraListRow({ issue, active, attentionReasons = [], density = 'comforta
         ]
       }),
       compact
-        ? jsx('span', { className: 'truncate text-[0.68rem] text-(--ui-text-secondary)', title: status, children: status })
-        : jsx(PanelPill, { tone: statusTone(issue), children: status }),
-      jsx('span', { className: compact ? 'truncate text-[0.68rem] text-(--ui-text-tertiary)' : 'truncate text-xs text-(--ui-text-secondary)', children: issue.priority || '—' }),
-      jsx('span', { className: compact ? 'truncate text-[0.68rem] text-(--ui-text-tertiary)' : 'truncate text-xs text-(--ui-text-secondary)', children: issue.assignee || 'Unassigned' }),
+        ? jsx('span', { className: 'min-w-0 truncate text-[0.68rem] text-(--ui-text-secondary)', title: status, children: status })
+        : jsx('span', { className: 'min-w-0 max-w-full overflow-hidden', title: status, children: jsx(PanelPill, { tone: statusTone(issue), children: status }) }),
+      jsx('span', { className: compact ? 'min-w-0 truncate text-[0.68rem] text-(--ui-text-tertiary)' : 'min-w-0 truncate text-xs text-(--ui-text-secondary)', title: issue.priority || '—', children: issue.priority || '—' }),
+      showStoryPoints
+        ? jsx('span', { className: compact ? 'min-w-0 truncate text-[0.68rem] text-(--ui-text-tertiary)' : 'min-w-0 truncate text-xs text-(--ui-text-secondary)', title: storyPointsText(issue), children: storyPointsText(issue) })
+        : null,
+      subtasks.length
+        ? jsx('span', {
+            className: compact ? 'shrink-0 text-[0.68rem] text-(--ui-text-quaternary)' : 'shrink-0 text-xs text-(--ui-text-quaternary)',
+            title: `Subtasks: ${subtaskCompleted} of ${subtasks.length} completed`,
+            children: `✓${subtaskCompleted}/${subtasks.length}`
+          })
+        : null,
+      jsx('span', { className: compact ? 'min-w-0 truncate text-[0.68rem] text-(--ui-text-tertiary)' : 'min-w-0 truncate text-xs text-(--ui-text-secondary)', title: issue.assignee || 'Unassigned', children: issue.assignee || 'Unassigned' }),
       jsxs('span', {
-        className: compact ? 'flex min-w-0 items-center justify-end gap-1 text-[0.6rem] text-(--ui-text-tertiary)' : 'flex min-w-0 flex-wrap items-center justify-end gap-1 text-[0.62rem] text-(--ui-text-tertiary)',
+        className: compact ? 'flex min-w-0 flex-nowrap items-center justify-end gap-1 whitespace-nowrap text-[0.6rem] text-(--ui-text-tertiary)' : 'flex min-w-0 flex-wrap items-center justify-end gap-1 text-[0.62rem] text-(--ui-text-tertiary)',
         children: [
-          jsx('span', { className: 'shrink-0 text-(--ui-text-quaternary)', children: relativeDate(issue.updated) }),
+          jsx('span', { className: 'shrink-0 text-(--ui-text-quaternary)', title: absoluteDate(issue.updated), children: relativeDate(issue.updated) }),
           working
             ? compact
               ? jsx('span', { 'aria-label': 'Working', className: 'text-(--dt-composer-ring)', title: 'Working', children: jsx(Codicon, { className: 'animate-pulse', name: 'loading~spin', size: '0.6rem' }) })
@@ -1553,22 +2108,27 @@ function JiraListRow({ issue, active, attentionReasons = [], density = 'comforta
   })
 }
 
-function JiraList({ issues, activeKey, attentionByKey, density = 'comfortable', onOpen, workStates, workingSessionIds, liveTicketStates }) {
+function JiraList({ issues, activeKey, attentionByKey, density = 'comfortable', onOpen, workStates, workingSessionIds, liveTicketStates, prStatusByKey = null }) {
   const compact = density === 'compact'
-  const listGrid = compact ? 'grid-cols-[minmax(14rem,1fr)_6rem_5rem_8rem_5rem]' : 'grid-cols-[minmax(18rem,1fr)_9rem_8rem_11rem_8rem]'
+  const showStoryPoints = issues.some(hasStoryPointsField)
+  const gridTemplateColumns = compact ? 'minmax(14rem, 1fr) 6rem 5rem 8rem 5rem' : 'minmax(18rem, 1fr) 9rem 8rem 11rem 8rem'
+  const storyPointsGridTemplateColumns = compact ? 'minmax(14rem, 1fr) 6rem 5rem 4rem 8rem 5rem' : 'minmax(18rem, 1fr) 9rem 8rem 5rem 11rem 8rem'
+  const activeGridTemplateColumns = showStoryPoints ? storyPointsGridTemplateColumns : gridTemplateColumns
   return jsxs('div', {
     className: compact ? 'min-w-[42rem] space-y-0' : 'min-w-[52rem] space-y-1.5',
     role: 'table',
     children: [
       jsxs('div', {
-        className: `${listGrid} grid ${compact ? 'gap-2 px-2 pb-1 text-[0.58rem]' : 'gap-3 px-3 text-[0.62rem]'} font-medium uppercase tracking-wide text-(--ui-text-quaternary)`,
+        className: `grid ${compact ? 'gap-2 px-2 pb-1 text-[0.58rem]' : 'gap-3 px-3 text-[0.62rem]'} sticky top-0 z-10 bg-(--ui-surface-background) pt-1 whitespace-nowrap font-medium uppercase tracking-wide text-(--ui-text-quaternary)`,
         role: 'row',
+        style: { gridTemplateColumns: activeGridTemplateColumns },
         children: [
-          jsx('span', { role: 'columnheader', children: 'Ticket' }),
-          jsx('span', { role: 'columnheader', children: 'Status' }),
-          jsx('span', { role: 'columnheader', children: 'Priority' }),
-          jsx('span', { role: 'columnheader', children: 'Assignee' }),
-          jsx('span', { className: 'text-right', role: 'columnheader', children: 'Updated' })
+          jsx('span', { className: 'min-w-0', role: 'columnheader', children: 'Ticket' }),
+          jsx('span', { className: 'min-w-0', role: 'columnheader', children: 'Status' }),
+          jsx('span', { className: 'min-w-0', role: 'columnheader', children: 'Priority' }),
+          showStoryPoints ? jsx('span', { className: 'min-w-0', role: 'columnheader', children: 'Points' }) : null,
+          jsx('span', { className: 'min-w-0', role: 'columnheader', children: 'Assignee' }),
+          jsx('span', { className: 'min-w-0 text-right', role: 'columnheader', children: 'Updated' })
         ]
       }),
       ...issues.map(issue => jsx(JiraListRow, {
@@ -1576,9 +2136,11 @@ function JiraList({ issues, activeKey, attentionByKey, density = 'comfortable', 
         active: issue.key === activeKey,
         attentionReasons: attentionByKey[issue.key] || [],
         density,
-        listGrid,
+        gridTemplateColumns: activeGridTemplateColumns,
         liveState: liveTicketStates?.[issue.key] || 'idle',
         onOpen,
+        prEntry: prStatusByKey?.[issue.key],
+        showStoryPoints,
         workState: workStates[issue.key],
         workingSessionIds
       }, issue.id || issue.key))
@@ -1586,10 +2148,27 @@ function JiraList({ issues, activeKey, attentionByKey, density = 'comfortable', 
   })
 }
 
-function JiraLane({ lane, attentionByKey, collapsed, density = 'comfortable', selectedKey, onToggle, onOpen, onMove, workingSessionIds, workStates, liveTicketStates }) {
+function JiraLane({ lane, attentionByKey, collapsed, density = 'comfortable', selectedKey, onToggle, onOpen, onMove, workingSessionIds, workStates, liveTicketStates, prStatusByKey = null }) {
   const [over, setOver] = useState(false)
   const label = lane.label || 'Tickets'
   const tone = statusColor(lane)
+  const lanePoints = lane.issues.some(hasStoryPointsField)
+    ? lane.issues.reduce((total, issue) => total + (storyPointsValue(issue) || 0), 0)
+    : null
+  const laneAttention = lane.issues.filter(issue => (attentionByKey?.[issue.key] || []).length > 0).length
+  const lanePrCount = lane.issues.filter(issue => {
+    const entry = prStatusByKey?.[issue.key]
+    return Boolean(entry && entry.pr !== false)
+  }).length
+  const laneNewestGhCheckAt = Math.max(0, ...lane.issues
+    .map(issue => prStatusByKey?.[issue.key])
+    .filter(entry => entry && typeof entry === 'object' && entry.state !== 'manual' && Number(entry.fetchedAt) > 0)
+    .map(entry => Number(entry.fetchedAt)))
+  const laneFreshnessNote = laneNewestGhCheckAt && Date.now() - laneNewestGhCheckAt > 5 * 60_000
+    ? ` · gh checks ${Math.round((Date.now() - laneNewestGhCheckAt) / 60_000)} min old`
+    : ''
+  const laneAttentionLabel = `${laneAttention} ticket${laneAttention === 1 ? '' : 's'} need attention in this lane`
+  const lanePrLabel = `${lanePrCount} ticket${lanePrCount === 1 ? '' : 's'} with a linked pull request (gh-checked or attached manually)${laneFreshnessNote}`
   const dragHandlers = {
     onDragLeave: () => setOver(false),
     onDragOver: event => {
@@ -1612,6 +2191,7 @@ function JiraLane({ lane, attentionByKey, collapsed, density = 'comfortable', se
     return jsxs('button', {
       ...dragHandlers,
       'aria-label': `Expand ${label}`,
+      'aria-expanded': false,
       className: `flex h-full w-8 shrink-0 flex-col items-center gap-1.5 rounded-lg p-2 transition-colors hover:bg-(--ui-bg-quinary) ${wash}`,
       onClick: onToggle,
       type: 'button',
@@ -1626,6 +2206,33 @@ function JiraLane({ lane, attentionByKey, collapsed, density = 'comfortable', se
         }),
         lane.issues.length
           ? jsx('span', { className: 'text-[0.625rem] tabular-nums text-(--ui-text-quaternary)', children: lane.issues.length })
+          : null,
+        lanePoints !== null
+          ? jsx('span', {
+              'aria-label': `${lanePoints} story points in this lane`,
+              className: 'text-[0.5625rem] tabular-nums text-(--ui-text-quaternary)',
+              role: 'img',
+              title: 'Story points in this lane',
+              children: `${lanePoints}pt`
+            })
+          : null,
+        laneAttention > 0
+          ? jsxs('span', {
+              className: 'flex items-center gap-0.5 text-[0.5625rem] tabular-nums text-amber-400',
+              'aria-label': laneAttentionLabel,
+              title: laneAttentionLabel,
+              role: 'img',
+              children: [jsx(Codicon, { name: 'bell', size: '0.6rem' }), laneAttention]
+            })
+          : null,
+        lanePrCount > 0
+          ? jsxs('span', {
+              className: 'flex items-center gap-0.5 text-[0.5625rem] tabular-nums text-(--ui-text-quaternary)',
+              'aria-label': lanePrLabel,
+              title: lanePrLabel,
+              role: 'img',
+              children: [jsx(Codicon, { name: 'git-pull-request', size: '0.6rem' }), lanePrCount]
+            })
           : null
       ]
     })
@@ -1644,8 +2251,36 @@ function JiraLane({ lane, attentionByKey, collapsed, density = 'comfortable', se
             children: label
           }),
           jsx('span', { className: 'text-[0.625rem] tabular-nums text-(--ui-text-quaternary)', children: lane.issues.length }),
+          lanePoints !== null
+            ? jsx('span', {
+                'aria-label': `${lanePoints} story points in this lane`,
+                className: 'text-[0.6rem] tabular-nums text-(--ui-text-quaternary)',
+                role: 'img',
+                title: 'Story points in this lane',
+                children: `${lanePoints} pts`
+              })
+            : null,
+          laneAttention > 0
+            ? jsxs('span', {
+                className: 'flex shrink-0 items-center gap-1 text-[0.6rem] tabular-nums text-amber-400',
+                'aria-label': laneAttentionLabel,
+                title: laneAttentionLabel,
+                role: 'img',
+                children: [jsx(Codicon, { name: 'bell', size: '0.62rem' }), laneAttention]
+              })
+            : null,
+          lanePrCount > 0
+            ? jsxs('span', {
+                className: 'flex shrink-0 items-center gap-1 text-[0.6rem] tabular-nums text-(--ui-text-quaternary)',
+                'aria-label': lanePrLabel,
+                title: lanePrLabel,
+                role: 'img',
+                children: [jsx(Codicon, { name: 'git-pull-request', size: '0.62rem' }), lanePrCount]
+              })
+            : null,
           jsx('button', {
             'aria-label': `Collapse ${label}`,
+            'aria-expanded': true,
             className: 'ml-auto grid size-5 place-items-center rounded text-(--ui-text-tertiary) opacity-0 transition-opacity hover:bg-(--chrome-action-hover) hover:text-foreground focus-visible:opacity-100 group-hover/col:opacity-100',
             onClick: onToggle,
             type: 'button',
@@ -1662,6 +2297,7 @@ function JiraLane({ lane, attentionByKey, collapsed, density = 'comfortable', se
               attentionReasons: attentionByKey[issue.key] || [],
               density,
               onOpen,
+              prEntry: prStatusByKey?.[issue.key],
               workState: workStates[issue.key],
               workingSessionIds,
               liveState: liveTicketStates?.[issue.key] || 'idle'
@@ -1954,6 +2590,14 @@ function JiraAttachment({ attachment, issueKey }) {
           children: [
             jsx(Codicon, { className: 'shrink-0 text-(--ui-text-tertiary)', name: 'file-media', size: '0.8rem' }),
             jsx('span', { className: 'min-w-0 flex-1 truncate text-foreground/80', title: filename, children: filename }),
+            jsx('button', {
+              'aria-label': 'Copy attachment filename',
+              className: 'shrink-0 rounded px-1 py-0.5 text-(--ui-text-quaternary) transition-colors hover:bg-(--chrome-action-hover) hover:text-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-(--dt-composer-ring)',
+              onClick: () => void copyTextToClipboard(filename, 'attachment filename'),
+              title: 'Copy filename',
+              type: 'button',
+              children: jsx(Codicon, { name: 'copy', size: '0.7rem' })
+            }),
             detail ? jsx('span', { className: 'shrink-0 text-(--ui-text-quaternary)', children: detail }) : null
           ]
         })
@@ -1971,21 +2615,389 @@ function JiraAttachment({ attachment, issueKey }) {
           jsx('div', { className: 'truncate text-xs text-foreground/80', title: filename, children: filename }),
           detail ? jsx('div', { className: 'text-[0.65rem] text-(--ui-text-quaternary)', children: detail }) : null
         ]
+      }),
+      jsx('button', {
+        'aria-label': 'Copy attachment filename',
+        className: 'shrink-0 rounded px-1 py-0.5 text-(--ui-text-quaternary) transition-colors hover:bg-(--chrome-action-hover) hover:text-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-(--dt-composer-ring)',
+        onClick: () => void copyTextToClipboard(filename, 'attachment filename'),
+        title: 'Copy filename',
+        type: 'button',
+        children: jsx(Codicon, { name: 'copy', size: '0.75rem' })
       })
     ]
   })
 }
 
-function IssueDetail({ issue, status, projects, mapping, links, baseRef, onOpenIssue, onIssueChanged, onMappingSaved, onLinksChanged, onPin, readOnly = false }) {
+function JiraIssueHierarchy({ issue, onOpenIssue }) {
+  const { key: parentKey, summary: parentSummary } = issueParent(issue)
+  const subtasks = Array.isArray(issue?.subtasks) ? issue.subtasks : []
+  const completed = subtasks.filter(isCompletedIssue).length
+  if (!parentKey && subtasks.length === 0) return null
+
+  return jsxs('section', {
+    className: 'space-y-3',
+    children: [
+      parentKey
+        ? jsxs('div', {
+            className: 'space-y-1.5',
+            children: [
+              jsx(PanelSectionLabel, { children: 'Parent' }),
+              jsx('button', {
+                'aria-label': `Open parent ${parentKey}`,
+                className: 'flex min-w-0 w-full items-center gap-2 rounded-md border border-(--ui-stroke-tertiary) bg-foreground/[0.025] px-2.5 py-2 text-left transition-colors hover:bg-primary/[0.06]',
+                onClick: () => onOpenIssue?.(parentKey),
+                title: parentSummary || parentKey,
+                type: 'button',
+                children: [
+                  jsx(Codicon, { className: 'shrink-0 text-(--ui-text-tertiary)', name: 'list-tree', size: '0.8rem' }),
+                  jsx('span', { className: 'shrink-0 font-mono text-[0.65rem] text-(--ui-text-tertiary)', children: parentKey }),
+                  jsx('span', { className: 'min-w-0 flex-1 truncate whitespace-nowrap text-xs text-foreground/85', children: parentSummary || 'Parent ticket' })
+                ]
+              })
+            ]
+          })
+        : null,
+      subtasks.length
+        ? jsxs('div', {
+            className: 'space-y-1.5',
+            children: [
+              jsx(PanelSectionLabel, { children: `Subtasks · ${completed}/${subtasks.length} done` }),
+              jsx('div', {
+                className: 'space-y-1',
+                children: subtasks.map(subtask => {
+                  const key = String(subtask?.key || '').trim()
+                  const summary = String(subtask?.summary || 'Subtask').trim()
+                  const status = String(subtask?.status || 'No status').trim()
+                  return jsxs('button', {
+                    'aria-label': `Open subtask ${key}`,
+                    className: 'flex min-w-0 w-full items-center gap-2 rounded-md border border-(--ui-stroke-tertiary) px-2 py-1.5 text-left transition-colors hover:bg-primary/[0.06]',
+                    onClick: () => onOpenIssue?.(key),
+                    title: `${key} · ${summary}`,
+                    type: 'button',
+                    children: [
+                      jsx('span', { className: 'size-1.5 shrink-0 rounded-full', style: { backgroundColor: statusColor(subtask) } }),
+                      jsx('span', { className: 'shrink-0 font-mono text-[0.62rem] text-(--ui-text-tertiary)', children: key }),
+                      jsx('span', { className: 'min-w-0 flex-1 truncate whitespace-nowrap text-xs text-foreground/85', children: summary }),
+                      jsx('span', { className: 'max-w-24 shrink-0 truncate whitespace-nowrap text-[0.62rem] text-(--ui-text-quaternary)', children: status })
+                    ]
+                  }, key)
+                })
+              })
+            ]
+          })
+        : null
+    ]
+  })
+}
+
+function prCheckRollup(checks) {
+  const rollup = { pass: 0, fail: 0, pending: 0 }
+  for (const check of Array.isArray(checks) ? checks : []) {
+    const state = String(check?.state || '').toLowerCase()
+    if (['success', 'successful', 'passed', 'pass', 'neutral', 'skipped'].includes(state)) rollup.pass += 1
+    else if (['failure', 'failed', 'error', 'timed_out', 'timed out', 'cancelled', 'action_required'].includes(state)) rollup.fail += 1
+    else rollup.pending += 1
+  }
+  return rollup
+}
+
+function prStateTone(state) {
+  const value = String(state || '').toLowerCase()
+  if (value === 'merged') return 'good'
+  if (value === 'open') return 'warn'
+  return 'muted'
+}
+
+function githubReasonText(reason) {
+  if (reason === 'gh_not_installed') return 'GitHub CLI is not installed, so no pull request was checked.'
+  if (reason === 'gh_not_authenticated') return 'GitHub CLI is not authenticated, so no pull request was checked.'
+  return 'GitHub context is unavailable right now.'
+}
+
+function changedFileStatusLabel(status) {
+  const value = String(status || '').trim()
+  if (value === '??') return 'Untracked'
+  if (value.includes('S')) return 'Staged'
+  if (value.includes('M')) return 'Modified'
+  if (value.includes('D')) return 'Deleted'
+  if (value.includes('A')) return 'Added'
+  return value || 'Changed'
+}
+
+async function copyTextToClipboard(value, label) {
+  const text = String(value || '')
+  if (!text || !pluginContext?.os?.writeClipboard) {
+    host.notify({ kind: 'warning', message: `Could not copy the ${label}.` })
+    return false
+  }
+  const copied = await pluginContext.os.writeClipboard(text)
+  host.notify({
+    kind: copied === false ? 'warning' : 'success',
+    message: copied === false ? `Could not copy the ${label}.` : `${label} copied to the clipboard.`
+  })
+  return copied !== false
+}
+
+function IssueDevelopmentSection({ context, manualPullRequest, issueKey = '', readOnly = false, onOverrideChanged = null }) {
+  const [repinUndo, setRepinUndo] = useState(null)
+  if (!context || context.available !== true) return null
+  const repository = context.repository && typeof context.repository === 'object' ? context.repository : null
+  const github = context.github && typeof context.github === 'object' ? context.github : null
+  const pullRequest = github?.pull_request && typeof github.pull_request === 'object' ? github.pull_request : null
+  const manualPullRequestValid = manualPullRequest && typeof manualPullRequest === 'object' && typeof manualPullRequest.url === 'string' ? manualPullRequest : null
+  const shownPullRequest = pullRequest || manualPullRequestValid
+  const prMismatch = Boolean(pullRequest && manualPullRequestValid
+    && String(pullRequest.number || '') && String(manualPullRequestValid.number || '')
+    && String(pullRequest.number) !== String(manualPullRequestValid.number))
+  const checks = Array.isArray(github?.checks) ? github.checks : []
+  const rollup = prCheckRollup(checks)
+  const failedNames = checks
+    .filter(check => ['failure', 'failed', 'error', 'timed_out', 'action_required'].includes(String(check?.state || '').toLowerCase()))
+    .map(check => String(check?.name || '').trim())
+    .filter(Boolean)
+    .slice(0, 6)
+  const checkChips = []
+  if (rollup.pass) {
+    checkChips.push(jsx('span', { className: 'rounded bg-foreground/5 px-1.5 py-0.5', title: 'Checks passing', children: `✔ ${rollup.pass} passing` }, 'checks-pass'))
+  }
+  if (rollup.fail) {
+    checkChips.push(jsx('span', {
+      className: 'rounded bg-red-500/10 px-1.5 py-0.5 text-red-400',
+      title: failedNames.join(', ') || 'Checks failing',
+      children: `✖ ${rollup.fail} failing`
+    }, 'checks-fail'))
+  }
+  if (rollup.pending) {
+    checkChips.push(jsx('span', { className: 'rounded bg-amber-500/10 px-1.5 py-0.5 text-amber-400', title: 'Checks still running', children: `… ${rollup.pending} pending` }, 'checks-pending'))
+  }
+  const branch = String(repository?.branch || '')
+  const changedFilesList = Array.isArray(repository?.changed_files) ? repository.changed_files : []
+  const changedFiles = changedFilesList.length
+  const recentCommits = Array.isArray(repository?.recent_commits) ? repository.recent_commits : []
+  const ahead = Number(repository?.ahead)
+  const behind = Number(repository?.behind)
+  return jsxs('section', {
+    className: 'space-y-2',
+    children: [
+      jsx(PanelSectionLabel, { children: 'Development' }),
+      shownPullRequest
+        ? jsxs('div', {
+            className: 'space-y-1.5 rounded-md border border-(--ui-stroke-tertiary) bg-foreground/[0.03] p-2.5',
+            title: shownPullRequest.url || '',
+            children: [
+              jsxs('div', {
+                className: 'flex min-w-0 items-center gap-2',
+                children: [
+                  shownPullRequest.number
+                    ? jsx('span', { className: 'shrink-0 font-mono text-[0.66rem] font-medium text-(--ui-text-tertiary)', children: `#${shownPullRequest.number}` })
+                    : null,
+                  jsx('span', {
+                    className: 'min-w-0 flex-1 truncate text-xs font-medium text-foreground',
+                    title: String(shownPullRequest.title || ''),
+                    children: shownPullRequest.title || (pullRequest
+                      ? 'Pull request'
+                      : `Attached${shownPullRequest.number ? ` #${shownPullRequest.number}` : ''} pull request`)
+                  }),
+                  shownPullRequest.state ? jsx('PanelPill', { tone: prStateTone(shownPullRequest.state), children: String(shownPullRequest.state) }) : null
+                ]
+              }),
+              jsxs('div', {
+                className: 'flex min-w-0 flex-wrap items-center gap-1.5 text-[0.62rem] text-(--ui-text-tertiary)',
+                children: [
+                  ...checkChips,
+                  shownPullRequest.review_decision
+                    ? jsx('span', { className: 'rounded bg-foreground/5 px-1.5 py-0.5', title: 'Review decision', children: `Review: ${shownPullRequest.review_decision}` })
+                    : null,
+                  shownPullRequest.url
+                    ? jsx('span', { className: 'ml-auto', children: jsx(Button, {
+                        onClick: () => pluginContext?.os.openExternal(shownPullRequest.url),
+                        size: 'xs',
+                        variant: 'outline',
+                        children: jsxs('span', {
+                          className: 'inline-flex items-center gap-1',
+                          children: [jsx(Codicon, { name: 'link-external', size: '0.7rem' }), 'Open PR']
+                        })
+                      }) })
+                    : null,
+                  shownPullRequest.url
+                    ? jsx('span', { children: jsx(Button, {
+                        'aria-label': 'Copy pull request URL',
+                        onClick: () => void copyTextToClipboard(shownPullRequest.url, 'pull request URL'),
+                        size: 'xs',
+                        title: 'Copy pull request URL',
+                        variant: 'ghost',
+                        children: jsx(Codicon, { name: 'copy', size: '0.7rem' })
+                      }) })
+                    : null
+                ]
+              }),
+              prMismatch
+                ? jsxs('div', {
+                    className: 'rounded bg-amber-500/10 px-1.5 py-0.5 text-[0.66rem] text-amber-400',
+                    role: 'status',
+                    title: `Manual ${manualPullRequestValid.url || `#${manualPullRequestValid.number}`} vs detected ${pullRequest.url || `#${pullRequest.number}`}`,
+                    children: [
+                      `Manual attachment #${manualPullRequestValid.number} differs from the detected #${pullRequest.number}.`,
+                      !readOnly
+                        ? jsx(Button, {
+                            onClick: () => {
+                              const url = prLinkOverrideValid(String(pullRequest.url || ''))
+                              if (!url || !issueKey) {
+                                host.notify({ kind: 'warning', message: 'The detected pull request URL is not usable yet.' })
+                                return
+                              }
+                              setRepinUndo({ key: issueKey, previous: manualPullRequest })
+                              writePrLinkOverride(issueKey, url)
+                              onOverrideChanged?.()
+                              host.notify({ kind: 'success', message: `Re-pinned ${issueKey} to detected #${pullRequest.number}.` })
+                            },
+                            size: 'xs',
+                            title: 'Replace the manual link with the detected pull request',
+                            variant: 'ghost',
+                            children: pullRequest.number ? `Re-pin to #${pullRequest.number}` : 'Re-pin to detected'
+                          })
+                        : null
+                    ]
+                  })
+                : null,
+              repinUndo && repinUndo.key === issueKey && manualPullRequestValid && !prMismatch
+                ? jsxs('div', {
+                    className: 'rounded bg-foreground/[0.03] px-1.5 py-0.5 text-[0.66rem] text-(--ui-text-tertiary)',
+                    role: 'status',
+                    children: [
+                      'Pinned to the detected pull request.',
+                      jsx(Button, {
+                        onClick: () => {
+                          restorePrLinkOverrides({ [issueKey]: repinUndo.previous })
+                          setRepinUndo(null)
+                          onOverrideChanged?.()
+                          host.notify({ kind: 'success', message: `Re-pin on ${issueKey} undone · previous manual link restored.` })
+                        },
+                        size: 'xs',
+                        title: 'Restore the manual link that was replaced',
+                        variant: 'ghost',
+                        children: 'Undo re-pin'
+                      })
+                    ]
+                  })
+                : null
+            ]
+          })
+        : null,
+      github && github.available === true && !shownPullRequest
+        ? jsx('p', {
+            className: 'text-xs text-(--ui-text-quaternary)',
+            children: branch ? `No pull request detected for ${branch} yet.` : 'No pull request detected yet.'
+          })
+        : null,
+      github && github.available !== true
+        ? jsx('p', { className: 'text-xs text-(--ui-text-quaternary)', children: githubReasonText(github.reason) })
+        : null,
+      repository
+        ? jsxs('div', {
+            className: 'flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1 font-mono text-[0.6rem] text-(--ui-text-quaternary)',
+            children: [
+              branch ? jsx('span', { className: 'truncate', title: branch, children: branch }) : null,
+              Number.isFinite(ahead) && Number.isFinite(behind)
+                ? jsx('span', { title: `Compared with ${repository.base_ref || 'base'}`, children: `↑${ahead} ↓${behind}` })
+                : null,
+              jsx('span', {
+                title: String(repository.worktree_path || ''),
+                children: repository.clean ? 'Clean' : `${changedFiles} changed`
+              }),
+              repository.worktree_path
+                ? jsx('button', {
+                    'aria-label': 'Copy worktree path',
+                    className: 'ml-auto rounded px-1 py-0.5 text-(--ui-text-quaternary) transition-colors hover:bg-(--chrome-action-hover) hover:text-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-(--dt-composer-ring)',
+                    onClick: () => copyTextToClipboard(repository.worktree_path, 'worktree path'),
+                    title: 'Copy worktree path',
+                    type: 'button',
+                    children: jsx(Codicon, { name: 'copy', size: '0.62rem' })
+                  })
+                : null
+            ]
+          })
+        : null,
+      changedFilesList.length
+        ? jsxs('details', {
+            className: 'border-t border-(--ui-stroke-tertiary) pt-1.5',
+            children: [
+              jsx('summary', {
+                className: 'cursor-pointer text-[0.62rem] text-(--ui-text-quaternary)',
+                children: `Changed files · ${changedFiles}${repository?.changed_files_truncated ? '+' : ''}`
+              }),
+              jsx('div', {
+                className: 'mt-1 space-y-0.5',
+                children: changedFilesList.map(file => jsxs('div', {
+                  className: 'flex min-w-0 items-center gap-1.5 font-mono text-[0.6rem]',
+                  children: [
+                    jsx('span', {
+                      className: 'w-14 shrink-0 rounded bg-foreground/5 px-1 py-px text-center text-(--ui-text-quaternary)',
+                      title: changedFileStatusLabel(file?.status),
+                      children: changedFileStatusLabel(file?.status)
+                    }),
+                    jsx('span', {
+                      className: 'min-w-0 truncate text-(--ui-text-tertiary)',
+                      title: String(file?.path || ''),
+                      children: file?.path || ''
+                    })
+                  ]
+                }, `${file?.status || ''}:${file?.path || ''}`))
+              })
+            ]
+          })
+        : null,
+      recentCommits.length
+        ? jsxs('details', {
+            className: 'border-t border-(--ui-stroke-tertiary) pt-1.5',
+            children: [
+              jsx('summary', {
+                className: 'cursor-pointer text-[0.62rem] text-(--ui-text-quaternary)',
+                children: `Recent commits · ${recentCommits.length}${repository?.recent_commits_truncated ? '+' : ''}`
+              }),
+              jsx('div', {
+                className: 'mt-1 space-y-1',
+                children: recentCommits.slice(0, 5).map(commit => jsxs('div', {
+                  className: 'flex min-w-0 items-baseline gap-1.5 text-[0.62rem]',
+                  children: [
+                    jsx('span', {
+                      className: 'shrink-0 font-mono text-(--ui-text-quaternary)',
+                      title: String(commit?.sha || ''),
+                      children: String(commit?.sha || '').slice(0, 7)
+                    }),
+                    jsx('span', {
+                      className: 'min-w-0 flex-1 truncate text-(--ui-text-tertiary)',
+                      title: String(commit?.subject || ''),
+                      children: commit?.subject || '(no subject)'
+                    }),
+                    jsx('span', { className: 'shrink-0 text-(--ui-text-quaternary)', children: relativeDate(commit?.authored_at) })
+                  ]
+                }, String(commit?.sha || '')))
+              })
+            ]
+          })
+        : null
+    ]
+  })
+}
+
+function IssueDetail({ issue, status, projects, mapping, links, baseRef, attachRequest = null, onOpenIssue, onIssueChanged, onMappingSaved, onLinksChanged, onPin, readOnly = false }) {
   const cacheOrigin = String(status?.base_url || '').trim()
   const cacheScope = cacheScopeKey(cacheOrigin)
   const [busyAction, setBusyAction] = useState('')
   const [commentDraft, setCommentDraft] = useState('')
+  const [prLinkInput, setPrLinkInput] = useState('')
+  const [prOverride, setPrOverride] = useState(null)
+  const [removedPrLink, setRemovedPrLink] = useState(null)
+  const [showPrInput, setShowPrInput] = useState(false)
+  const attachInputRef = useRef(null)
+  const undoButtonRef = useRef(null)
   const [error, setError] = useState('')
   const [transitions, setTransitions] = useState([])
   const [transitionId, setTransitionId] = useState('')
   const [relatedChats, setRelatedChats] = useState([])
   const [availableWorktrees, setAvailableWorktrees] = useState([])
+  const [repoContext, setRepoContext] = useState(null)
   const [linkedWorktree, setLinkedWorktree] = useState(() => readTicketWorktree(issue?.key, cacheOrigin))
   const [scanningChats, setScanningChats] = useState(false)
   const [unlinkingChatKey, setUnlinkingChatKey] = useState('')
@@ -2007,7 +3019,136 @@ function IssueDetail({ issue, status, projects, mapping, links, baseRef, onOpenI
     setLinkedWorktree(readTicketWorktree(issue?.key, cacheOrigin))
     setRelatedChats([])
     setAvailableWorktrees([])
+    setRepoContext(null)
   }, [cacheScope, issue?.key])
+
+  useEffect(() => {
+    setCommentDraft(readCommentDraft(cacheScope, issue?.key))
+  }, [cacheScope, issue?.key])
+
+  useEffect(() => {
+    setPrOverride(readPrLinkOverrides()[issue?.key] || null)
+    setPrLinkInput('')
+    setRemovedPrLink(null)
+    setShowPrInput(false)
+  }, [issue?.key])
+
+  const consumedAttachNonceRef = useRef(0)
+  useEffect(() => {
+    if (attachRequest?.key !== issue?.key) return
+    if (consumedAttachNonceRef.current === attachRequest?.nonce) return
+    consumedAttachNonceRef.current = attachRequest?.nonce
+    if (prOverride) return
+    setShowPrInput(true)
+  }, [attachRequest, issue?.key, prOverride])
+
+  const attachPrLink = useCallback(() => {
+    const valid = prLinkOverrideValid(prLinkInput)
+    if (!valid) {
+      host.notify({ kind: 'warning', message: 'Enter a valid http(s) pull request URL.' })
+      return
+    }
+    writePrLinkOverride(issue?.key, valid)
+    const saved = readPrLinkOverrides()[issue?.key] || null
+    if (saved) {
+      const label = saved.number ? `#${saved.number}` : saved.url
+      host.notify({ kind: 'success', message: `Pull request ${label} attached to ${issue?.key || 'this ticket'}.` })
+    }
+    setPrOverride(saved)
+    setPrLinkInput('')
+  }, [issue?.key, prLinkInput])
+
+  const removePrLink = useCallback(() => {
+    const entry = readPrLinkOverrides()[issue?.key] || null
+    writePrLinkOverride(issue?.key, '')
+    setPrOverride(null)
+    setRemovedPrLink(entry ? { key: issue?.key, entry } : null)
+  }, [issue?.key])
+
+  const undoRemovePrLink = useCallback(() => {
+    if (!removedPrLink?.entry || removedPrLink.key !== issue?.key) return
+    writePrLinkOverride(issue?.key, removedPrLink.entry.url)
+    setPrOverride(readPrLinkOverrides()[issue?.key] || null)
+    host.notify({ kind: 'success', message: `Pull request attachment restored on ${issue?.key || 'this ticket'}.` })
+    setRemovedPrLink(null)
+  }, [issue?.key, removedPrLink])
+
+  const detectedPullRequest = Boolean(repoContext?.github?.pull_request && typeof repoContext.github.pull_request === 'object')
+
+  useEffect(() => {
+    if (showPrInput) attachInputRef.current?.focus()
+  }, [showPrInput])
+
+  useEffect(() => {
+    if (removedPrLink) undoButtonRef.current?.focus()
+  }, [removedPrLink])
+
+  useEffect(() => {
+    if (readOnly) return () => undefined
+    const handler = event => {
+      if (event.metaKey || event.ctrlKey || event.altKey) return
+      const active = document.activeElement
+      const typing = active && (active.tagName === 'INPUT' || active.tagName === 'TEXTAREA' || active.isContentEditable === true)
+      if (event.key === 'Escape') {
+        // Collapse the attach field only when it holds focus, and swallow the
+        // press so the global Escape chain (blur → help → panels → filter)
+        // never fires for this one interaction.
+        if (active === attachInputRef.current) {
+          event.preventDefault()
+          event.stopPropagation()
+          attachInputRef.current?.blur()
+          setPrLinkInput('')
+          setShowPrInput(false)
+          return
+        }
+        // Escape with Undo focused dismisses the undo affordance rather than
+        // dropping focus to the body or letting the chain close the drawer;
+        // focus lands back in the attach field (expanding it if needed).
+        if (active === undoButtonRef.current) {
+          event.preventDefault()
+          event.stopPropagation()
+          setRemovedPrLink(null)
+          setShowPrInput(true)
+          attachInputRef.current?.focus()
+          return
+        }
+        return
+      }
+      const isAttachKey = event.key === 'a' || (event.key === 'A' && !event.shiftKey)
+      if (!isAttachKey || typing) return
+      if (prOverride) return
+      event.preventDefault()
+      setShowPrInput(true)
+    }
+    document.addEventListener('keydown', handler, true)
+    return () => document.removeEventListener('keydown', handler, true)
+  }, [prOverride, readOnly])
+
+  useEffect(() => {
+    let alive = true
+    const key = String(issue?.key || '').trim()
+    if (!key) {
+      setRepoContext(null)
+      return () => { alive = false }
+    }
+    const base = String(baseRef || 'HEAD').trim() || 'HEAD'
+    api(`/issues/${encodeURIComponent(key)}/repository-context?base_ref=${encodeURIComponent(base)}`, { timeoutMs: 20_000 })
+      .then(result => {
+        if (alive) setRepoContext(result || null)
+        const github = result?.github && typeof result.github === 'object' ? result.github : null
+        if (!result?.available || !github || github.available !== true) return
+        const pullRequest = github.pull_request && typeof github.pull_request === 'object' ? github.pull_request : null
+        writePrStatus(key, pullRequest
+          ? { number: pullRequest.number || '', state: String(pullRequest.state || ''), url: String(pullRequest.url || ''), fetchedAt: Date.now() }
+          : { pr: false, fetchedAt: Date.now() })
+      })
+      .catch(() => {
+        if (alive) setRepoContext({ available: false, reason: 'unreachable' })
+      })
+    return () => {
+      alive = false
+    }
+  }, [baseRef, issue?.key])
 
   useEffect(() => {
     let alive = true
@@ -2032,6 +3173,21 @@ function IssueDetail({ issue, status, projects, mapping, links, baseRef, onOpenI
     const url = issueUrl(status, issue?.key)
     if (url) pluginContext?.os.openExternal(url)
   }, [issue?.key, status])
+
+  const copyIssueKey = useCallback(async () => {
+    await copyTextToClipboard(issue?.key, 'ticket key')
+  }, [issue?.key])
+
+  const copyIssueUrl = useCallback(async () => {
+    await copyTextToClipboard(issueUrl(status, issue?.key), 'Jira link')
+  }, [issue?.key, status])
+
+  const copyIssueSummary = useCallback(async () => {
+    const key = String(issue?.key || '')
+    if (!key) return
+    const summary = String(issue?.summary || '').trim()
+    await copyTextToClipboard(summary ? `${key}: ${summary}` : key, 'ticket title')
+  }, [issue?.key, issue?.summary])
 
   const openLinked = useCallback(async link => {
     traceWorkOpen(issue?.key, 'resume-requested')
@@ -2376,6 +3532,7 @@ function IssueDetail({ issue, status, projects, mapping, links, baseRef, onOpenI
       forgetMutationKey('suggestion', issue.key, { transition_id: suggestedTransition.id }, mutationKey)
     } catch (cause) {
       setError(errorText(cause, 'Could not apply the suggested status.'))
+      host.notify({ kind: 'error', message: errorText(cause, 'Could not apply the suggested status.') })
     } finally {
       setBusyAction('')
     }
@@ -2464,6 +3621,7 @@ function IssueDetail({ issue, status, projects, mapping, links, baseRef, onOpenI
         body: { body, idempotency_key: mutationKey }
       })
       await invalidateIssueBatchCache(readActiveOwner(), status?.base_url)
+      writeCommentDraft(cacheScope, issue.key, '')
       setCommentDraft('')
       onIssueChanged?.({
         ...issue,
@@ -2473,10 +3631,11 @@ function IssueDetail({ issue, status, projects, mapping, links, baseRef, onOpenI
       forgetMutationKey('comment', issue.key, { body }, mutationKey)
     } catch (cause) {
       setError(errorText(cause, 'Could not add the Jira comment.'))
+      host.notify({ kind: 'error', message: errorText(cause, 'Could not add the Jira comment.') })
     } finally {
       setBusyAction('')
     }
-  }, [commentDraft, issue, onIssueChanged, status?.base_url])
+  }, [cacheScope, commentDraft, issue, onIssueChanged, status?.base_url])
 
   const moveIssue = useCallback(async () => {
     if (!transitionId) return
@@ -2501,6 +3660,7 @@ function IssueDetail({ issue, status, projects, mapping, links, baseRef, onOpenI
       forgetMutationKey('transition', issue.key, { transition_id: transitionId }, mutationKey)
     } catch (cause) {
       setError(errorText(cause, 'Could not change the Jira status.'))
+      host.notify({ kind: 'error', message: errorText(cause, 'Could not change the Jira status.') })
     } finally {
       setBusyAction('')
     }
@@ -2648,50 +3808,40 @@ function IssueDetail({ issue, status, projects, mapping, links, baseRef, onOpenI
   }, [baseRef, issue, linkedWorktree, links.length, mapping, onLinksChanged, status, cacheScope])
 
   if (!issue) return jsx(PanelEmpty, { icon: 'issues', title: 'Select a Jira ticket' })
+  const workSessionUnavailable = !mapping && !linkedWorktree?.path
+    ? 'Link this Jira project to a Hermes Project below, or attach a worktree to enable work sessions.'
+    : ''
 
   return jsxs('div', {
     className: 'space-y-5',
     children: [
       jsxs('div', {
-        className: 'flex flex-wrap items-start gap-x-3 gap-y-1.5',
+        className: 'space-y-2',
         children: [
           jsxs('div', {
-            className: 'min-w-0 flex-1',
+            className: 'flex flex-wrap items-center gap-2',
             children: [
-              jsxs('div', {
-                className: 'flex flex-wrap items-center gap-2',
-                children: [
-                  jsx('span', { className: 'font-mono text-[0.7rem] text-(--ui-text-tertiary)', children: issue.key }),
-                  issue.status ? jsx(PanelPill, { tone: statusTone(issue), children: issue.status }) : null,
-                  issue.issue_type ? jsx(Badge, { variant: 'outline', children: issue.issue_type }) : null
-                ]
-              })
+              jsx('span', { className: 'font-mono text-[0.7rem] text-(--ui-text-tertiary)', children: issue.key }),
+              jsx(Button, {
+                'aria-label': `Copy ${issue.key}`,
+                onClick: copyIssueKey,
+                size: 'icon-xs',
+                title: 'Copy ticket key',
+                variant: 'ghost',
+                children: jsx(Codicon, { name: 'copy', size: '0.72rem' })
+              }),
+              issue.status ? jsx(PanelPill, { tone: statusTone(issue), children: issue.status }) : null,
+              issue.issue_type ? jsx(Badge, { variant: 'outline', children: issue.issue_type }) : null
             ]
           }),
-          jsxs('div', {
-            className: 'flex flex-wrap items-center gap-1',
+          jsx('h2', {
+            className: 'break-words text-base font-semibold leading-snug text-foreground',
+            children: issue.summary
+          }),
+          !readOnly ? jsxs('div', {
+            className: 'flex flex-wrap items-center gap-1.5',
             children: [
-              jsx(PanelAction, { icon: 'link-external', onClick: openExternal, children: 'Open in Jira' }),
-              onPin && !readOnly
-                ? jsx(PanelAction, { icon: 'pin', onClick: onPin, children: 'Pin beside chat' })
-                : null,
-              !readOnly
-                ? jsx(PanelAction, {
-                    disabled: Boolean(busyAction),
-                    icon: 'link',
-                    onClick: linkCurrent,
-                    children: busyAction === 'link' ? 'Linking…' : 'Link current chat'
-                  })
-                : null,
-              !readOnly
-                ? jsx(PanelAction, {
-                    disabled: Boolean(busyAction),
-                    icon: 'wand',
-                    onClick: draftJiraUpdate,
-                    children: busyAction === 'draft-update' ? 'Drafting…' : 'Draft update'
-                  })
-                : null,
-              resumableLink && !readOnly
+              resumableLink
                 ? jsx(PanelAction, {
                     disabled: Boolean(busyAction),
                     icon: 'debug-restart',
@@ -2700,20 +3850,56 @@ function IssueDetail({ issue, status, projects, mapping, links, baseRef, onOpenI
                     children: busyAction === 'resume' ? 'Opening…' : 'Resume work'
                   })
                 : null,
+              jsx('span', {
+                'aria-label': workSessionUnavailable || undefined,
+                className: 'inline-flex rounded focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-(--dt-composer-ring)',
+                role: workSessionUnavailable ? 'note' : undefined,
+                tabIndex: workSessionUnavailable ? 0 : undefined,
+                title: workSessionUnavailable || undefined,
+                children: jsx(PanelAction, {
+                  disabled: Boolean(busyAction) || Boolean(workSessionUnavailable),
+                  icon: resumableLink ? 'comment-add' : 'git-branch-create',
+                  onClick: startWork,
+                  primary: !resumableLink,
+                  children: busyAction === 'work' ? 'Creating…' : resumableLink ? 'New chat' : 'Open work session'
+                })
+              })
+            ]
+          }) : null,
+          jsxs('div', {
+            'aria-label': 'Ticket actions',
+            className: 'flex flex-wrap items-center gap-1 border-t border-(--ui-stroke-tertiary) pt-2',
+            role: 'group',
+            children: [
+              jsx(Button, { 'aria-label': 'Open in Jira', onClick: openExternal, size: 'icon-xs', title: 'Open this ticket in Jira', variant: 'ghost', children: jsx(Codicon, { name: 'link-external', size: '0.85rem' }) }),
+              jsx(Button, { 'aria-label': 'Copy link', onClick: copyIssueUrl, size: 'icon-xs', title: 'Copy ticket URL', variant: 'ghost', children: jsx(Codicon, { name: 'link', size: '0.85rem' }) }),
+              jsx(Button, { 'aria-label': 'Copy summary', onClick: copyIssueSummary, size: 'icon-xs', title: 'Copy ticket key and summary', variant: 'ghost', children: jsx(Codicon, { name: 'copy', size: '0.85rem' }) }),
+              onPin && !readOnly
+                ? jsx(Button, { 'aria-label': 'Pin beside chat', onClick: onPin, size: 'icon-xs', title: 'Pin this ticket beside the chat', variant: 'ghost', children: jsx(Codicon, { name: 'pin', size: '0.85rem' }) })
+                : null,
               !readOnly
-                ? jsx(PanelAction, {
-                    disabled: Boolean(busyAction) || (!mapping && !linkedWorktree?.path),
-                    icon: resumableLink ? 'comment-add' : 'git-branch-create',
-                    onClick: startWork,
-                    primary: !resumableLink,
-                    children: busyAction === 'work' ? 'Creating…' : resumableLink ? 'New chat' : 'Open work session'
+                ? jsx(Button, {
+                    'aria-label': busyAction === 'link' ? 'Linking current chat' : 'Link current chat',
+                    disabled: Boolean(busyAction),
+                    onClick: linkCurrent,
+                    size: 'icon-xs',
+                    title: 'Link the current chat to this ticket',
+                    variant: 'ghost',
+                    children: jsx(Codicon, { name: busyAction === 'link' ? 'loading~spin' : 'comment-add', size: '0.85rem' })
+                  })
+                : null,
+              !readOnly
+                ? jsx(Button, {
+                    'aria-label': busyAction === 'draft-update' ? 'Drafting update' : 'Draft update',
+                    disabled: Boolean(busyAction),
+                    onClick: draftJiraUpdate,
+                    size: 'icon-xs',
+                    title: 'Draft a Jira update in a chat; nothing is posted to Jira',
+                    variant: 'ghost',
+                    children: jsx(Codicon, { name: busyAction === 'draft-update' ? 'loading~spin' : 'wand', size: '0.85rem' })
                   })
                 : null
             ]
-          }),
-          jsx('h2', {
-            className: 'min-w-0 basis-full text-base font-semibold leading-snug text-foreground',
-            children: issue.summary
           })
         ]
       }),
@@ -2722,14 +3908,170 @@ function IssueDetail({ issue, status, projects, mapping, links, baseRef, onOpenI
         rows: [
           { label: 'Project', value: `${issue.project_name || issue.project_key || '—'}${issue.project_key ? ` (${issue.project_key})` : ''}` },
           { label: 'Assignee', value: issue.assignee || 'Unassigned' },
-          { label: 'Reporter', value: issue.reporter || '—' },
           { label: 'Priority', value: issue.priority || '—' },
-          { label: 'Labels', value: issue.labels?.length ? issue.labels.join(', ') : '—' },
-          { label: 'Components', value: issue.components?.length ? issue.components.join(', ') : '—' },
-          { label: 'Fix versions', value: issue.fix_versions?.length ? issue.fix_versions.join(', ') : '—' },
-          { label: 'Created', value: issue.created ? new Date(issue.created).toLocaleString() : '—' },
+          ...(hasStoryPointsField(issue) ? [{ label: 'Story points', value: storyPointsText(issue) }] : []),
           { label: 'Updated', value: issue.updated ? new Date(issue.updated).toLocaleString() : '—' }
         ]
+      }),
+      jsxs('section', {
+        className: 'space-y-2',
+        children: [
+          jsx(PanelSectionLabel, { children: 'Description' }),
+          issue.description
+            ? jsx('div', {
+                className: 'whitespace-pre-wrap rounded-md bg-foreground/5 p-3 text-xs leading-relaxed text-foreground/80',
+                children: issue.description
+              })
+            : jsx('p', { className: 'text-xs text-(--ui-text-quaternary)', children: 'No description.' })
+        ]
+      }),
+      jsxs('details', {
+        className: 'rounded-md border border-(--ui-stroke-tertiary) px-3 py-2',
+        children: [
+          jsx('summary', { className: 'cursor-pointer text-xs text-(--ui-text-secondary)', children: 'More ticket details' }),
+          jsx('div', {
+            className: 'pt-3',
+            children: jsx(PanelMeta, {
+              rows: [
+                { label: 'Reporter', value: issue.reporter || '—' },
+                { label: 'Labels', value: issue.labels?.length ? issue.labels.join(', ') : '—' },
+                { label: 'Components', value: issue.components?.length ? issue.components.join(', ') : '—' },
+                { label: 'Fix versions', value: issue.fix_versions?.length ? issue.fix_versions.join(', ') : '—' },
+                { label: 'Created', value: issue.created ? new Date(issue.created).toLocaleString() : '—' }
+              ]
+            })
+          })
+        ]
+      }),
+      prOverride || !readOnly
+        ? jsxs('section', {
+            className: 'space-y-1.5',
+            children: [
+              jsx(PanelSectionLabel, { children: 'Pull request' }),
+              !prOverride && detectedPullRequest && !showPrInput
+                ? jsxs('div', {
+                    className: 'flex items-center gap-2',
+                    children: [
+                      jsx(Button, {
+                        onClick: () => {
+                          const url = prLinkOverrideValid(String(repoContext?.github?.pull_request?.url || ''))
+                          if (!url || !issue?.key) {
+                            host.notify({ kind: 'warning', message: 'The detected pull request URL is not usable yet.' })
+                            return
+                          }
+                          writePrLinkOverride(issue.key, url)
+                          setPrOverride(readPrLinkOverrides()[issue.key] || null)
+                          const number = repoContext?.github?.pull_request?.number
+                          host.notify({ kind: 'success', message: `Detected pull request ${number ? `#${number} ` : ''}pinned to ${issue.key}.` })
+                        },
+                        size: 'xs',
+                        title: "Save the detected pull request as this ticket's manual link",
+                        variant: 'ghost',
+                        children: repoContext?.github?.pull_request?.number
+                          ? `Pin detected #${repoContext.github.pull_request.number}`
+                          : 'Pin detected'
+                      }),
+                      jsx(Button, {
+                        onClick: () => setShowPrInput(true),
+                        size: 'xs',
+                        title: 'Attach a pull request link even though one was detected · a',
+                        variant: 'ghost',
+                        children: 'Add manual link'
+                      })
+                    ]
+                  })
+                : null,
+              prOverride
+                ? jsxs('div', {
+                    className: 'flex min-w-0 items-center gap-2 text-[0.7rem]',
+                    children: [
+                      jsx('span', {
+                        className: 'min-w-0 flex-1 truncate text-foreground/80',
+                        title: prOverride.url,
+                        children: prOverride.number ? `Attached #${prOverride.number}` : 'Attached'
+                      }),
+                      jsx('button', {
+                        'aria-label': 'Open attached pull request',
+                        className: 'shrink-0 rounded px-1.5 py-0.5 text-(--ui-text-quaternary) transition-colors hover:bg-(--chrome-action-hover) hover:text-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-(--dt-composer-ring)',
+                        onClick: () => {
+                          const valid = prLinkOverrideValid(prOverride.url)
+                          if (valid) pluginContext?.os?.openExternal?.(valid)
+                        },
+                        title: prOverride.url,
+                        type: 'button',
+                        children: 'Open'
+                      }),
+                      !readOnly
+                        ? jsx('button', {
+                            'aria-label': 'Remove attached pull request',
+                            className: 'shrink-0 rounded px-1.5 py-0.5 text-(--ui-text-quaternary) transition-colors hover:bg-(--chrome-action-hover) hover:text-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-(--dt-composer-ring)',
+                            onClick: removePrLink,
+                            type: 'button',
+                            children: 'Remove'
+                          })
+                        : null
+                    ]
+                  })
+                : jsxs('div', {
+                    className: `space-y-1${detectedPullRequest && !showPrInput ? ' hidden' : ''}`,
+                    children: [
+                      jsxs('div', {
+                        className: 'flex items-center gap-2',
+                        children: [
+                          jsx('input', {
+                            'aria-label': 'Attach pull request URL',
+                            ref: attachInputRef,
+                            title: 'Enter attaches · Esc closes',
+                            autoComplete: 'off',
+                            inputMode: 'url',
+                            maxLength: 500,
+                            spellCheck: false,
+                            className: 'h-7 min-w-0 flex-1 rounded-md border border-(--ui-stroke-secondary) bg-(--ui-bg-elevated) px-2 text-xs text-foreground outline-none placeholder:text-(--ui-text-quaternary) focus:border-(--dt-composer-ring)',
+                            onChange: event => setPrLinkInput(event.target.value),
+                            onKeyDown: event => {
+                              if (event.key === 'Enter') {
+                                event.preventDefault()
+                                attachPrLink()
+                              }
+                            },
+                            placeholder: 'https://github.com/org/repo/pull/123',
+                            value: prLinkInput
+                          }),
+                          jsx(Button, {
+                            disabled: !prLinkOverrideValid(prLinkInput),
+                            onClick: attachPrLink,
+                            size: 'xs',
+                            children: 'Attach'
+                          }),
+                          removedPrLink && removedPrLink.key === issue?.key
+                            ? jsx('button', {
+                                className: 'shrink-0 rounded px-1.5 py-0.5 text-[0.7rem] text-(--ui-text-quaternary) transition-colors hover:bg-(--chrome-action-hover) hover:text-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-(--dt-composer-ring)',
+                                onClick: undoRemovePrLink,
+                                ref: undoButtonRef,
+                                title: 'Restore the removed attachment',
+                                type: 'button',
+                                children: 'Undo'
+                              })
+                            : null
+                        ]
+                      }),
+                      String(prLinkInput || '').trim() && !prLinkOverrideValid(prLinkInput)
+                        ? jsx('p', {
+                            className: 'text-[0.66rem] text-amber-400',
+                            children: 'Enter a full https://… pull-request URL.'
+                          })
+                        : null
+                    ]
+                  })
+            ]
+          })
+        : null,
+      jsx(IssueDevelopmentSection, {
+        context: repoContext,
+        manualPullRequest: prOverride,
+        issueKey: issue?.key,
+        onOverrideChanged: () => setPrOverride(readPrLinkOverrides()[issue?.key] || null),
+        readOnly
       }),
       !readOnly && suggestedTransition
         ? jsxs('section', {
@@ -2790,123 +4132,83 @@ function IssueDetail({ issue, status, projects, mapping, links, baseRef, onOpenI
         className: 'space-y-2',
         children: [
           jsx(PanelSectionLabel, { children: 'Hermes worktree' }),
-          jsx('p', {
-            className: 'text-xs leading-relaxed text-(--ui-text-quaternary)',
-            children: 'Auto-link chats from worktree. Existing and future chats are attached when this ticket is opened or rescanned.'
-          }),
-          availableWorktrees.length > 0
-            ? jsx(Select, {
-                disabled: scanningChats,
-                value: linkedWorktree?.path || '',
-                onValueChange: chooseWorktree,
-                children: jsxs(Fragment, {
-                  children: [
-                    jsx(SelectTrigger, {
-                      className: 'w-full',
-                      children: jsx(SelectValue, { placeholder: 'Choose a detected worktree' })
-                    }),
-                    jsx(SelectContent, {
-                      children: availableWorktrees.map(worktree =>
-                        jsx(SelectItem, {
-                          value: worktree.path,
-                          children: worktree.branch || worktree.path
-                        }, worktree.path)
-                      )
+          jsxs('div', {
+            className: 'flex min-w-0 items-center gap-1.5',
+            children: [
+              availableWorktrees.length > 0
+                ? jsx('div', {
+                    className: 'min-w-0 flex-1',
+                    children: jsx(Select, {
+                      disabled: scanningChats,
+                      value: linkedWorktree?.path || '',
+                      onValueChange: chooseWorktree,
+                      children: jsxs(Fragment, {
+                        children: [
+                          jsx(SelectTrigger, {
+                            'aria-label': 'Choose a worktree for this ticket',
+                            className: 'w-full',
+                            children: jsx(SelectValue, { placeholder: 'Choose a detected worktree' })
+                          }),
+                          jsxs(SelectContent, {
+                            children: [
+                              linkedWorktree?.path && !availableWorktrees.some(worktree => worktree.path === linkedWorktree.path)
+                                ? jsx(SelectItem, { value: linkedWorktree.path, children: linkedWorktree.branch || linkedWorktree.path }, linkedWorktree.path)
+                                : null,
+                              ...availableWorktrees.map(worktree =>
+                                jsx(SelectItem, { value: worktree.path, children: worktree.branch || worktree.path }, worktree.path)
+                              )
+                            ]
+                          })
+                        ]
+                      })
                     })
-                  ]
-                })
-              })
-            : null,
-          linkedWorktree
-            ? jsxs('div', {
-                className: 'rounded-md bg-foreground/5 px-2.5 py-2',
-                children: [
-                  jsx('div', {
-                    className: 'truncate text-[0.72rem] font-medium text-foreground/85',
-                    children: linkedWorktree.branch || 'Linked worktree'
-                  }),
-                  jsx('div', {
-                    className: 'truncate font-mono text-[0.6rem] text-(--ui-text-quaternary)',
-                    title: linkedWorktree.path,
-                    children: linkedWorktree.path
                   })
+                : linkedWorktree
+                ? jsxs('div', {
+                    className: 'flex min-w-0 flex-1 items-center gap-2 rounded-md bg-foreground/5 px-2.5 py-1.5',
+                    title: linkedWorktree.path,
+                    children: [
+                      jsx(Codicon, { name: 'git-branch', size: '0.8rem' }),
+                      jsx('span', { className: 'min-w-0 truncate text-xs text-foreground/85', children: linkedWorktree.branch || linkedWorktree.path })
+                    ]
+                  })
+                : jsx('span', { className: 'min-w-0 flex-1 truncate text-xs text-(--ui-text-quaternary)', children: 'No worktree linked' }),
+              jsxs('div', {
+                'aria-label': 'Worktree actions',
+                className: 'flex shrink-0 items-center gap-1',
+                role: 'group',
+                children: [
+                  jsx(Button, {
+                    'aria-label': busyAction === 'current-worktree' ? 'Linking current worktree' : 'Use current worktree',
+                    disabled: Boolean(busyAction) || scanningChats,
+                    onClick: useCurrentWorktree,
+                    size: 'icon-xs',
+                    title: 'Use the current chat’s worktree · auto-link its chats',
+                    variant: 'ghost',
+                    children: jsx(Codicon, { name: busyAction === 'current-worktree' ? 'loading~spin' : 'link', size: '0.85rem' })
+                  }),
+                  linkedWorktree
+                    ? jsx(Button, {
+                        'aria-label': 'Unlink worktree',
+                        disabled: Boolean(busyAction) || scanningChats,
+                        onClick: unlinkWorktree,
+                        size: 'icon-xs',
+                        title: 'Unlink this worktree from the ticket; chats remain intact',
+                        variant: 'ghost',
+                        children: jsx(Codicon, { name: 'link-break', size: '0.85rem' })
+                      })
+                    : null
                 ]
               })
-            : null,
-          jsxs('div', {
-            className: 'flex flex-wrap items-center gap-2',
-            children: [
-              jsx(Button, {
-                disabled: Boolean(busyAction) || scanningChats,
-                onClick: useCurrentWorktree,
-                size: 'sm',
-                variant: 'outline',
-                children: busyAction === 'current-worktree' ? 'Linking…' : 'Use current worktree'
-              }),
-              linkedWorktree
-                ? jsx(Button, {
-                    disabled: Boolean(busyAction) || scanningChats,
-                    onClick: unlinkWorktree,
-                    size: 'sm',
-                    variant: 'ghost',
-                    children: 'Unlink'
-                  })
-                : null
             ]
           })
         ]
       }) : null,
-      issue.parent || issue.subtasks?.length
-        ? jsxs('section', {
-            className: 'space-y-2',
-            children: [
-              jsx(PanelSectionLabel, { children: 'Related tickets' }),
-              issue.parent
-                ? jsx(Button, {
-                    className: 'w-full justify-start',
-                    onClick: () => onOpenIssue?.(issue.parent.key),
-                    size: 'sm',
-                    variant: 'ghost',
-                    children: jsxs(Fragment, {
-                      children: [
-                        jsx('span', { className: 'mr-2 font-mono text-[0.65rem] text-(--ui-text-tertiary)', children: issue.parent.key }),
-                        jsx('span', { className: 'truncate', children: issue.parent.summary || 'Parent ticket' })
-                      ]
-                    })
-                  })
-                : null,
-              (issue.subtasks || []).map(subtask =>
-                jsx(Button, {
-                  className: 'w-full justify-start',
-                  onClick: () => onOpenIssue?.(subtask.key),
-                  size: 'sm',
-                  variant: 'ghost',
-                  children: jsxs(Fragment, {
-                    children: [
-                      jsx('span', { className: 'mr-2 font-mono text-[0.65rem] text-(--ui-text-tertiary)', children: subtask.key }),
-                      jsx('span', { className: 'truncate', children: subtask.summary || 'Subtask' })
-                    ]
-                  })
-                }, subtask.key)
-              )
-            ]
-          })
-        : null,
-      jsxs('section', {
-        className: 'space-y-2',
-        children: [
-          jsx(PanelSectionLabel, { children: 'Description' }),
-          issue.description
-            ? jsx('div', {
-                className: 'whitespace-pre-wrap rounded-md bg-foreground/5 p-3 text-xs leading-relaxed text-foreground/80',
-                children: issue.description
-              })
-            : jsx('p', { className: 'text-xs text-(--ui-text-quaternary)', children: 'No description.' })
-        ]
-      }),
+      jsx(JiraIssueHierarchy, { issue, onOpenIssue }),
       unplacedAttachments.length > 0
         ? jsxs('section', {
             className: 'space-y-2',
+            id: 'jira-detail-attachments',
             children: [
               jsx(PanelSectionLabel, { children: `Attachments · ${unplacedAttachments.length}` }),
               jsx('div', {
@@ -2931,29 +4233,65 @@ function IssueDetail({ issue, status, projects, mapping, links, baseRef, onOpenI
       !readOnly ? jsxs('section', {
         className: 'space-y-2',
         children: [
-          jsx(PanelSectionLabel, { children: 'Add comment' }),
+          jsx(PanelSectionLabel, {
+            children: commentDraft.trim()
+              ? jsxs('span', { className: 'inline-flex items-center gap-1.5', children: ['Add comment', jsx('span', { className: 'size-1.5 rounded-full bg-amber-400', title: 'Draft saved locally on this machine' })] })
+              : 'Add comment'
+          }),
           jsx(Textarea, {
             'aria-label': `Comment on ${issue.key}`,
             className: 'min-h-24 resize-y text-xs leading-relaxed',
+            rows: Math.min(12, Math.max(4, commentDraft.split('\n').length)),
+            title: 'Ctrl/Cmd+Enter posts the comment',
             disabled: Boolean(busyAction),
-            onChange: event => setCommentDraft(event.target.value),
+            onChange: event => {
+              setCommentDraft(event.target.value)
+              writeCommentDraft(cacheScope, issue.key, event.target.value)
+            },
+            onKeyDown: event => {
+              if ((event.metaKey || event.ctrlKey) && event.key === 'Enter' && commentDraft.trim() && !busyAction) {
+                event.preventDefault()
+                void postComment()
+              }
+            },
             placeholder: 'Write a comment…',
             value: commentDraft
           }),
-          jsx('div', {
-            className: 'flex justify-end',
-            children: jsx(Button, {
-              disabled: Boolean(busyAction) || !commentDraft.trim(),
-              onClick: postComment,
-              size: 'sm',
-              children: busyAction === 'comment' ? 'Posting…' : 'Comment'
-            })
+          jsxs('div', {
+            className: 'flex items-center justify-between gap-2',
+            children: [
+              jsx('span', {
+                className: `text-[0.6rem] tabular-nums ${commentDraft.length >= COMMENT_DRAFT_TEXT_LIMIT ? 'text-red-400' : commentDraft.length >= Math.round(COMMENT_DRAFT_TEXT_LIMIT * 0.9) ? 'text-amber-400' : 'text-(--ui-text-quaternary)'}`,
+                title: `Local draft limit ${COMMENT_DRAFT_TEXT_LIMIT} characters · saves on this device, auto-expires after ${Math.round(COMMENT_DRAFT_MAX_AGE_MS / 86_400_000)} days`,
+                children: `${commentDraft.length} / ${COMMENT_DRAFT_TEXT_LIMIT}`
+              }),
+              commentDraft.trim() && !busyAction
+                ? jsx('button', {
+                    'aria-label': 'Discard comment draft',
+                    className: 'rounded px-1.5 py-0.5 text-[0.6rem] text-(--ui-text-quaternary) transition-colors hover:bg-(--chrome-action-hover) hover:text-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-(--dt-composer-ring)',
+                    onClick: () => {
+                      writeCommentDraft(cacheScope, issue.key, '')
+                      setCommentDraft('')
+                    },
+                    title: 'Discard the local draft',
+                    type: 'button',
+                    children: 'Discard'
+                  })
+                : null,
+              jsx(Button, {
+                disabled: Boolean(busyAction) || !commentDraft.trim(),
+                onClick: postComment,
+                size: 'sm',
+                children: busyAction === 'comment' ? 'Posting…' : 'Comment'
+              })
+            ]
           })
         ]
       }) : null,
       Array.isArray(issue.comments) && issue.comments.length > 0
         ? jsxs('section', {
             className: 'space-y-2',
+            id: 'jira-detail-comments',
             children: [
               jsx(PanelSectionLabel, { children: `Comments · ${issue.comments.length}${issue.comments_truncated ? '+' : ''}` }),
               issue.comments_truncated
@@ -3022,8 +4360,7 @@ function FriendlyViewBuilder({ onCreateFriendlyView }) {
           className: 'flex items-center gap-2',
           children: [
             jsx(Codicon, { name: 'add', size: '0.72rem' }),
-            jsx('span', { children: 'Create a saved view' }),
-            jsx('span', { className: 'font-normal text-(--ui-text-quaternary)', children: 'without writing JQL' })
+            jsx('span', { children: 'Create a saved view' })
           ]
         })
       }),
@@ -3163,7 +4500,6 @@ function FriendlyViewBuilder({ onCreateFriendlyView }) {
 
 function SettingsDrawer({
   draft,
-  error,
   onAddBacklogView,
   onAddView,
   onChangeDraft,
@@ -3175,60 +4511,457 @@ function SettingsDrawer({
   onMoveView,
   onReload,
   onRemoveView,
+  onOpenTicket,
   onViewChange,
   onViewModeChange,
   activeView,
+  attentionByKey = {},
+  detectedStoryPoints,
   settings,
   state
 }) {
   const inputClass = 'h-8 w-full rounded-md border border-(--ui-stroke-secondary) bg-(--ui-bg-elevated) px-2 text-xs text-foreground outline-none focus:border-(--dt-composer-ring)'
   const views = Array.isArray(settings?.views) ? settings.views : []
   const viewMode = viewPreferences(settings, activeView).layout
+  const [prLinks, setPrLinks] = useState(() => readPrLinkOverrides())
+  const [confirmRemoveAll, setConfirmRemoveAll] = useState(false)
+  const [prImportText, setPrImportText] = useState('')
+  const [removedAllLinks, setRemovedAllLinks] = useState(() => removeAllSnapshot)
+  const [lastRemovedRow, setLastRemovedRow] = useState(null)
+  const [lastRepinned, setLastRepinned] = useState(null)
+  const [repinSnapshot, setRepinSnapshot] = useState(null)
+  useEffect(() => subscribePrStatus(() => setPrLinks(readPrLinkOverrides())), [])
+  const prLinkRows = Object.entries(prLinks)
+    .filter(([, entry]) => entry && typeof entry === 'object' && typeof entry.url === 'string' && entry.url)
+    .sort((left, right) => String(left[0]).localeCompare(String(right[0])))
+  const prDriftByKey = new Map(
+    prLinkRows
+      .map(([key, entry]) => [key, prLinkDrift(entry, readPrStatusCache()[key])])
+      .filter(([, drift]) => drift)
+  )
+  const repinAllDrifted = () => {
+    if (!prDriftByKey.size) return
+    const previousLinks = {}
+    for (const [key] of prDriftByKey) previousLinks[key] = prLinks[key]
+    setRepinSnapshot(previousLinks)
+    setConfirmRemoveAll(false)
+    for (const [key, drift] of prDriftByKey) writePrLinkOverride(key, String(drift.url))
+    setPrLinks(readPrLinkOverrides())
+    host.notify({
+      kind: 'success',
+      message: `Re-pinned ${prDriftByKey.size} manual PR link${prDriftByKey.size === 1 ? '' : 's'} to their detected pull requests.`
+    })
+  }
+  const prImportParsed = parsePrLinkImport(prImportText)
+  const importTally = (prImportParsed?.entries || []).reduce(
+    (acc, [key, url]) => {
+      const existing = prLinkOverrideValid(prLinks[key]?.url)
+      const incoming = prLinkOverrideValid(url)
+      const status = !prLinks[key] ? 'new' : existing === incoming ? 'same' : 'update'
+      acc[status] += 1
+      return acc
+    },
+    { new: 0, update: 0, same: 0 }
+  )
+  const importAllIdentical = Boolean(prImportParsed?.entries.length) && importTally.same === prImportParsed.entries.length
+  const importAttentionCount = (prImportParsed?.entries || [])
+    .filter(([key]) => (attentionByKey[key] || []).length > 0).length
+  useEffect(() => {
+    if (!prLinkRows.length && confirmRemoveAll) setConfirmRemoveAll(false)
+  }, [confirmRemoveAll, prLinkRows.length])
+  useEffect(() => {
+    if (!confirmRemoveAll) return undefined
+    // A stale armed state must not fire on a later, absent-minded click.
+    const disarmTimer = setTimeout(() => setConfirmRemoveAll(false), 6_000)
+    return () => clearTimeout(disarmTimer)
+  }, [confirmRemoveAll])
+  useEffect(() => {
+    if (lastRemovedRow && prLinks[lastRemovedRow.key]) setLastRemovedRow(null)
+  }, [lastRemovedRow, prLinks])
+  useEffect(() => {
+    if (lastRepinned && !prLinks[lastRepinned.key]) setLastRepinned(null)
+    if (repinSnapshot && Object.keys(repinSnapshot).some(key => !prLinks[key])) setRepinSnapshot(null)
+  }, [lastRepinned, prLinks, repinSnapshot])
+  const importPrLinks = () => {
+    const parsed = prImportParsed
+    if (!parsed || !parsed.entries.length) {
+      host.notify({ kind: 'warning', message: 'No valid pull request links found in that JSON.' })
+      return
+    }
+    let written = 0
+    let alreadyAttached = 0
+    for (const [key, url] of parsed.entries) {
+      if (prLinks[key] && prLinkOverrideValid(prLinks[key]?.url) === prLinkOverrideValid(url)) {
+        alreadyAttached += 1
+        continue
+      }
+      writePrLinkOverride(key, url)
+      written += 1
+    }
+    setConfirmRemoveAll(false)
+    setPrLinks(readPrLinkOverrides())
+    setPrImportText('')
+    host.notify({
+      kind: 'success',
+      message: `Imported ${written} manual PR link${written === 1 ? '' : 's'}${alreadyAttached ? ` · ${alreadyAttached} already attached` : ''}${parsed.skipped ? ` · ${parsed.skipped} skipped` : ''}.`
+    })
+  }
+  const importInputRef = useRef(null)
+  useEffect(() => {
+    const handler = event => {
+      if (event.key !== 'Escape') return
+      if (document.activeElement === importInputRef.current) {
+        event.preventDefault()
+        event.stopPropagation()
+        importInputRef.current?.blur()
+        setPrImportText('')
+        return
+      }
+      if (confirmRemoveAll) {
+        // Disarming beats the global chain so the panel stays open.
+        event.preventDefault()
+        event.stopPropagation()
+        setConfirmRemoveAll(false)
+      }
+    }
+    document.addEventListener('keydown', handler, true)
+    return () => document.removeEventListener('keydown', handler, true)
+  }, [confirmRemoveAll])
+  const manualPrLinks = jsxs('details', {
+    className: 'border-t border-(--ui-stroke-tertiary) pt-4',
+    children: [
+      jsx('summary', {
+        className: 'cursor-pointer text-xs font-medium text-foreground/85',
+        children: `Manual PR links · ${prLinkRows.length}${prDriftByKey.size > 0 ? ` · ${prDriftByKey.size} drifted` : ''}`
+      }),
+      jsxs('div', {
+        className: 'mt-3 space-y-2',
+        children: [
+          jsxs('div', {
+            className: 'flex flex-wrap items-center justify-end gap-1',
+            children: [
+              repinSnapshot && !prDriftByKey.size
+                ? jsx(Button, {
+                    onClick: () => {
+                      restorePrLinkOverrides(repinSnapshot)
+                      setPrLinks(readPrLinkOverrides())
+                      setRepinSnapshot(null)
+                      host.notify({
+                        kind: 'success',
+                        message: `Re-pin of ${Object.keys(repinSnapshot).length} manual PR link${Object.keys(repinSnapshot).length === 1 ? '' : 's'} undone · previous links restored.`
+                      })
+                    },
+                    size: 'xs',
+                    title: 'Restore every manual link changed by the last Re-pin sweep',
+                    variant: 'ghost',
+                    children: `Undo re-pin · ${Object.keys(repinSnapshot).length}`
+                  })
+                : prDriftByKey.size
+                ? jsx(Button, {
+                    onClick: repinAllDrifted,
+                    size: 'xs',
+                    title: `Replace ${prDriftByKey.size} manual link${prDriftByKey.size === 1 ? '' : 's'} with the detected pull request${prDriftByKey.size === 1 ? '' : 's'}`,
+                    variant: 'ghost',
+                    children: `Re-pin ${prDriftByKey.size} drifted`
+                  })
+                : null,
+              jsx(Button, {
+                'aria-label': 'Copy manual PR links as JSON',
+                disabled: prLinkRows.length === 0,
+                onClick: () => void copyTextToClipboard(JSON.stringify(Object.fromEntries(prLinkRows), null, 2), 'manual PR links'),
+                size: 'icon-xs',
+                title: 'Copy every manual PR link as JSON for backup or transfer',
+                variant: 'ghost',
+                children: jsx(Codicon, { name: 'copy', size: '0.8rem' })
+              }),
+              jsx(Button, {
+                'aria-label': confirmRemoveAll ? `Confirm removal of ${prLinkRows.length} manual PR links` : 'Remove all manual PR links',
+                disabled: prLinkRows.length === 0,
+                onClick: () => {
+                  if (!confirmRemoveAll) {
+                    setConfirmRemoveAll(true)
+                    return
+                  }
+                  const removedCount = prLinkRows.length
+                  const snapshot = { ...readPrLinkOverrides() }
+                  removeAllSnapshot = snapshot
+                  setRemovedAllLinks(snapshot)
+                  clearPrLinkOverrides()
+                  setPrLinks(readPrLinkOverrides())
+                  setConfirmRemoveAll(false)
+                  host.notify({ kind: 'success', message: `Removed ${removedCount} manual PR link${removedCount === 1 ? '' : 's'}.` })
+                },
+                className: confirmRemoveAll ? 'text-red-400' : '',
+                size: confirmRemoveAll ? 'xs' : 'icon-xs',
+                title: confirmRemoveAll ? 'Click again to remove every manual PR link · auto-cancels in 6s' : 'Remove every manual PR link',
+                variant: 'ghost',
+                children: confirmRemoveAll ? `Remove all · ${prLinkRows.length}?` : jsx(Codicon, { name: 'trash', size: '0.8rem' })
+              })
+            ]
+          }),
+          jsxs('div', {
+            className: 'flex items-center gap-2',
+            children: [
+              jsx('input', {
+                'aria-label': 'Paste manual PR links JSON',
+                ref: importInputRef,
+                className: `${inputClass} font-mono`,
+                maxLength: 20_000,
+                onChange: event => setPrImportText(event.target.value),
+                onKeyDown: event => {
+                  if (event.key === 'Enter' && prImportParsed?.entries.length && !importAllIdentical) {
+                    event.preventDefault()
+                    importPrLinks()
+                  }
+                },
+                placeholder: 'Paste PR links JSON to restore (Enter imports)',
+                spellCheck: false,
+                value: prImportText
+              }),
+              jsx(Button, {
+                disabled: !prImportParsed?.entries.length || importAllIdentical,
+                onClick: importPrLinks,
+                size: 'xs',
+                title: importAllIdentical
+                  ? `All ${prImportParsed.entries.length} link${prImportParsed.entries.length === 1 ? '' : 's'} already attached identically`
+                  : 'Restore links exported with Copy JSON',
+                variant: 'ghost',
+                children: prImportParsed?.entries.length
+                  ? `Import · ${prImportParsed.entries.length}`
+                  : 'Import'
+              })
+            ]
+          }),
+          prImportParsed && prImportParsed.entries.length
+            ? jsxs('div', {
+                className: 'space-y-0.5',
+                children: [
+                  jsx('p', {
+                    'aria-live': 'polite',
+                    className: 'text-[0.66rem] text-(--ui-text-quaternary)',
+                    role: 'status',
+                    children: `${importTally.new} new · ${importTally.update} update${importTally.update === 1 ? '' : 's'} · ${importTally.same} identical` + (importAttentionCount > 0 ? ` · ${importAttentionCount} need attention` : '')
+                  }),
+                  ...prImportParsed.entries.slice(0, 5).map(([key, url]) => {
+                    const existingUrl = prLinkOverrideValid(prLinks[key]?.url)
+                    const incomingUrl = prLinkOverrideValid(url)
+                    const status = !prLinks[key] ? 'new' : existingUrl === incomingUrl ? 'same' : 'update'
+                    const statusLabel = status === 'new' ? 'new' : status === 'update' ? 'update' : 'identical'
+                    const statusTitle = status === 'new'
+                      ? 'Not attached yet'
+                      : status === 'update'
+                        ? 'Replaces the current link'
+                        : 'Already attached exactly'
+                    const statusClass = status === 'new'
+                      ? 'text-(--ui-accent)'
+                      : status === 'update'
+                        ? 'text-amber-400'
+                        : 'text-(--ui-text-quaternary)'
+                    return jsx('div', {
+                      className: `flex min-w-0 items-center gap-2 font-mono text-[0.66rem] text-(--ui-text-quaternary) ${status === 'same' ? 'opacity-60' : ''}`,
+                      children: [
+                        attentionByKey[key]?.length
+                          ? jsx('span', {
+                              'aria-label': `Needs attention: ${attentionByKey[key].join(', ')}`,
+                              className: 'text-amber-400',
+                              role: 'img',
+                              title: attentionByKey[key].join(' · '),
+                              children: jsx(Codicon, { name: 'bell', size: '0.65rem' })
+                            })
+                          : null,
+                        jsx('span', { className: 'shrink-0', children: key }),
+                        jsx('span', {
+                          className: 'min-w-0 flex-1 truncate',
+                          title: url,
+                          children: url.replace(/^https?:\/\/(www\.)?/, '')
+                        }),
+                        jsx('span', {
+                          className: `shrink-0 ${statusClass}`,
+                          title: statusTitle,
+                          children: statusLabel
+                        })
+                      ]
+                    }, key)
+                  }),
+                  prImportParsed.entries.length > 5 || prImportParsed.skipped
+                    ? jsx('p', {
+                        className: 'text-[0.66rem] text-(--ui-text-quaternary)',
+                        children: `${prImportParsed.entries.length > 5 ? `… ${prImportParsed.entries.length - 5} more` : ''}${prImportParsed.entries.length > 5 && prImportParsed.skipped ? ' · ' : ''}${prImportParsed.skipped ? `${prImportParsed.skipped} invalid skipped` : ''}`
+                      })
+                    : null
+                ]
+              })
+            : null,
+          lastRemovedRow && !prLinks[lastRemovedRow.key]
+            ? jsxs('div', {
+                className: 'flex items-center gap-2 text-[0.7rem]',
+                children: [
+                  jsx('span', { className: 'text-(--ui-text-quaternary)', children: `Removed ${lastRemovedRow.key}` }),
+                  jsx(Button, {
+                    onClick: () => {
+                      writePrLinkOverride(lastRemovedRow.key, lastRemovedRow.url)
+                      setPrLinks(readPrLinkOverrides())
+                      host.notify({ kind: 'success', message: `Manual PR link restored on ${lastRemovedRow.key}.` })
+                      setLastRemovedRow(null)
+                    },
+                    size: 'xs',
+                    title: `Restore the ${lastRemovedRow.key} pull request attachment`,
+                    variant: 'ghost',
+                    children: 'Undo remove'
+                  })
+                ]
+              })
+            : null,
+          prLinkRows.length
+            ? jsxs('div', {
+                className: 'space-y-1',
+                children: prLinkRows.map(([key, entry]) => {
+                  const drift = prDriftByKey.get(key)
+                  return jsxs('div', {
+                  className: 'flex min-w-0 items-center gap-2 text-[0.7rem]',
+                  children: [
+                    jsx('span', { className: 'font-mono text-(--ui-text-tertiary)', children: key }),
+                    commentDraftMarker(activeDraftScope, key),
+                    jsx('button', {
+                      'aria-label': `Open ${key}`,
+                      className: 'font-mono text-(--ui-text-tertiary) transition-colors hover:text-foreground hover:underline focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-(--dt-composer-ring)',
+                      onClick: () => onOpenTicket?.(key),
+                      title: `Open ${key} in the ticket drawer`,
+                      type: 'button',
+                      children: key
+                    }),
+                    attentionByKey[key]?.length
+                      ? jsx('span', {
+                          'aria-label': `${attentionByKey[key].length} attention item${attentionByKey[key].length === 1 ? '' : 's'} on ${key}`,
+                          className: 'text-amber-400',
+                          role: 'img',
+                          title: attentionByKey[key].join(' · '),
+                          children: jsx(Codicon, { name: 'bell', size: '0.7rem' })
+                        })
+                      : null,
+                    drift
+                      ? jsx(Button, {
+                          className: 'shrink-0 text-amber-400',
+                          onClick: () => {
+                            setLastRepinned({ key, previous: prLinks[key] })
+                            writePrLinkOverride(key, String(drift.url))
+                            setPrLinks(readPrLinkOverrides())
+                            host.notify({ kind: 'success', message: `Re-pinned ${key} to the detected pull request${drift.number ? ` #${drift.number}` : ''}.` })
+                          },
+                          size: 'xs',
+                          title: `Manual link differs from the detected pull request — click to re-pin to ${drift.url}`,
+                          variant: 'ghost',
+                          children: drift.number ? `≠ #${drift.number}` : '≠ detected'
+                        })
+                      : lastRepinned && lastRepinned.key === key && prLinks[key]
+                        ? jsx(Button, {
+                            onClick: () => {
+                              restorePrLinkOverrides({ [key]: lastRepinned.previous })
+                              setPrLinks(readPrLinkOverrides())
+                              setLastRepinned(null)
+                              host.notify({ kind: 'success', message: `Re-pin on ${key} undone · previous manual link restored.` })
+                            },
+                            size: 'xs',
+                            title: `Restore the previous manual link on ${key}`,
+                            variant: 'ghost',
+                            children: 'Undo re-pin'
+                          })
+                        : null,
+                    jsx('span', {
+                      className: 'min-w-0 flex-1 truncate text-foreground/80',
+                      title: String(entry.url || ''),
+                      children: entry.number ? `#${entry.number}` : String(entry.url || '')
+                    }),
+                    jsx(Button, {
+                      onClick: () => void copyTextToClipboard(String(entry.url || ''), `PR link for ${key}`),
+                      'aria-label': `Copy the ${key} pull request URL`,
+                      size: 'xs',
+                      title: `Copy the ${key} pull request URL`,
+                      variant: 'ghost',
+                      children: jsx(Codicon, { name: 'copy', size: '0.75rem' })
+                    }),
+                    jsx(Button, {
+                      onClick: () => {
+                        setConfirmRemoveAll(false)
+                        setLastRemovedRow({ key, url: String(entry.url || '') })
+                        writePrLinkOverride(key, '')
+                        setPrLinks(readPrLinkOverrides())
+                        host.notify({ kind: 'success', message: `Manual PR link removed from ${key}.` })
+                      },
+                      size: 'xs',
+                      title: `Remove the ${key} pull request attachment`,
+                      variant: 'ghost',
+                      children: 'Remove'
+                    })
+                  ]
+                }, key)
+                })
+              })
+            : jsxs('div', {
+                className: 'space-y-1.5',
+                children: [
+                  jsx('p', {
+                    className: 'text-[0.66rem] text-(--ui-text-quaternary)',
+                    children: 'No manual links. Attach a pull request from a ticket.'
+                  }),
+                  removedAllLinks && Object.keys(removedAllLinks).length
+                    ? jsx(Button, {
+                        onClick: () => {
+                          const restoredCount = restorePrLinkOverrides(removedAllLinks)
+                          setRemovedAllLinks(null)
+                          removeAllSnapshot = null
+                          setPrLinks(readPrLinkOverrides())
+                          host.notify({
+                            kind: restoredCount ? 'success' : 'warning',
+                            message: restoredCount
+                              ? `Restored ${restoredCount} manual PR link${restoredCount === 1 ? '' : 's'}.`
+                              : 'No manual PR links could be restored.'
+                          })
+                        },
+                        size: 'xs',
+                        title: 'Restore every link removed by Remove all',
+                        variant: 'ghost',
+                        children: `Undo remove all · ${Object.keys(removedAllLinks).length}`
+                      })
+                    : null
+                ]
+              })
+        ]
+      })
+    ]
+  })
   return jsxs('div', {
     className: 'space-y-5',
     children: [
       jsxs('section', {
         className: 'space-y-3',
         children: [
-          jsx(PanelSectionLabel, { children: 'How Jira looks' }),
-          jsx('p', {
-            className: 'text-xs leading-relaxed text-(--ui-text-tertiary)',
-            children: 'Pick the layout that matches the work. Boards are useful for moving active work through statuses; lists are easier to scan for a backlog.'
-          }),
+          jsx(PanelSectionLabel, { children: 'Display' }),
           jsxs('div', {
             className: 'space-y-1.5',
             children: [
-              jsx('span', { className: 'text-[0.68rem] text-(--ui-text-tertiary)', children: 'Ticket layout' }),
               jsxs('div', {
-                className: 'grid grid-cols-2 gap-2',
+                'aria-label': 'Ticket layout',
+                className: 'flex items-center gap-1 rounded-md border border-(--ui-stroke-tertiary) p-1',
+                role: 'group',
                 children: [
-                  jsx(Button, {
+                  jsxs(Button, {
                     'aria-pressed': viewMode !== 'list',
-                    className: 'h-auto justify-start px-3 py-2 text-left',
+                    className: 'flex-1 gap-1.5',
                     onClick: () => onViewModeChange('board'),
                     size: 'sm',
-                    variant: viewMode !== 'list' ? 'secondary' : 'outline',
-                    children: jsxs('span', {
-                      className: 'flex flex-col items-start gap-0.5',
-                      children: [
-                        jsx('span', { className: 'font-medium', children: 'Board' }),
-                        jsx('span', { className: 'text-[0.62rem] font-normal text-(--ui-text-tertiary)', children: 'Move work across status columns' })
-                      ]
-                    })
+                    title: 'Board · move tickets between status columns',
+                    variant: viewMode !== 'list' ? 'secondary' : 'ghost',
+                    children: [jsx(Codicon, { name: 'layout', size: '0.8rem' }), 'Board']
                   }),
-                  jsx(Button, {
+                  jsxs(Button, {
                     'aria-pressed': viewMode === 'list',
-                    className: 'h-auto justify-start px-3 py-2 text-left',
+                    className: 'flex-1 gap-1.5',
                     onClick: () => onViewModeChange('list'),
                     size: 'sm',
-                    variant: viewMode === 'list' ? 'secondary' : 'outline',
-                    children: jsxs('span', {
-                      className: 'flex flex-col items-start gap-0.5',
-                      children: [
-                        jsx('span', { className: 'font-medium', children: 'List' }),
-                        jsx('span', { className: 'text-[0.62rem] font-normal text-(--ui-text-tertiary)', children: 'Scan a backlog or queue' })
-                      ]
-                    })
+                    title: 'List · scan a backlog or queue',
+                    variant: viewMode === 'list' ? 'secondary' : 'ghost',
+                    children: [jsx(Codicon, { name: 'list-flat', size: '0.8rem' }), 'List']
                   })
                 ]
               })
@@ -3254,50 +4987,81 @@ function SettingsDrawer({
               })
             ]
           }),
-          jsxs('div', {
-            className: 'grid grid-cols-2 gap-2',
+          jsxs('details', {
+            className: 'border-t border-(--ui-stroke-tertiary) pt-2',
             children: [
-              jsxs('label', {
-                className: 'space-y-1',
-                children: [
-                  jsx('span', { className: 'text-[0.68rem] text-(--ui-text-tertiary)', children: 'Tickets to load at once' }),
-                  jsx('input', {
-                    className: inputClass,
-                    max: 100,
-                    min: 1,
-                    onChange: event => onFieldChange('pageSize', Number(event.target.value)),
-                    type: 'number',
-                    value: Number(settings?.pageSize || 50)
-                  })
-                ]
+              jsx('summary', {
+                className: 'cursor-pointer text-xs text-(--ui-text-secondary)',
+                children: 'More display options'
               }),
-              jsxs('label', {
-                className: 'space-y-1',
+              jsxs('div', {
+                className: 'mt-3 space-y-3',
                 children: [
-                  jsx('span', { className: 'text-[0.68rem] text-(--ui-text-tertiary)', children: 'New worktree base' }),
-                  jsx('span', { className: 'block text-[0.6rem] leading-relaxed text-(--ui-text-quaternary)', children: 'Usually HEAD. Change this only if new work should start from another branch or ref.' }),
-                  jsx('input', {
-                    className: inputClass,
-                    onChange: event => onFieldChange('baseRef', event.target.value),
-                    value: String(settings?.baseRef || 'HEAD')
+                  jsxs('div', {
+                    className: 'grid grid-cols-2 gap-2',
+                    children: [
+                      jsxs('label', {
+                        className: 'space-y-1',
+                        children: [
+                          jsx('span', { className: 'text-[0.68rem] text-(--ui-text-tertiary)', children: 'Tickets per page' }),
+                          jsx('input', {
+                            className: inputClass,
+                            max: 100,
+                            min: 1,
+                            onChange: event => onFieldChange('pageSize', Number(event.target.value)),
+                            type: 'number',
+                            value: Number(settings?.pageSize || 50)
+                          })
+                        ]
+                      }),
+                      jsxs('label', {
+                        className: 'space-y-1',
+                        title: 'Branch or ref used for newly created worktrees (usually HEAD)',
+                        children: [
+                          jsx('span', { className: 'text-[0.68rem] text-(--ui-text-tertiary)', children: 'Worktree base' }),
+                          jsx('input', {
+                            className: inputClass,
+                            onChange: event => onFieldChange('baseRef', event.target.value),
+                            value: String(settings?.baseRef || 'HEAD')
+                          })
+                        ]
+                      })
+                    ]
+                  }),
+                  jsxs('label', {
+                    className: 'block space-y-1',
+                    title: 'Auto detects Jira’s story-points field. Use none to hide it, or enter a custom field id.',
+                    children: [
+                      jsx('span', { className: 'text-[0.68rem] text-(--ui-text-tertiary)', children: 'Story points field' }),
+                      jsx('input', {
+                        'aria-label': 'Story points field',
+                        className: `${inputClass} font-mono`,
+                        onChange: event => onFieldChange('storyPointsField', event.target.value),
+                        placeholder: 'auto, none, or customfield_10016',
+                        spellCheck: false,
+                        value: String(settings?.storyPointsField || 'auto')
+                      }),
+                      !settings?.storyPointsField || settings.storyPointsField === 'auto'
+                        ? jsx('span', {
+                            className: 'block text-[0.6rem] text-(--ui-text-secondary)',
+                            children: detectedStoryPoints ? `Detected: ${detectedStoryPoints}` : 'No story-points field detected yet.'
+                          })
+                        : null
+                    ]
+                  }),
+                  jsxs('label', {
+                    className: `flex cursor-pointer items-center gap-2 text-xs text-foreground/80${viewMode === 'list' ? ' opacity-55' : ''}`,
+                    title: viewMode === 'list' ? 'Only used in the Board layout' : 'Group board tickets by Jira status',
+                    children: [
+                      jsx('input', {
+                        checked: Boolean(settings?.groupByStatus),
+                        disabled: viewMode === 'list',
+                        onChange: event => onFieldChange('groupByStatus', event.target.checked),
+                        type: 'checkbox'
+                      }),
+                      'Group board by status'
+                    ]
                   })
-                ]
-              })
-            ]
-          }),
-          jsxs('label', {
-            className: `flex cursor-pointer items-start gap-2 rounded-md border border-(--ui-stroke-tertiary) px-2.5 py-2 text-xs text-foreground/80${viewMode === 'list' ? ' opacity-55' : ''}`,
-            children: [
-              jsx('input', {
-                checked: Boolean(settings?.groupByStatus),
-                disabled: viewMode === 'list',
-                onChange: event => onFieldChange('groupByStatus', event.target.checked),
-                type: 'checkbox'
-              }),
-              jsxs('span', {
-                children: [
-                  jsx('span', { className: 'block', children: 'Group tickets into columns by status' }),
-                  jsx('span', { className: 'mt-0.5 block text-[0.6rem] leading-relaxed text-(--ui-text-quaternary)', children: viewMode === 'list' ? 'Only used by the Board layout.' : 'Useful when you are moving active work through a workflow.' })
                 ]
               })
             ]
@@ -3310,142 +5074,152 @@ function SettingsDrawer({
           jsxs('div', {
             className: 'flex items-center justify-between gap-2',
             children: [
+              jsx(PanelSectionLabel, { children: `Saved views · ${views.length}` }),
               jsxs('div', {
-                className: 'flex flex-wrap items-center justify-between gap-2',
+                className: 'flex shrink-0 items-center gap-1',
                 children: [
-                  jsx(PanelSectionLabel, { children: `Saved views · ${views.length}` }),
-                  jsxs('div', {
-                    className: 'flex flex-wrap gap-1.5',
-                    children: [
-                      jsx(Button, { onClick: onAddBacklogView, size: 'xs', variant: 'ghost', children: 'Add backlog view' }),
-                      jsx(Button, { onClick: onAddView, size: 'xs', variant: 'outline', children: 'Add view' })
-                    ]
-                  })
+                  jsx(Button, { 'aria-label': 'Add backlog view', onClick: onAddBacklogView, size: 'icon-xs', title: 'Add a ready-made backlog list', variant: 'ghost', children: jsx(Codicon, { name: 'list-flat', size: '0.8rem' }) }),
+                  jsx(Button, { 'aria-label': 'Add blank view', onClick: onAddView, size: 'icon-xs', title: 'Add a blank view for custom JQL', variant: 'ghost', children: jsx(Codicon, { name: 'add', size: '0.8rem' }) })
                 ]
               })
             ]
           }),
-          jsx('p', {
-            className: 'text-xs leading-relaxed text-(--ui-text-tertiary)',
-            children: 'A saved view is simply a named Jira search. Use Backlog for open work that is better scanned as a list, or add a view for a team queue.'
-          }),
           ...views.map((view, index) =>
-            jsxs('div', {
-              className: 'space-y-2 rounded-md border border-(--ui-stroke-tertiary) p-2.5',
+            jsxs('details', {
+              className: 'rounded-md border border-(--ui-stroke-tertiary)',
               children: [
+                jsx('summary', {
+                  className: 'cursor-pointer px-3 py-2 text-xs text-foreground hover:bg-(--chrome-action-hover)',
+                  title: `Edit ${view.label || view.id}`,
+                  children: jsxs('span', {
+                    className: 'inline-flex min-w-0 items-center gap-2 align-middle',
+                    style: { width: 'calc(100% - 1.25rem)' },
+                    children: [
+                      jsx('span', { className: 'min-w-0 flex-1 truncate font-medium', children: view.label || view.id || 'Untitled view' }),
+                      jsx('span', { className: 'shrink-0 text-[0.65rem] text-(--ui-text-quaternary)', children: (view.layout || (view.id === 'backlog' ? 'list' : settingsViewMode(settings))) === 'list' ? 'List' : 'Board' })
+                    ]
+                  })
+                }),
                 jsxs('div', {
-                  className: 'grid grid-cols-[1fr_7rem_auto] gap-2',
+                  className: 'space-y-2 border-t border-(--ui-stroke-tertiary) px-3 pb-3 pt-2',
                   children: [
-                    jsx('input', {
-                      'aria-label': `Saved view ${index + 1} label`,
-                      className: inputClass,
-                      onChange: event => onViewChange(index, 'label', event.target.value),
-                      placeholder: 'Label',
-                      value: String(view.label || '')
-                    }),
-                    jsx('input', {
-                      'aria-label': `Saved view ${index + 1} id`,
-                      className: `${inputClass} font-mono`,
-                      onChange: event => onViewChange(index, 'id', event.target.value),
-                      placeholder: 'id',
-                      value: String(view.id || '')
+                    jsxs('div', {
+                      className: 'flex min-w-0 items-center gap-2',
+                      children: [
+                        jsx('input', {
+                          'aria-label': `Saved view ${index + 1} label`,
+                          className: `${inputClass} min-w-0 flex-1`,
+                          onChange: event => onViewChange(index, 'label', event.target.value),
+                          placeholder: 'Label',
+                          value: String(view.label || '')
+                        }),
+                        jsxs('div', {
+                          className: 'flex shrink-0 items-center justify-end gap-0.5',
+                          children: [
+                            jsx(Button, {
+                              'aria-label': `Duplicate ${view.label || view.id}`,
+                              onClick: () => onDuplicateView(index),
+                              size: 'icon-xs',
+                              title: 'Duplicate saved view',
+                              variant: 'ghost',
+                              children: jsx(Codicon, { name: 'copy', size: '0.75rem' })
+                            }),
+                            jsx(Button, {
+                              'aria-label': `Move saved view up: ${view.label || view.id}`,
+                              disabled: index === 0,
+                              onClick: () => onMoveView(index, -1),
+                              size: 'icon-xs',
+                              title: 'Move saved view up',
+                              variant: 'ghost',
+                              children: jsx(Codicon, { name: 'chevron-up', size: '0.75rem' })
+                            }),
+                            jsx(Button, {
+                              'aria-label': `Move saved view down: ${view.label || view.id}`,
+                              disabled: index === views.length - 1,
+                              onClick: () => onMoveView(index, 1),
+                              size: 'icon-xs',
+                              title: 'Move saved view down',
+                              variant: 'ghost',
+                              children: jsx(Codicon, { name: 'chevron-down', size: '0.75rem' })
+                            }),
+                            jsx(Button, {
+                              'aria-label': `Remove ${view.label || view.id}`,
+                              disabled: views.length <= 1,
+                              onClick: () => onRemoveView(index),
+                              size: 'icon-xs',
+                              title: 'Remove saved view',
+                              variant: 'ghost',
+                              children: jsx(Codicon, { name: 'trash', size: '0.78rem' })
+                            })
+                          ]
+                        })
+                      ]
                     }),
                     jsxs('div', {
-                      className: 'flex items-center justify-end gap-0.5',
+                      className: 'grid grid-cols-3 gap-2',
                       children: [
-                        jsx(Button, {
-                          'aria-label': `Duplicate ${view.label || view.id}`,
-                          onClick: () => onDuplicateView(index),
-                          size: 'icon-xs',
-                          title: 'Duplicate',
-                          variant: 'ghost',
-                          children: jsx(Codicon, { name: 'copy', size: '0.75rem' })
+                        jsxs('label', {
+                          className: 'space-y-1',
+                          children: [
+                            jsx('span', { className: 'text-[0.62rem] text-(--ui-text-quaternary)', children: 'Open as' }),
+                            jsx('select', {
+                              'aria-label': `Saved view ${index + 1} layout`,
+                              className: inputClass,
+                              onChange: event => onViewChange(index, 'layout', event.target.value),
+                              value: view.layout || (view.id === 'backlog' ? 'list' : settingsViewMode(settings)),
+                              children: [jsx('option', { value: 'board', children: 'Board' }), jsx('option', { value: 'list', children: 'List' })]
+                            })
+                          ]
                         }),
-                        jsx(Button, {
-                          'aria-label': `Move saved view up: ${view.label || view.id}`,
-                          disabled: index === 0,
-                          onClick: () => onMoveView(index, -1),
-                          size: 'icon-xs',
-                          title: 'Move saved view up',
-                          variant: 'ghost',
-                          children: jsx(Codicon, { name: 'chevron-up', size: '0.75rem' })
+                        jsxs('label', {
+                          className: 'space-y-1',
+                          children: [
+                            jsx('span', { className: 'text-[0.62rem] text-(--ui-text-quaternary)', children: 'Sort by' }),
+                            jsx('select', {
+                              'aria-label': `Saved view ${index + 1} sort`,
+                              className: inputClass,
+                              onChange: event => onViewChange(index, 'sort', event.target.value),
+                              value: view.sort || (view.id === 'backlog' ? 'priority' : 'updated'),
+                              children: VIEW_SORT_OPTIONS.map(option => jsx('option', { value: option.value, children: option.label }, option.value))
+                            })
+                          ]
                         }),
-                        jsx(Button, {
-                          'aria-label': `Move saved view down: ${view.label || view.id}`,
-                          disabled: index === views.length - 1,
-                          onClick: () => onMoveView(index, 1),
-                          size: 'icon-xs',
-                          title: 'Move saved view down',
-                          variant: 'ghost',
-                          children: jsx(Codicon, { name: 'chevron-down', size: '0.75rem' })
-                        }),
-                        jsx(Button, {
-                          'aria-label': `Remove ${view.label || view.id}`,
-                          disabled: views.length <= 1,
-                          onClick: () => onRemoveView(index),
-                          size: 'icon-xs',
-                          variant: 'ghost',
-                          children: jsx(Codicon, { name: 'trash', size: '0.78rem' })
-                        })
-                      ]
-                    })
-                  ]
-                }),
-                jsxs('div', {
-                  className: 'grid grid-cols-3 gap-2',
-                  children: [
-                    jsxs('label', {
-                      className: 'space-y-1',
-                      children: [
-                        jsx('span', { className: 'text-[0.62rem] text-(--ui-text-quaternary)', children: 'Open as' }),
-                        jsx('select', {
-                          'aria-label': `Saved view ${index + 1} layout`,
-                          className: inputClass,
-                          onChange: event => onViewChange(index, 'layout', event.target.value),
-                          value: view.layout || (view.id === 'backlog' ? 'list' : settingsViewMode(settings)),
-                          children: [jsx('option', { value: 'board', children: 'Board' }), jsx('option', { value: 'list', children: 'List' })]
+                        jsxs('label', {
+                          className: 'space-y-1',
+                          children: [
+                            jsx('span', { className: 'text-[0.62rem] text-(--ui-text-quaternary)', children: 'Density' }),
+                            jsx('select', {
+                              'aria-label': `Saved view ${index + 1} density`,
+                              className: inputClass,
+                              onChange: event => onViewChange(index, 'density', event.target.value),
+                              value: view.density || (view.id === 'backlog' ? 'compact' : 'comfortable'),
+                              children: VIEW_DENSITY_OPTIONS.map(option => jsx('option', { value: option.value, children: option.label }, option.value))
+                            })
+                          ]
                         })
                       ]
                     }),
-                    jsxs('label', {
-                      className: 'space-y-1',
+                    jsxs('details', {
+                      className: 'border-t border-(--ui-stroke-tertiary) pt-2',
                       children: [
-                        jsx('span', { className: 'text-[0.62rem] text-(--ui-text-quaternary)', children: 'Sort by' }),
-                        jsx('select', {
-                          'aria-label': `Saved view ${index + 1} sort`,
-                          className: inputClass,
-                          onChange: event => onViewChange(index, 'sort', event.target.value),
-                          value: view.sort || (view.id === 'backlog' ? 'priority' : 'updated'),
-                          children: VIEW_SORT_OPTIONS.map(option => jsx('option', { value: option.value, children: option.label }, option.value))
+                        jsx('summary', { className: 'cursor-pointer text-[0.62rem] text-(--ui-text-quaternary)', children: 'Advanced · ID and JQL' }),
+                        jsx('input', {
+                          'aria-label': `Saved view ${index + 1} id`,
+                          className: `${inputClass} mt-2 font-mono`,
+                          onChange: event => onViewChange(index, 'id', event.target.value),
+                          placeholder: 'View ID',
+                          title: 'Identifier used in links and saved view state',
+                          value: String(view.id || '')
+                        }),
+                        jsx(Textarea, {
+                          'aria-label': `Saved view ${index + 1} JQL`,
+                          className: 'mt-2 min-h-20 resize-y font-mono text-[0.68rem] leading-relaxed',
+                          onChange: event => onViewChange(index, 'jql', event.target.value),
+                          placeholder: 'JQL query',
+                          spellCheck: false,
+                          value: String(view.jql || '')
                         })
                       ]
-                    }),
-                    jsxs('label', {
-                      className: 'space-y-1',
-                      children: [
-                        jsx('span', { className: 'text-[0.62rem] text-(--ui-text-quaternary)', children: 'Density' }),
-                        jsx('select', {
-                          'aria-label': `Saved view ${index + 1} density`,
-                          className: inputClass,
-                          onChange: event => onViewChange(index, 'density', event.target.value),
-                          value: view.density || (view.id === 'backlog' ? 'compact' : 'comfortable'),
-                          children: VIEW_DENSITY_OPTIONS.map(option => jsx('option', { value: option.value, children: option.label }, option.value))
-                        })
-                      ]
-                    })
-                  ]
-                }),
-                jsxs('details', {
-                  className: 'border-t border-(--ui-stroke-tertiary) pt-2',
-                  children: [
-                    jsx('summary', { className: 'cursor-pointer text-[0.62rem] text-(--ui-text-quaternary)', children: 'Advanced query (JQL)' }),
-                    jsx(Textarea, {
-                      'aria-label': `Saved view ${index + 1} JQL`,
-                      className: 'mt-2 min-h-20 resize-y font-mono text-[0.68rem] leading-relaxed',
-                      onChange: event => onViewChange(index, 'jql', event.target.value),
-                      placeholder: 'JQL query',
-                      spellCheck: false,
-                      value: String(view.jql || '')
                     })
                   ]
                 })
@@ -3455,6 +5229,7 @@ function SettingsDrawer({
           onCreateFriendlyView ? jsx(FriendlyViewBuilder, { onCreateFriendlyView }) : null
         ]
       }),
+      manualPrLinks,
       jsxs('details', {
         className: 'border-t border-(--ui-stroke-tertiary) pt-4',
         children: [
@@ -3464,24 +5239,14 @@ function SettingsDrawer({
               className: 'flex items-center gap-2',
               children: [
                 jsx(Codicon, { name: 'chevron-right', size: '0.7rem' }),
-                jsx('span', { children: 'Advanced settings' }),
-                jsx('span', { className: 'font-normal text-(--ui-text-quaternary)', children: '(JSON file)' })
+                jsx('span', { children: 'Advanced settings' })
               ]
             })
           }),
           jsxs('div', {
             className: 'mt-3 space-y-2',
             children: [
-              jsxs('div', {
-                className: 'flex items-center justify-between gap-2',
-                children: [
-                  jsx('p', {
-                    className: 'max-w-[26rem] text-[0.65rem] leading-relaxed text-(--ui-text-quaternary)',
-                    children: 'Most people can ignore this. Use it when an agent or an advanced Jira setup needs the complete credential-free settings file.'
-                  }),
-                  jsx('span', { className: 'shrink-0 text-[0.65rem] text-(--ui-text-tertiary)', children: state })
-                ]
-              }),
+              jsx('span', { className: 'text-[0.65rem] text-(--ui-text-tertiary)', children: state }),
               jsxs('div', {
                 className: 'rounded-md bg-foreground/5 p-2',
                 children: [
@@ -3506,8 +5271,7 @@ function SettingsDrawer({
                 onChange: event => onChangeDraft(event.target.value),
                 spellCheck: false,
                 value: draft
-              }),
-              error ? jsx('p', { className: 'text-[0.68rem] text-destructive', children: error }) : null
+              })
             ]
           })
         ]
@@ -3527,23 +5291,30 @@ function JiraPage() {
   )
 
   const [detail, setDetail] = useState(null)
+  const [detailError, setDetailError] = useState(null)
+  const [detailRetry, setDetailRetry] = useState(0)
+  const retryDetail = useCallback(() => setDetailRetry(value => value + 1), [])
   const [mapping, setMapping] = useState(null)
   const [links, setLinks] = useState([])
   const [workStates, setWorkStates] = useState(() => readWorkStateCache())
   const [liveTicketStates, setLiveTicketStates] = useState({})
   const [workingSessionIds, setWorkingSessionIds] = useState(() => new Set())
   const [settings, setSettings] = useState(null)
-  const [activeView, setActiveView] = useState('assigned')
+  const [activeView, setActiveView] = useState('current-sprint')
   const [submittedJql, setSubmittedJql] = useState(DEFAULT_JQL)
   const [showSettings, setShowSettings] = useState(false)
   const [settingsDraft, setSettingsDraft] = useState('')
   const [settingsState, setSettingsState] = useState('')
   const [settingsError, setSettingsError] = useState('')
+  const [settingsRetry, setSettingsRetry] = useState(0)
   const [filter, setFilter] = useState('')
   const [quickFilter, setQuickFilter] = useState('all')
   const [attentionOnly, setAttentionOnly] = useState(false)
   const [collapsedLanes, setCollapsedLanes] = useState({})
+  const collapsedLaneKeys = useMemo(() => Object.keys(collapsedLanes).filter(key => collapsedLanes[key]), [collapsedLanes])
   const [loading, setLoading] = useState(true)
+  const [coldView, setColdView] = useState(false)
+  const [laneReadySignature, setLaneReadySignature] = useState('')
   const [loadingMore, setLoadingMore] = useState(false)
   const [nextPageToken, setNextPageToken] = useState('')
   const [cacheState, setCacheState] = useState('')
@@ -3551,14 +5322,24 @@ function JiraPage() {
   const [movingKey, setMovingKey] = useState('')
   const [error, setError] = useState('')
   const requestGeneration = useRef(0)
+  const lastLoadedAtRef = useRef(0)
+  const listEndRef = useRef(null)
+  const pinTicketRef = useRef(null)
+  const [prStatusVersion, setPrStatusVersion] = useState(0)
+  const [showShortcuts, setShowShortcuts] = useState(false)
+  const [, setClockTick] = useState(0)
   const lastSavedSettings = useRef('')
   const saveTimer = useRef(null)
   const settingsSaveGeneration = useRef(0)
+  const retrySettingsSave = useCallback(() => setSettingsRetry(value => value + 1), [])
   const workStateGeneration = useRef(0)
   const workStateScopeRef = useRef('')
   const lastCacheScopeRef = useRef('')
   const jiraOriginRef = useRef('')
+  const activeDetailKeyRef = useRef(selectedKey)
+  activeDetailKeyRef.current = selectedKey
   const activeCacheScope = cacheScopeKey(status?.base_url)
+  activeDraftScope = activeCacheScope
   jiraOriginRef.current = String(status?.base_url || '').trim()
 
   useEffect(() => {
@@ -3574,7 +5355,7 @@ function JiraPage() {
       const activeOwnerKey = activeOwner ? liveOwnerKey(activeOwner) : ''
       const next = {}
       if (!activeOwnerKey) {
-        setLiveTicketStates(next)
+        setLiveTicketStates(current => reuseUnchangedRecord(current, next))
         return
       }
       for (const entry of Array.isArray(snapshot?.entries) ? snapshot.entries : []) {
@@ -3584,12 +5365,13 @@ function JiraPage() {
         const current = next[key]
         if (!current || liveStatusPriority(entry.state) > liveStatusPriority(current)) next[key] = entry.state
       }
-      setLiveTicketStates(next)
+      setLiveTicketStates(current => reuseUnchangedRecord(current, next))
     })
     return unsubscribe
   }, [])
 
   useEffect(() => {
+    const currentDetail = detail?.key === selectedKey ? detail : null
     const byIdentity = new Map()
     for (const issue of issues) {
       for (const link of Array.isArray(workStates?.[issue.key]?.links) ? workStates[issue.key].links : []) {
@@ -3597,14 +5379,14 @@ function JiraPage() {
         byIdentity.set(sessionLinkIdentity(candidate), candidate)
       }
     }
-    for (const link of Array.isArray(links) ? links : []) {
-      const candidate = { ...link, ticketKey: selectedKey || detail?.key || '' }
+    for (const link of currentDetail && Array.isArray(links) ? links : []) {
+      const candidate = { ...link, ticketKey: selectedKey }
       byIdentity.set(sessionLinkIdentity(candidate), candidate)
     }
     publishJiraContext({
       links: [...byIdentity.values()],
       selectedKey,
-      title: detail?.summary || detail?.key || selectedKey
+      title: currentDetail?.summary || selectedKey
     })
   }, [detail?.key, detail?.summary, issues, links, selectedKey, workStates])
 
@@ -3624,13 +5406,15 @@ function JiraPage() {
         try {
           route = await resolveFocusedSessionRoute()
         } catch (cause) {
-          if (alive && !isConfirmedTransientRpcFailure(cause)) setWorkingSessionIds(new Set())
+          if (alive && !isConfirmedTransientRpcFailure(cause)) {
+            setWorkingSessionIds(current => reuseUnchangedSet(current, new Set()))
+          }
           return
         }
         try {
           const result = await host.requestProfile(route, 'session.active_list', { profile: route.targetProfile || route.profile })
           if (!alive) return
-          setWorkingSessionIds(new Set(
+          const next = new Set(
             (Array.isArray(result?.sessions) ? result.sessions : [])
               .filter(session => session.status === 'working')
               .map(session => sessionLinkIdentity({
@@ -3638,9 +5422,12 @@ function JiraPage() {
                 ...sessionOwnerFields(ownerFromRoute(route))
               }))
               .filter(identity => !identity.endsWith('::::'))
-          ))
+          )
+          setWorkingSessionIds(current => reuseUnchangedSet(current, next))
         } catch (cause) {
-          if (alive && !isConfirmedTransientRpcFailure(cause)) setWorkingSessionIds(new Set())
+          if (alive && !isConfirmedTransientRpcFailure(cause)) {
+            setWorkingSessionIds(current => reuseUnchangedSet(current, new Set()))
+          }
         }
       } finally {
         refreshing = false
@@ -3662,11 +5449,23 @@ function JiraPage() {
     const origin = String(options.origin || jiraOriginRef.current || '').trim()
     const owner = options.owner || readActiveOwner()
     const cached = !append ? readIssueCache(nextJql, pageSize, origin, owner) : null
+    const cachedSnapshot = cached ? cachedViewState(cached.issues, origin, owner) : null
+    const primeCachedView = (rows, snapshot = cachedViewState(rows, origin, owner)) => {
+      const scopeChanged = Boolean(workStateScopeRef.current && workStateScopeRef.current !== cacheScopeKey(origin, owner))
+      setWorkStates(current => scopeChanged ? snapshot.workStates : reuseCachedWorkStates(current, snapshot.workStates))
+      setDetectedLanes(current => reuseUnchangedLanes(current, snapshot.lanes))
+      setLaneReadySignature(snapshot.laneReady ? snapshot.laneKey : '')
+    }
     const generation = ++requestGeneration.current
+    lastLoadedAtRef.current = Date.now()
     if (append) {
       setLoadingMore(true)
-    } else if (cached && !options.force) {
-      setIssues(cached.issues)
+    } else {
+      setColdView(Boolean(!cached || cached.issues.some(issue => !Array.isArray(cachedSnapshot.workStates[issue.key]?.links)) || !cachedSnapshot.laneReady))
+    }
+    if (!append && cached && !options.force) {
+      primeCachedView(cached.issues, cachedSnapshot)
+      setIssues(current => reuseUnchangedIssues(current, cached.issues))
       setNextPageToken(String(cached.nextPageToken || ''))
       setLoading(false)
       setCacheState(`Cached · last updated ${relativeDate(cached.storedAt) || 'recently'} · refreshing…`)
@@ -3690,8 +5489,10 @@ function JiraPage() {
           return merged
         })
       } else {
-        setIssues(rows)
+        primeCachedView(rows)
+        setIssues(current => reuseUnchangedIssues(current, rows))
         writeIssueCache(nextJql, pageSize, rows, nextToken, origin, owner)
+        if (rows.length === 0) setColdView(false)
       }
     } catch (cause) {
       if (generation !== requestGeneration.current) return
@@ -3704,6 +5505,7 @@ function JiraPage() {
         setError(`${isLikelyOfflineError(cause) ? 'Offline: ' : ''}${errorText(cause, 'Could not load Jira tickets.')}`)
         setCacheState(isLikelyOfflineError(cause) ? 'Offline' : 'Error')
         if (!append) {
+          setColdView(false)
           setIssues([])
           setNextPageToken('')
         }
@@ -3716,12 +5518,52 @@ function JiraPage() {
     }
   }, [])
 
+  // Effect dependency arrays are evaluated during render, not when their
+  // callbacks run; initialize this value before any effect lists pageSize.
+  const editableSettings = useMemo(() => {
+    try {
+      const parsed = JSON.parse(settingsDraft)
+      return parsed && typeof parsed === 'object' ? parsed : (settings || {})
+    } catch {
+      return settings || {}
+    }
+  }, [settings, settingsDraft])
+
+  useEffect(() => {
+    const refreshIfStale = () => {
+      if (typeof document !== 'undefined' && document.visibilityState === 'hidden') return
+      if (loading || loadingMore) return
+      if (!status?.configured || !submittedJql) return
+      if (Date.now() - lastLoadedAtRef.current < FOCUS_REFRESH_MIN_MS) return
+      loadIssues(submittedJql, { pageSize: editableSettings?.pageSize })
+    }
+    window.addEventListener('focus', refreshIfStale)
+    document.addEventListener('visibilitychange', refreshIfStale)
+    return () => {
+      window.removeEventListener('focus', refreshIfStale)
+      document.removeEventListener('visibilitychange', refreshIfStale)
+    }
+  }, [editableSettings?.pageSize, lastLoadedAtRef, loadIssues, loading, loadingMore, status?.configured, submittedJql])
+
+  useEffect(() => {
+    if (!nextPageToken || loading || loadingMore) return
+    const node = listEndRef.current
+    if (!node || typeof IntersectionObserver !== 'function') return
+    const observer = new IntersectionObserver(entries => {
+      if (entries.some(entry => entry.isIntersecting)) {
+        loadIssues(submittedJql, { append: true, nextPageToken, pageSize: editableSettings?.pageSize })
+      }
+    }, { rootMargin: '240px 0px' })
+    observer.observe(node)
+    return () => observer.disconnect()
+  }, [editableSettings?.pageSize, loadIssues, loading, loadingMore, nextPageToken, submittedJql])
+
   const restoreViewState = useCallback((viewId, origin = jiraOriginRef.current, owner = null) => {
     const saved = readSavedViewState(viewId, origin, owner || readActiveOwner())
     setFilter(String(saved?.filter || '').slice(0, VIEW_FILTER_LIMIT))
     setQuickFilter(isQuickFilter(saved?.quickFilter))
     setAttentionOnly(saved?.attentionOnly === true)
-    setCollapsedLanes({})
+    setCollapsedLanes(Object.fromEntries(normaliseCollapsedLaneKeys(saved?.collapsedLanes).map(key => [key, true])))
   }, [])
 
   useEffect(() => {
@@ -3729,9 +5571,12 @@ function JiraPage() {
     Promise.all([api('/status'), api('/settings'), host.request('projects.tree', { preview_limit: 0 })])
       .then(([nextStatus, settingsResult, tree]) => {
         if (!alive) return
-        const nextSettings = settingsResult?.settings
+        const nextSettings = withSprintViews(settingsResult?.settings)
         const views = Array.isArray(nextSettings?.views) ? nextSettings.views : []
-        const view = views.find(candidate => candidate.id === nextSettings?.defaultView) || views[0]
+        const lastActiveViewId = readLastActiveViewId()
+        const view = views.find(candidate => candidate.id === lastActiveViewId)
+          || views.find(candidate => candidate.id === nextSettings?.defaultView)
+          || views[0]
         const nextJql = String(view?.jql || DEFAULT_JQL)
         const formatted = JSON.stringify(nextSettings, null, 2)
         setStatus(nextStatus)
@@ -3767,6 +5612,7 @@ function JiraPage() {
     setLiveTicketStates({})
     setWorkingSessionIds(new Set())
     setDetectedLanes([])
+    setLaneReadySignature('')
     setDetail(null)
     setMapping(null)
     setLinks([])
@@ -3774,7 +5620,6 @@ function JiraPage() {
     host.navigate(jiraRoute(''))
     if (status?.configured && submittedJql) {
       void loadIssues(submittedJql, {
-        force: true,
         pageSize: settings?.pageSize,
         origin: status.base_url
       })
@@ -3783,8 +5628,8 @@ function JiraPage() {
 
   useEffect(() => {
     if (!activeView || !activeCacheScope) return
-    writeSavedViewState(activeView, { filter, quickFilter, attentionOnly }, status?.base_url, readActiveOwner())
-  }, [activeCacheScope, activeView, attentionOnly, filter, quickFilter, status?.base_url])
+    writeSavedViewState(activeView, { filter, quickFilter, attentionOnly, collapsedLanes: collapsedLaneKeys }, status?.base_url, readActiveOwner())
+  }, [activeCacheScope, activeView, attentionOnly, collapsedLaneKeys, filter, quickFilter, status?.base_url])
 
   useEffect(() => {
     if (!settingsDraft || settingsDraft === lastSavedSettings.current) return
@@ -3795,7 +5640,7 @@ function JiraPage() {
       parsed = JSON.parse(settingsDraft)
       setSettingsError('')
     } catch (cause) {
-      setSettingsState('')
+      setSettingsState('Invalid JSON')
       setSettingsError(errorText(cause, 'Settings must be valid JSON.'))
       return
     }
@@ -3805,7 +5650,7 @@ function JiraPage() {
       try {
         const result = await api('/settings', { method: 'PUT', body: parsed })
         if (generation !== settingsSaveGeneration.current) return
-        const saved = result?.settings
+        const saved = withSprintViews(result?.settings)
         const formatted = JSON.stringify(saved, null, 2)
         const views = Array.isArray(saved?.views) ? saved.views : []
         const view = views.find(candidate => candidate.id === activeView)
@@ -3820,21 +5665,12 @@ function JiraPage() {
         if (status?.configured) loadIssues(String(view?.jql || DEFAULT_JQL), { pageSize: saved?.pageSize })
       } catch (cause) {
         if (generation !== settingsSaveGeneration.current) return
-        setSettingsState('')
+        setSettingsState('Save failed')
         setSettingsError(errorText(cause, 'Could not save Jira Browser settings.'))
       }
     }, 700)
     return () => clearTimeout(saveTimer.current)
-  }, [activeView, loadIssues, settingsDraft, status?.configured])
-
-  const editableSettings = useMemo(() => {
-    try {
-      const parsed = JSON.parse(settingsDraft)
-      return parsed && typeof parsed === 'object' ? parsed : (settings || {})
-    } catch {
-      return settings || {}
-    }
-  }, [settings, settingsDraft])
+  }, [activeView, loadIssues, settingsDraft, status?.configured, settingsRetry])
 
   const mutateSettingsDraft = useCallback(mutator => {
     setSettingsDraft(current => {
@@ -3852,6 +5688,14 @@ function JiraPage() {
   const updateSettingsField = useCallback((field, value) => {
     mutateSettingsDraft(current => ({ ...current, [field]: value }))
   }, [mutateSettingsDraft])
+
+  useEffect(() => {
+    const handleOnline = () => {
+      if (status?.configured && error && !loading) loadIssues(submittedJql, { pageSize: editableSettings?.pageSize })
+    }
+    window.addEventListener('online', handleOnline)
+    return () => window.removeEventListener('online', handleOnline)
+  }, [editableSettings?.pageSize, error, loadIssues, loading, status?.configured, submittedJql])
 
   const updateViewMode = useCallback(mode => {
     mutateSettingsDraft(current => ({
@@ -3997,7 +5841,7 @@ function JiraPage() {
       setSettingsDraft(formatted)
       setSettingsState('Reloaded')
     } catch (cause) {
-      setSettingsState('')
+      setSettingsState('Reload failed')
       setSettingsError(errorText(cause, 'Could not reload the settings file.'))
     }
   }, [])
@@ -4032,11 +5876,16 @@ function JiraPage() {
     workStateScopeRef.current = cacheScope
     const cached = readWorkStateCache(cacheOrigin, cacheOwner)
     setWorkStates(current => {
-      const next = { ...(scopeChanged ? {} : current), ...cached }
+      const next = reuseCachedWorkStates(scopeChanged ? {} : current, cached)
+      let updated = next
       for (const issue of issues) {
-        next[issue.key] = { ...(next[issue.key] || {}), loading: true }
+        const previous = updated[issue.key] || {}
+        if (previous.loading !== !Array.isArray(previous.links)) {
+          if (updated === next) updated = { ...next }
+          updated[issue.key] = { ...previous, loading: !Array.isArray(previous.links) }
+        }
       }
-      return next
+      return updated
     })
     if (issues.length === 0) return
 
@@ -4092,12 +5941,12 @@ function JiraPage() {
             storedAt: Date.now()
           }]
         }).filter(([key]) => key && !failedKeys.has(key))
-        if (failedKeys.size > 0) {
-          const failedIssues = issues.filter(issue => failedKeys.has(String(issue.key || '').trim().toUpperCase()))
-          const fallbackEntries = await fallbackIndividual(failedIssues)
-          if (entries.length || fallbackEntries.length) return commitEntries([...entries, ...fallbackEntries])
+        const completedKeys = new Set(entries.map(([key]) => key))
+        const missingIssues = issues.filter(issue => !completedKeys.has(String(issue.key || '').trim().toUpperCase()))
+        if (missingIssues.length > 0) {
+          const fallbackEntries = await fallbackIndividual(missingIssues)
+          return commitEntries([...entries, ...fallbackEntries])
         }
-        if (entries.length === 0) return fallbackIndividual().then(commitEntries)
         commitEntries(entries)
       })
       .catch(() => fallbackIndividual().then(commitEntries))
@@ -4105,6 +5954,7 @@ function JiraPage() {
 
   const reloadLinks = useCallback(async () => {
     if (!detail?.id) return
+    const detailKey = detail.key
     const owner = readActiveOwner()
     const cacheOrigin = String(status?.base_url || '').trim()
     const cacheOwner = owner
@@ -4115,6 +5965,7 @@ function JiraPage() {
     }
     await invalidateIssueBatchCache(owner, status?.base_url)
     const result = await api(path)
+    if (activeDetailKeyRef.current !== detailKey) return
     const nextLinks = filterDetachedLinks(detail.key, result?.links, result?.detached, status?.base_url)
     setLinks(nextLinks)
     setWorkStates(current => {
@@ -4128,10 +5979,12 @@ function JiraPage() {
   }, [detail?.id, detail?.key, status?.base_url, activeCacheScope])
 
   useEffect(() => {
+    setDetail(null)
+    setMapping(null)
+    setLinks([])
+    setDetailError(null)
     if (!selectedKey) {
-      setDetail(null)
-      setMapping(null)
-      setLinks([])
+      setDetailLoading(false)
       return
     }
     let alive = true
@@ -4142,18 +5995,17 @@ function JiraPage() {
         const owner = readActiveOwner()
         const linksPath = issueLinksPath(nextDetail.id, owner)
         if (!linksPath) throw new Error('Jira link owner is unavailable.')
-        const linksResult = await api(linksPath)
-        if (!alive) return
-        const mappingResult = nextDetail?.project_key
-          ? await api(`/mappings/${encodeURIComponent(nextDetail.project_key)}`)
-          : { mapping: null }
+        const [linksResult, mappingResult] = await Promise.all([
+          api(linksPath),
+          nextDetail?.project_key ? api(`/mappings/${encodeURIComponent(nextDetail.project_key)}`) : { mapping: null }
+        ])
         if (!alive) return
         setDetail(nextDetail)
         setLinks(filterDetachedLinks(nextDetail.key, linksResult?.links, linksResult?.detached, status?.base_url))
         setMapping(mappingResult?.mapping || null)
       })
       .catch(cause => {
-        if (alive) setError(errorText(cause, `Could not load ${selectedKey}.`))
+        if (alive) setDetailError({ key: selectedKey, message: errorText(cause, `Could not load ${selectedKey}.`) })
       })
       .finally(() => {
         if (alive) setDetailLoading(false)
@@ -4161,7 +6013,7 @@ function JiraPage() {
     return () => {
       alive = false
     }
-  }, [selectedKey, status?.base_url])
+  }, [selectedKey, status?.base_url, detailRetry])
 
   const laneProbeKeys = useMemo(() => {
     const representatives = new Map()
@@ -4181,12 +6033,13 @@ function JiraPage() {
       category: issue.status_category || 'new'
     }))
     if (laneProbeKeys.length === 0) {
-      setDetectedLanes(mergeLaneDefinitions(issueStatuses))
+      setDetectedLanes(current => reuseUnchangedLanes(current, mergeLaneDefinitions(issueStatuses)))
       return () => { alive = false }
     }
 
     const cached = readLaneCache(projectKeys, status?.base_url)
-    setDetectedLanes(mergeLaneDefinitions(cached, issueStatuses))
+    setDetectedLanes(current => reuseUnchangedLanes(current, mergeLaneDefinitions(cached, issueStatuses)))
+    if (cached.length > 0) setLaneReadySignature(projectKeys.join('|'))
     Promise.all(laneProbeKeys.map(async probe => {
       try {
         const result = await api(`/issues/${encodeURIComponent(probe.issueKey)}/transitions`)
@@ -4197,11 +6050,20 @@ function JiraPage() {
     })).then(results => {
       if (!alive) return
       const lanes = mergeLaneDefinitions(cached, issueStatuses, ...results)
-      setDetectedLanes(lanes)
+      setDetectedLanes(current => reuseUnchangedLanes(current, lanes))
       writeLaneCache(projectKeys, lanes, status?.base_url)
+      setLaneReadySignature(projectKeys.join('|'))
     })
     return () => { alive = false }
   }, [laneProbeSignature, activeCacheScope])
+
+  useEffect(() => {
+    if (!coldView || loading) return
+    const laneKey = laneProbeKeys.map(probe => probe.projectKey).join('|')
+    if (viewEnrichmentReady(issues, workStates, laneProbeKeys.length === 0 || laneReadySignature === laneKey)) {
+      setColdView(false)
+    }
+  }, [coldView, loading, issues, workStates, laneReadySignature, laneProbeSignature])
 
   const attentionByKey = useMemo(() => Object.fromEntries(
     issues.map(issue => [issue.key, issueAttentionReasons(issue, workStates[issue.key])])
@@ -4210,6 +6072,36 @@ function JiraPage() {
     () => issues.filter(issue => (attentionByKey[issue.key] || []).length > 0).length,
     [attentionByKey, issues]
   )
+  const attentionBreakdown = useMemo(() => {
+    const counts = new Map()
+    for (const issue of issues) {
+      for (const reason of attentionByKey[issue.key] || []) {
+        counts.set(reason, (counts.get(reason) || 0) + 1)
+      }
+    }
+    return [...counts.entries()]
+      .sort((left, right) => right[1] - left[1])
+      .map(([reason, count]) => `${reason} · ${count}`)
+      .join('\n')
+  }, [attentionByKey, issues])
+  useEffect(() => subscribePrStatus(() => setPrStatusVersion(version => version + 1)), [])
+  const prStatusByKey = useMemo(() => readPrStatusCache(), [prStatusVersion])
+  const quickFilterCounts = useMemo(() => countQuickFilters(
+    issues, workStates, attentionByKey, liveTicketStates, workingSessionIds, prStatusByKey
+  ), [attentionByKey, issues, liveTicketStates, prStatusByKey, workingSessionIds, workStates])
+  useEffect(() => {
+    const timer = window.setInterval(() => {
+      if (document.visibilityState === 'visible') setClockTick(value => value + 1)
+    }, 60_000)
+    return () => window.clearInterval(timer)
+  }, [])
+  const detectedStoryPoints = useMemo(() => {
+    const field = issues.find(issue => hasStoryPointsField(issue))?.story_points_field
+    const id = String(field?.id || '').trim()
+    if (!id) return ''
+    const name = String(field?.name || '').trim()
+    return name && name !== id ? `${name} (${id})` : id
+  }, [issues])
   const activeViewPreferences = useMemo(
     () => viewPreferences(editableSettings, activeView),
     [activeView, editableSettings]
@@ -4225,17 +6117,77 @@ function JiraPage() {
         workStates[issue.key],
         attentionByKey[issue.key] || [],
         liveTicketStates[issue.key] || 'idle',
-        workingSessionIds
+        workingSessionIds,
+        prStatusByKey
       )) return false
       if (!needle) return true
       return `${issue.key} ${issue.summary} ${issue.assignee || ''} ${issue.status || ''}`.toLowerCase().includes(needle)
     })
-  }, [attentionByKey, attentionOnly, filter, issues, liveTicketStates, quickFilter, workingSessionIds, workStates])
+  }, [attentionByKey, attentionOnly, filter, issues, liveTicketStates, prStatusByKey, quickFilter, workingSessionIds, workStates])
 
   const sortedVisibleIssues = useMemo(
     () => sortIssues(visibleIssues, activeViewPreferences.sort),
     [activeViewPreferences.sort, visibleIssues]
   )
+
+  // Background PR-badge prewarm: fetch repository context for the first few
+  // visible, uncached tickets so badges and has-pr/no-pr filters fill in
+  // without opening every drawer. Transport failures leave the badge unknown
+  // (never marked absent); a key retries only after the cache TTL passes.
+  // Attention tickets are prewarmed first; offline sessions skip entirely,
+  // and the ⇧a attach target is always queued even outside the top slice.
+  const prPrewarmRef = useRef(new Map())
+  useEffect(() => {
+    let alive = true
+    if (!navigator.onLine) return () => { alive = false }
+    const cached = readPrStatusCache()
+    const queue = [...sortedVisibleIssues]
+      .sort((left, right) => Number((attentionByKey[right.key] || []).length > 0) - Number((attentionByKey[left.key] || []).length > 0))
+      .map(issue => String(issue?.key || '').trim())
+      .filter(key => key && key !== selectedKey && !cached[key]
+        && (!prPrewarmRef.current.has(key) || Date.now() - prPrewarmRef.current.get(key) > PR_STATUS_MAX_AGE_MS))
+      .slice(0, PR_PREWARM_LIMIT)
+    const attachTargetKey = shiftAttachTarget(sortedVisibleIssues, attentionByKey, readPrLinkOverrides(), readPrStatusCache())?.key
+    if (attachTargetKey && attachTargetKey !== selectedKey && !cached[attachTargetKey]
+      && (!prPrewarmRef.current.has(attachTargetKey) || Date.now() - prPrewarmRef.current.get(attachTargetKey) > PR_STATUS_MAX_AGE_MS)
+      && !queue.includes(attachTargetKey)) queue.push(attachTargetKey)
+    if (!queue.length) return () => { alive = false }
+    let index = 0
+    let timer = null
+    const tick = () => {
+      if (!alive || index >= queue.length) return
+      const key = queue[index]
+      index += 1
+      prPrewarmRef.current.set(key, Date.now())
+      api(`/issues/${encodeURIComponent(key)}/repository-context?base_ref=${encodeURIComponent('HEAD')}`, { timeoutMs: 10_000 })
+        .then(result => {
+          const github = result?.github && typeof result.github === 'object' ? result.github : null
+          if (!result?.available || !github || github.available !== true) return
+          const pullRequest = github.pull_request && typeof github.pull_request === 'object' ? github.pull_request : null
+          if (alive) writePrStatus(key, pullRequest
+            ? { number: pullRequest.number || '', state: String(pullRequest.state || ''), url: String(pullRequest.url || ''), fetchedAt: Date.now() }
+            : { pr: false, fetchedAt: Date.now() })
+        })
+        .catch(() => { /* transport failure: badge stays unknown, never absent */ })
+      timer = setTimeout(tick, 600)
+    }
+    timer = setTimeout(tick, 400)
+    return () => { alive = false; clearTimeout(timer) }
+  }, [attentionByKey, selectedKey, sortedVisibleIssues])
+
+  const storyPointsRollup = useMemo(() => {
+    if (!sortedVisibleIssues.some(hasStoryPointsField)) return null
+    let total = 0
+    let counted = 0
+    for (const issue of sortedVisibleIssues) {
+      const value = storyPointsValue(issue)
+      if (value !== null) {
+        total += value
+        counted += 1
+      }
+    }
+    return counted > 0 ? total : null
+  }, [sortedVisibleIssues])
 
   const issueLanes = useMemo(() => {
     const explicitBoardView = activeViewPreferences.view?.layout === 'board'
@@ -4271,26 +6223,77 @@ function JiraPage() {
     setCollapsedLanes(current => ({ ...current, [key]: !current[key] }))
   }, [])
 
+  const allLanesCollapsed = issueLanes.length > 0 && issueLanes.every(lane => collapsedLanes[lane.key])
+  const toggleAllLanes = useCallback(() => {
+    setCollapsedLanes(allLanesCollapsed ? {} : Object.fromEntries(issueLanes.map(lane => [lane.key, true])))
+  }, [allLanesCollapsed, issueLanes])
+
+  const hasActiveNarrowing = Boolean(String(filter || '').trim()) || quickFilter !== 'all' || attentionOnly
+  const clearNarrowingFilters = useCallback(() => {
+    setFilter('')
+    setQuickFilter('all')
+    setAttentionOnly(false)
+  }, [])
+
+  const manualPrLinkCount = Object.values(readPrLinkOverrides())
+    .filter(link => link && typeof link === 'object' && typeof link.url === 'string' && link.url).length
+  const prLinkAttentionCount = Object.keys(readPrLinkOverrides())
+    .filter(key => (attentionByKey[key] || []).length > 0).length
+  const prLinkDriftCount = Object.entries(readPrLinkOverrides())
+    .filter(([key, entry]) => prLinkDrift(entry, readPrStatusCache()[key])).length
+  const newestGhPrCheckAt = prStatusByKey
+    ? Math.max(0, ...Object.values(prStatusByKey)
+        .filter(entry => entry && typeof entry === 'object' && entry.state !== 'manual' && Number(entry.fetchedAt) > 0)
+        .map(entry => Number(entry.fetchedAt)))
+    : 0
+  const prFreshnessNote = newestGhPrCheckAt && Date.now() - newestGhPrCheckAt > 5 * 60_000
+    ? ` · gh checks ${Math.round((Date.now() - newestGhPrCheckAt) / 60_000)} min old`
+    : ''
+  const headerPrCount = useMemo(() => sortedVisibleIssues.reduce((total, issue) => {
+    const entry = prStatusByKey?.[issue.key]
+    return total + (entry && entry.pr !== false ? 1 : 0)
+  }, 0), [prStatusByKey, sortedVisibleIssues])
+  const copyVisibleKeys = useCallback(() => {
+    const keys = sortedVisibleIssues.map(issue => String(issue?.key || '')).filter(Boolean)
+    if (!keys.length) return
+    void copyTextToClipboard(keys.join('\n'), `${keys.length} ticket keys`)
+  }, [sortedVisibleIssues])
+
+  const openSelectedInJira = useCallback(() => {
+    const url = issueUrl(status, selectedKey)
+    if (url) pluginContext?.os.openExternal(url)
+  }, [selectedKey, status])
+
   const selectView = useCallback(nextId => {
     const view = editableSettings?.views?.find(candidate => candidate.id === nextId)
     if (!view) return
     setActiveView(nextId)
+    writeLastActiveViewId(nextId)
     setSubmittedJql(view.jql)
     restoreViewState(nextId)
     loadIssues(view.jql, { pageSize: editableSettings?.pageSize })
   }, [editableSettings, loadIssues, restoreViewState])
 
+  const [attachRequest, setAttachRequest] = useState(null)
   const openTicket = useCallback(issueKey => {
     const key = normaliseIssueKey(issueKey)
     if (!key) return
     setShowSettings(false)
     setSelectedKey(key)
+    const containingLane = issueLanes.find(lane => lane.issues.some(item => item.key === key))
+    if (containingLane && collapsedLanes[containingLane.key]) {
+      setCollapsedLanes(current => ({ ...current, [containingLane.key]: false }))
+    }
     host.navigate(jiraRoute(key))
-  }, [])
+  }, [collapsedLanes, issueLanes])
 
   const selectedIssueIndex = sortedVisibleIssues.findIndex(issue => issue.key === selectedKey)
-  const previousIssueKey = selectedIssueIndex > 0 ? sortedVisibleIssues[selectedIssueIndex - 1]?.key : ''
-  const nextIssueKey = selectedIssueIndex >= 0 ? sortedVisibleIssues[selectedIssueIndex + 1]?.key || '' : ''
+  const previousIssueKey = selectedIssueIndex >= 0 && sortedVisibleIssues.length > 0
+    ? sortedVisibleIssues[(selectedIssueIndex - 1 + sortedVisibleIssues.length) % sortedVisibleIssues.length]?.key || ''
+    : ''
+  const nextIssueKey = selectedIssueIndex >= 0 && sortedVisibleIssues.length > 0
+    ? sortedVisibleIssues[(selectedIssueIndex + 1) % sortedVisibleIssues.length]?.key || ''
+    : ''
 
   useEffect(() => {
     const handleKeyboard = event => {
@@ -4307,22 +6310,65 @@ function JiraPage() {
         document.querySelector('[aria-label="Filter Jira tickets"]')?.focus()
         return
       }
+      if (event.key === '?') {
+        event.preventDefault()
+        setShowShortcuts(value => !value)
+        return
+      }
       if (event.key === 'Escape') {
         event.preventDefault()
+        if (showShortcuts) {
+          setShowShortcuts(false)
+          return
+        }
         if (showSettings) setShowSettings(false)
         else if (selectedKey) {
           setSelectedKey('')
           host.navigate(jiraRoute(''))
+        } else if (String(filter || '').trim()) {
+          setFilter('')
         }
         return
       }
-      if (event.key === 'j' || event.key === 'ArrowDown' || event.key === 'k' || event.key === 'ArrowUp') {
+      if (event.key === 'j' || event.key === 'J' || event.key === 'ArrowDown' || event.key === 'k' || event.key === 'K' || event.key === 'ArrowUp') {
         event.preventDefault()
-        const delta = event.key === 'j' || event.key === 'ArrowDown' ? 1 : -1
+        const delta = event.key === 'j' || event.key === 'J' || event.key === 'ArrowDown' ? 1 : -1
+        const step = event.shiftKey ? 10 : 1
         const currentIndex = sortedVisibleIssues.findIndex(issue => issue.key === selectedKey)
-        const nextIndex = currentIndex < 0 ? (delta > 0 ? 0 : sortedVisibleIssues.length - 1) : currentIndex + delta
+        const total = sortedVisibleIssues.length
+        let nextIndex = currentIndex < 0
+          ? (delta > 0 ? 0 : total - 1)
+          : currentIndex + delta * step
+        if (nextIndex < 0) nextIndex = total - 1
+        else if (nextIndex >= total) nextIndex = 0
         const nextKey = sortedVisibleIssues[nextIndex]?.key
         if (nextKey) openTicket(nextKey)
+        return
+      }
+      if (event.key === 'n' || event.key === 'N') {
+        event.preventDefault()
+        const needingAttention = sortedVisibleIssues.filter(issue => (attentionByKey?.[issue.key] || []).length > 0)
+        if (!needingAttention.length) return
+        const at = needingAttention.findIndex(issue => issue.key === selectedKey)
+        const stepIndex = event.shiftKey
+          ? (at <= 0 ? needingAttention.length - 1 : at - 1)
+          : (at + 1) % needingAttention.length
+        const nextKey = needingAttention[stepIndex]?.key
+        if (nextKey) openTicket(nextKey)
+        return
+      }
+      if (event.key === 'Home' || event.key === 'End') {
+        event.preventDefault()
+        const target = event.key === 'Home'
+          ? sortedVisibleIssues[0]
+          : sortedVisibleIssues[sortedVisibleIssues.length - 1]
+        if (target?.key) openTicket(target.key)
+        return
+      }
+      if (event.key === ',') {
+        event.preventDefault()
+        setSelectedKey('')
+        setShowSettings(value => !value)
         return
       }
       if (event.key === 'b' || event.key === 'l') {
@@ -4333,11 +6379,84 @@ function JiraPage() {
       if (event.key === 'r' && !loading) {
         event.preventDefault()
         void loadIssues(submittedJql, { force: true, pageSize: editableSettings?.pageSize })
+        return
+      }
+      if (event.key === 'c') {
+        event.preventDefault()
+        const issue = selectedKey ? sortedVisibleIssues.find(candidate => candidate.key === selectedKey) : null
+        if (issue?.key) void copyTextToClipboard(issue.key, 'ticket key')
+        else copyVisibleKeys()
+        return
+      }
+      if (event.key === 'y') {
+        event.preventDefault()
+        void copyTextToClipboard(submittedJql, 'JQL')
+        return
+      }
+      if (event.key === 'p') {
+        event.preventDefault()
+        pinTicketRef.current?.()
+        return
+      }
+      if (event.key === 'P' && event.shiftKey) {
+        const pinTargetKey = String(selectedKey || sortedVisibleIssues[0]?.key || '').trim()
+        const detected = readPrStatusCache()[pinTargetKey]
+        const detectedUrl = detected && detected.pr !== false && Number(detected.number) > 0
+          ? prLinkOverrideValid(String(detected.url || ''))
+          : ''
+        if (!pinTargetKey || !detectedUrl || readPrLinkOverrides()[pinTargetKey]) {
+          host.notify({ kind: 'warning', message: pinTargetKey ? `No unattached detected pull request to pin for ${pinTargetKey}.` : 'No visible ticket to pin a pull request for.' })
+          return
+        }
+        event.preventDefault()
+        writePrLinkOverride(pinTargetKey, detectedUrl)
+        host.notify({ kind: 'success', message: `Detected pull request #${detected.number} pinned to ${pinTargetKey}.` })
+      }
+      if (event.key === 'o') {
+        event.preventDefault()
+        openSelectedInJira()
+        return
+      }
+      if (event.key === 'v') {
+        event.preventDefault()
+        updateViewMode(effectiveListView === 'list' ? 'board' : 'list')
+        return
+      }
+      if (event.key === 'x') {
+        if (effectiveListView !== 'board') return
+        event.preventDefault()
+        const laneKeys = issueLanes.map(lane => lane.key)
+        const allCollapsed = laneKeys.length > 0 && laneKeys.every(key => collapsedLanes[key])
+        setCollapsedLanes(current => {
+          const next = { ...current }
+          for (const lane of issueLanes) next[lane.key] = !allCollapsed
+          return next
+        })
+      }
+      if ((event.key === 'a' || (event.key === 'A' && !event.shiftKey)) && !selectedKey && !showSettings) {
+        const issueToAttach = sortedVisibleIssues[0]
+        if (!issueToAttach?.key) return
+        event.preventDefault()
+        setAttachRequest({ key: issueToAttach.key, nonce: Date.now() })
+        openTicket(issueToAttach.key)
+      }
+      if (event.key === 'A' && event.shiftKey && !showSettings) {
+        const attentionTarget = shiftAttachTarget(sortedVisibleIssues, attentionByKey, readPrLinkOverrides(), readPrStatusCache())
+        if (!attentionTarget?.key) return
+        event.preventDefault()
+        setAttachRequest({ key: attentionTarget.key, nonce: Date.now() })
+        openTicket(attentionTarget.key)
       }
     }
     window.addEventListener('keydown', handleKeyboard)
     return () => window.removeEventListener('keydown', handleKeyboard)
-  }, [editableSettings?.pageSize, loadIssues, loading, openTicket, selectedKey, showSettings, sortedVisibleIssues, submittedJql, updateViewMode])
+  }, [attentionByKey, collapsedLanes, copyVisibleKeys, editableSettings?.pageSize, effectiveListView, filter, issueLanes, loadIssues, loading, openSelectedInJira, openTicket, selectedKey, showSettings, showShortcuts, sortedVisibleIssues, submittedJql, updateViewMode])
+
+  useEffect(() => {
+    if (!selectedKey || !effectiveListView) return
+    const escape = typeof CSS !== 'undefined' && CSS.escape ? CSS.escape : value => value
+    document.querySelector(`[data-jira-row="${escape(selectedKey)}"]`)?.scrollIntoView?.({ block: 'nearest' })
+  }, [effectiveListView, selectedKey, sortedVisibleIssues.length])
 
   const pinTicket = useCallback(() => {
     const issue = detail
@@ -4381,6 +6500,10 @@ function JiraPage() {
     }
   }, [detail, links, mapping, projects, settings?.baseRef, status])
 
+  useEffect(() => {
+    pinTicketRef.current = pinTicket
+  }, [pinTicket])
+
   const moveIssueToLane = useCallback(async (issueKey, targetStatus) => {
     const current = issues.find(issue => issue.key === issueKey)
     if (!current || !targetStatus || current.status === targetStatus || movingKey) return
@@ -4405,11 +6528,13 @@ function JiraPage() {
       host.notify({ kind: 'success', message: `${issueKey} moved to ${updated.status}.` })
       forgetMutationKey('drag', issueKey, { transition_id: transition.id }, mutationKey)
     } catch (cause) {
-      setError(errorText(cause, `Could not move ${issueKey}.`))
+      const message = errorText(cause, `Could not move ${issueKey}.`)
+      setError(message)
+      host.notify({ kind: 'error', message })
     } finally {
       setMovingKey('')
     }
-  }, [issues, movingKey, selectedKey])
+  }, [issues, movingKey, selectedKey, status])
 
   const beginDrawerResize = useCallback(event => {
     if (event.button !== 0) return
@@ -4474,144 +6599,291 @@ function JiraPage() {
     className: 'relative flex h-full flex-col overflow-hidden bg-(--ui-surface-background)',
     children: [
       jsxs('header', {
-        className: 'flex shrink-0 flex-wrap items-center gap-2 px-4 py-2',
+        className: 'flex shrink-0 flex-col gap-1.5 border-b border-(--ui-stroke-tertiary) px-4 py-2',
         children: [
-          jsx('h1', { className: 'text-sm font-semibold text-foreground', children: 'Jira' }),
-          jsx('span', {
-            className: 'rounded-full bg-(--ui-bg-quaternary) px-1.5 py-px text-[0.625rem] tabular-nums text-(--ui-text-tertiary)',
-            children: visibleIssues.length
-          }),
-          jsx(Select, {
-            value: activeView,
-            onValueChange: selectView,
-            children: jsxs(Fragment, {
-              children: [
-                jsx(SelectTrigger, {
-                  className: 'h-7 w-48 text-xs',
-                  'aria-label': 'Jira saved view',
-                  children: jsx(SelectValue, { placeholder: 'Choose a Jira view' })
-                }),
-                jsx(SelectContent, {
-                  children: (editableSettings?.views || []).map(view =>
-                    jsx(SelectItem, { value: view.id, children: view.label }, view.id)
-                  )
-                })
-              ]
-            })
-          }),
           jsxs('div', {
-            className: 'flex items-center gap-0.5 rounded-md border border-(--ui-stroke-tertiary) p-0.5',
-            'aria-label': 'Jira ticket layout',
-            role: 'group',
+            className: 'flex min-w-0 flex-wrap items-center gap-2',
             children: [
-              jsx(Button, {
-                'aria-pressed': !effectiveListView,
-                onClick: () => updateViewMode('board'),
-                size: 'xs',
-                variant: !effectiveListView ? 'secondary' : 'ghost',
-                children: 'Board'
+              jsx('h1', { className: 'text-sm font-semibold text-foreground', children: 'Jira' }),
+              jsx('span', {
+                className: 'rounded-full bg-(--ui-bg-quaternary) px-1.5 py-px text-[0.625rem] tabular-nums text-(--ui-text-tertiary)',
+                'aria-label': `${visibleIssues.length} ticket${visibleIssues.length === 1 ? '' : 's'} shown`,
+                'aria-live': 'polite',
+                role: 'status',
+                children: visibleIssues.length
+              }),
+              storyPointsRollup !== null
+                ? jsx('button', {
+                    className: 'rounded-full bg-(--ui-bg-quaternary) px-1.5 py-px text-[0.625rem] tabular-nums text-(--ui-text-tertiary) transition-colors hover:bg-(--chrome-action-hover) hover:text-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-(--dt-composer-ring)',
+                    onClick: () => updateActiveViewPreference('sort', activeViewPreferences.sort === 'points' ? 'updated' : 'points'),
+                    'aria-label': activeViewPreferences.sort === 'points'
+                      ? 'Total story points for the tickets shown · click to sort by updated'
+                      : 'Total story points for the tickets shown · click to sort by points',
+                    'aria-pressed': activeViewPreferences.sort === 'points',
+                    title: activeViewPreferences.sort === 'points'
+                      ? 'Total story points for the tickets shown · click to sort by updated'
+                      : 'Total story points for the tickets shown · click to sort by points',
+                    type: 'button',
+                    children: `${storyPointsRollup} pts`
+                  })
+                : null,
+              headerPrCount > 0
+                ? jsx('button', {
+                    className: 'rounded-full bg-(--ui-bg-quaternary) px-1.5 py-px text-[0.625rem] tabular-nums text-(--ui-text-tertiary) transition-colors hover:bg-(--chrome-action-hover) hover:text-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-(--dt-composer-ring)',
+                    onClick: () => setQuickFilter(quickFilter === 'has-pr' ? 'all' : 'has-pr'),
+                    'aria-label': quickFilter === 'has-pr'
+                      ? 'Pull-request filter is on · click to show all tickets'
+                      : `Tickets shown with a linked pull request (gh-checked or attached manually)${prFreshnessNote} · click to filter`,
+                    title: quickFilter === 'has-pr'
+                      ? 'Pull-request filter is on · click to show all tickets'
+                      : `Tickets shown with a linked pull request (gh-checked or attached manually)${prFreshnessNote} · click to filter`,
+                    type: 'button',
+                    children: `${headerPrCount} PR`
+                  })
+                : null,
+              visibleIssues.length
+                ? jsx(Button, {
+                    'aria-label': 'Copy visible ticket keys',
+                    onClick: copyVisibleKeys,
+                    size: 'icon-xs',
+                    title: `Copy ${visibleIssues.length} ticket key${visibleIssues.length === 1 ? '' : 's'}`,
+                    variant: 'ghost',
+                    children: jsx(Codicon, { name: 'copy', size: '0.75rem' })
+                  })
+                : null,
+              jsx(Select, {
+                value: activeView,
+                onValueChange: selectView,
+                children: jsxs(Fragment, {
+                  children: [
+                    jsx(SelectTrigger, {
+                      className: 'h-7 w-48 max-w-full text-xs',
+                      'aria-label': 'Jira saved view',
+                      children: jsx(SelectValue, { placeholder: 'Choose a Jira view' })
+                    }),
+                    jsx(SelectContent, {
+                      children: (editableSettings?.views || []).map(view =>
+                        jsx(SelectItem, { value: view.id, children: view.label }, view.id)
+                      )
+                    })
+                  ]
+                })
               }),
               jsx(Button, {
-                'aria-pressed': effectiveListView,
-                onClick: () => updateViewMode('list'),
-                size: 'xs',
-                variant: effectiveListView ? 'secondary' : 'ghost',
-                children: 'List'
+                'aria-label': 'Copy active JQL',
+                onClick: () => void copyTextToClipboard(submittedJql, 'JQL'),
+                size: 'icon-xs',
+                title: 'Copy the JQL for this view (y)',
+                variant: 'ghost',
+                children: jsx(Codicon, { name: 'code', size: '0.85rem' })
+              }),
+              jsxs('div', {
+                className: 'flex items-center gap-0.5 rounded-md border border-(--ui-stroke-tertiary) p-0.5',
+                'aria-label': 'Jira ticket layout',
+                role: 'group',
+                children: [
+                  jsx(Button, {
+                    'aria-pressed': !effectiveListView,
+                    onClick: () => updateViewMode('board'),
+                    size: 'xs',
+                    variant: !effectiveListView ? 'secondary' : 'ghost',
+                    children: 'Board'
+                  }),
+                  jsx(Button, {
+                    'aria-pressed': effectiveListView,
+                    onClick: () => updateViewMode('list'),
+                    size: 'xs',
+                    variant: effectiveListView ? 'secondary' : 'ghost',
+                    children: 'List'
+                  })
+                ]
+              }),
+              jsxs('div', {
+                className: 'ml-auto flex shrink-0 items-center gap-2',
+                children: [
+                  jsx('span', {
+                    className: 'whitespace-nowrap text-[0.625rem] text-(--ui-text-quaternary)',
+                    title: lastLoadedAtRef.current ? `Last loaded ${absoluteDate(lastLoadedAtRef.current)}` : 'Loading time is shown after the first refresh',
+                    children: loading ? 'Loading…' : cacheState
+                  }),
+                  jsx(Button, {
+                    'aria-label': 'Refresh Jira tickets',
+                    disabled: loading,
+                    onClick: () => loadIssues(submittedJql, { force: true, pageSize: editableSettings?.pageSize }),
+                    size: 'icon-xs',
+                    title: 'Refresh Jira tickets',
+                    variant: 'ghost',
+                    children: jsx(Codicon, { name: loading ? 'loading~spin' : 'refresh', size: '0.85rem' })
+                  }),
+                  jsx(Button, {
+                    'aria-label': 'Jira Browser settings',
+                    title: manualPrLinkCount > 0
+                      ? `Jira settings · ${manualPrLinkCount} manual PR link${manualPrLinkCount === 1 ? '' : 's'}${prLinkAttentionCount > 0 ? ` · ${prLinkAttentionCount} need attention` : ''}${prLinkDriftCount > 0 ? ` · ${prLinkDriftCount} drifted` : ''}`
+                      : 'Jira settings',
+                    onClick: () => {
+                      setSelectedKey('')
+                      setShowSettings(value => !value)
+                    },
+                    size: 'icon-xs',
+                    variant: showSettings ? 'secondary' : 'ghost',
+                    children: jsx(Codicon, { name: 'settings-gear', size: '0.85rem' })
+                  })
+                ]
               })
             ]
           }),
-          jsxs(Button, {
-            'aria-pressed': attentionOnly,
-            onClick: () => {
-              setQuickFilter('all')
-              setAttentionOnly(value => !value)
-            },
-            size: 'sm',
-            variant: attentionOnly ? 'secondary' : 'ghost',
+          jsxs('div', {
+            className: 'flex min-w-0 flex-wrap items-center gap-2',
             children: [
-              jsx(Codicon, { name: 'bell', size: '0.75rem' }),
-              `Needs attention · ${attentionCount}`
+              jsxs('div', {
+                className: 'relative min-w-[10rem] max-w-sm flex-1',
+                children: [
+                  jsx('input', {
+                    'aria-label': 'Filter Jira tickets',
+                    className: `h-7 w-full rounded-md border border-(--ui-stroke-secondary) bg-(--ui-bg-elevated) ${filter ? 'pl-2 pr-6' : 'px-2'} text-xs text-foreground outline-none placeholder:text-(--ui-text-quaternary) focus:border-(--dt-composer-ring)`,
+                    onChange: event => setFilter(event.target.value),
+                    placeholder: 'Filter tickets (press /)',
+                    value: filter
+                  }),
+                  filter
+                    ? jsx('button', {
+                        'aria-label': 'Clear filter',
+                        className: 'absolute right-1 top-1/2 -translate-y-1/2 rounded p-0.5 text-(--ui-text-quaternary) transition-colors hover:bg-(--chrome-action-hover) hover:text-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-(--dt-composer-ring)',
+                        onClick: () => setFilter(''),
+                        title: 'Clear filter',
+                        type: 'button',
+                        children: jsx(Codicon, { name: 'close', size: '0.7rem' })
+                      })
+                    : null
+                ]
+              }),
+              jsx(Select, {
+                value: quickFilter,
+                onValueChange: value => {
+                  setQuickFilter(value)
+                  setAttentionOnly(false)
+                },
+                children: jsxs(Fragment, {
+                  children: [
+                    jsx(SelectTrigger, {
+                      className: 'h-7 w-36 shrink-0 text-xs',
+                      'aria-label': 'Quick filter',
+                      title: nextPageToken ? 'Counts are for loaded tickets only. Load more to expand them.' : 'Filter tickets',
+                      children: jsx(SelectValue, { placeholder: 'Quick filter' })
+                    }),
+                    jsx(SelectContent, {
+                      children: QUICK_FILTER_OPTIONS.map(option => {
+                        const count = quickFilterCounts[option.value] || 0
+                        return jsx(SelectItem, {
+                          value: option.value,
+                          children: jsxs('span', {
+                            className: 'flex w-full items-center justify-between gap-3',
+                            title: option.hint,
+                            children: [
+                              option.label,
+                              jsx('span', { className: 'tabular-nums text-(--ui-text-quaternary)', children: nextPageToken ? `${count} loaded` : count })
+                            ]
+                          })
+                        }, option.value)
+                      })
+                    })
+                  ]
+                })
+              }),
+              jsxs(Button, {
+                'aria-label': `Needs attention · ${attentionCount}`,
+                className: 'shrink-0 gap-1 tabular-nums',
+                'aria-pressed': attentionOnly,
+                onClick: () => {
+                  setQuickFilter('all')
+                  setAttentionOnly(value => !value)
+                },
+                size: 'xs',
+                title: attentionBreakdown || 'No tickets need attention right now',
+                variant: attentionOnly ? 'secondary' : 'ghost',
+                children: [
+                  jsx(Codicon, { name: 'bell', size: '0.75rem' }),
+                  attentionCount
+                ]
+              }),
+              jsx(Select, {
+                value: activeViewPreferences.sort,
+                onValueChange: value => updateActiveViewPreference('sort', value),
+                children: jsxs(Fragment, {
+                  children: [
+                    jsx(SelectTrigger, { className: 'h-7 w-36 shrink-0 text-xs', 'aria-label': 'Sort tickets', children: jsx(SelectValue, { placeholder: 'Sort tickets' }) }),
+                    jsx(SelectContent, {
+                      children: VIEW_SORT_OPTIONS.map(option => jsx(SelectItem, { value: option.value, children: option.label }, option.value))
+                    })
+                  ]
+                })
+              }),
+              jsx(Button, {
+                'aria-label': 'Density',
+                'aria-checked': activeViewPreferences.density === 'compact',
+                className: 'shrink-0',
+                onClick: () => updateActiveViewPreference('density', activeViewPreferences.density === 'compact' ? 'comfortable' : 'compact'),
+                role: 'switch',
+                size: 'xs',
+                title: `Density: ${activeViewPreferences.density === 'compact' ? 'compact' : 'comfortable'}`,
+                variant: 'ghost',
+                children: jsx(Codicon, { name: activeViewPreferences.density === 'compact' ? 'list-flat' : 'list-tree', size: '0.8rem' })
+              }),
+              !effectiveListView && issueLanes.length
+                ? jsx(Button, {
+                    'aria-label': allLanesCollapsed ? 'Expand all lanes' : 'Collapse all lanes',
+                    'aria-expanded': !allLanesCollapsed,
+                    className: 'shrink-0',
+                    onClick: toggleAllLanes,
+                    size: 'xs',
+                    title: allLanesCollapsed ? 'Expand all lanes' : 'Collapse all lanes',
+                    variant: 'ghost',
+                    children: jsx(Codicon, { name: allLanesCollapsed ? 'expand-all' : 'collapse-all', size: '0.8rem' })
+                  })
+                : null,
+              jsx('button', {
+                className: 'hidden shrink-0 text-[0.6rem] text-(--ui-text-quaternary) underline-offset-2 hover:text-(--ui-text-tertiary) hover:underline xl:inline',
+                onClick: () => setShowShortcuts(value => !value),
+                title: SHORTCUT_TITLE,
+                type: 'button',
+                children: `Keyboard shortcuts: ${SHORTCUT_HINT}`
+              })
             ]
           }),
-          jsx('div', {
-            className: 'w-56',
-            children: jsx('input', {
-              'aria-label': 'Filter Jira tickets',
-              className: 'h-7 w-full rounded-md border border-(--ui-stroke-secondary) bg-(--ui-bg-elevated) px-2 text-xs text-foreground outline-none placeholder:text-(--ui-text-quaternary) focus:border-(--dt-composer-ring)',
-              onChange: event => setFilter(event.target.value),
-              placeholder: 'Filter tickets',
-              value: filter
-            })
-          }),
-          jsx(Select, {
-            value: quickFilter,
-            onValueChange: value => {
-              setQuickFilter(value)
-              setAttentionOnly(false)
-            },
-            children: jsxs(Fragment, {
-              children: [
-                jsx(SelectTrigger, { className: 'h-7 w-36 text-xs', 'aria-label': 'Quick filter', children: jsx(SelectValue, { placeholder: 'Quick filter' }) }),
-                jsx(SelectContent, {
-                  children: QUICK_FILTER_OPTIONS.map(option => jsx(SelectItem, { value: option.value, children: option.label }, option.value))
-                })
-              ]
-            })
-          }),
-          jsx(Select, {
-            value: activeViewPreferences.sort,
-            onValueChange: value => updateActiveViewPreference('sort', value),
-            children: jsxs(Fragment, {
-              children: [
-                jsx(SelectTrigger, { className: 'h-7 w-36 text-xs', 'aria-label': 'Sort tickets', children: jsx(SelectValue, { placeholder: 'Sort tickets' }) }),
-                jsx(SelectContent, {
-                  children: VIEW_SORT_OPTIONS.map(option => jsx(SelectItem, { value: option.value, children: option.label }, option.value))
-                })
-              ]
-            })
-          }),
-          jsx(Button, {
-            'aria-label': 'Density',
-            onClick: () => updateActiveViewPreference('density', activeViewPreferences.density === 'compact' ? 'comfortable' : 'compact'),
-            size: 'xs',
-            title: `Density: ${activeViewPreferences.density === 'compact' ? 'compact' : 'comfortable'}`,
-            variant: 'ghost',
-            children: jsx(Codicon, { name: activeViewPreferences.density === 'compact' ? 'list-flat' : 'list-tree', size: '0.8rem' })
-          }),
-          jsx('span', {
-            className: 'hidden text-[0.6rem] text-(--ui-text-quaternary) xl:inline',
-            title: 'Keyboard shortcuts: / filter · j/k navigate · b/l layout · r refresh · Escape close',
-            children: 'Keyboard shortcuts: / · j/k · b/l · r'
-          }),
-          jsx('span', {
-            className: 'text-[0.625rem] text-(--ui-text-quaternary)',
-            children: loading ? 'Loading…' : cacheState
-          }),
-          jsx('div', {
-            className: 'ml-auto flex items-center gap-1',
-            children: jsxs(Fragment, {
-              children: [
-                jsx(Button, {
-                  'aria-label': 'Jira Browser settings',
-                  onClick: () => {
-                    setSelectedKey('')
-                    setShowSettings(value => !value)
-                  },
-                  size: 'icon-xs',
-                  variant: showSettings ? 'secondary' : 'ghost',
-                  children: jsx(Codicon, { name: 'settings-gear', size: '0.85rem' })
-                }),
-                jsx(Button, {
-                  'aria-label': 'Refresh Jira tickets',
-                  disabled: loading,
-                  onClick: () => loadIssues(submittedJql, { force: true, pageSize: editableSettings?.pageSize }),
-                  size: 'icon-xs',
-                  variant: 'ghost',
-                  children: jsx(Codicon, { name: loading ? 'loading~spin' : 'refresh', size: '0.85rem' })
-                })
-              ]
-            })
-          })
+          hasActiveNarrowing
+            ? jsxs('div', {
+                className: 'flex flex-wrap items-center gap-1.5',
+                children: [
+                  String(filter || '').trim()
+                    ? jsx(NarrowingChip, { label: `Filter: ${filter.trim()}`, onClear: () => setFilter('') })
+                    : null,
+                  quickFilter !== 'all'
+                    ? jsx(NarrowingChip, {
+                        label: `${QUICK_FILTER_OPTIONS.find(option => option.value === quickFilter)?.label || quickFilter} · ${quickFilterCounts[quickFilter] || 0}${nextPageToken ? ' loaded' : ''}`,
+                        onClear: () => setQuickFilter('all')
+                      })
+                    : null,
+                  attentionOnly
+                    ? jsx(NarrowingChip, { label: `Needs attention · ${attentionCount}`, onClear: () => setAttentionOnly(false) })
+                    : null
+                ]
+              })
+            : null,
+          showShortcuts
+            ? jsxs('div', {
+                className: 'flex flex-wrap gap-x-4 gap-y-1 rounded-md border border-(--ui-stroke-tertiary) bg-(--ui-bg-elevated) px-3 py-2 text-[0.62rem] text-(--ui-text-tertiary)',
+                role: 'note',
+                children: [
+                  ...SHORTCUT_ROWS.map(([keys, label]) => jsxs('span', {
+                    className: 'inline-flex items-center gap-1.5',
+                    children: [
+                      jsx('kbd', { className: 'rounded border border-(--ui-stroke-tertiary) bg-foreground/5 px-1 font-mono text-[0.6rem]', children: keys }),
+                      label
+                    ]
+                  }, keys))
+                ]
+              })
+            : null,
         ]
       }),
       error
@@ -4631,7 +6903,7 @@ function JiraPage() {
             ]
           })
         : null,
-      loading && issues.length === 0
+      coldView || (loading && issues.length === 0)
         ? jsx('div', { className: 'grid flex-1 place-items-center', children: jsx(Loader, { type: 'lemniscate-bloom' }) })
         : visibleIssues.length === 0
           ? jsx('div', {
@@ -4640,7 +6912,13 @@ function JiraPage() {
                 className: 'flex flex-col items-center gap-2',
                 children: [
                   jsx(Codicon, { className: 'text-(--ui-text-quaternary)', name: 'issues', size: '1.25rem' }),
-                  jsx('p', { className: 'text-xs text-(--ui-text-tertiary)', children: 'No Jira tickets match this view.' })
+                  jsx('p', {
+                    className: 'text-xs text-(--ui-text-tertiary)',
+                    children: hasActiveNarrowing ? 'No Jira tickets match the current filters.' : 'No Jira tickets match this view.'
+                  }),
+                  hasActiveNarrowing
+                    ? jsx(Button, { onClick: clearNarrowingFilters, size: 'xs', variant: 'outline', children: 'Clear filters' })
+                    : null
                 ]
               })
             })
@@ -4655,9 +6933,13 @@ function JiraPage() {
                     issues: sortedVisibleIssues,
                     liveTicketStates,
                     onOpen: openTicket,
+                    prStatusByKey,
                     workStates,
                     workingSessionIds
                   }),
+                  nextPageToken
+                    ? jsx('div', { ref: listEndRef, 'aria-hidden': 'true', className: 'h-px' })
+                    : null,
                   nextPageToken
                     ? jsx('div', {
                         className: 'flex justify-center py-3',
@@ -4685,6 +6967,7 @@ function JiraPage() {
                     onToggle: () => toggleLane(lane.key),
                     onOpen: openTicket,
                     onMove: moveIssueToLane,
+                    prStatusByKey,
                     workingSessionIds,
                     workStates,
                     liveTicketStates
@@ -4722,7 +7005,7 @@ function JiraPage() {
                 'aria-valuemax': DRAWER_MAX_WIDTH,
                 'aria-valuemin': DRAWER_MIN_WIDTH,
                 'aria-valuenow': drawerWidth,
-                className: 'group absolute inset-y-0 left-0 z-30 w-2 -translate-x-1/2 cursor-col-resize touch-none outline-none',
+                className: 'group absolute inset-y-0 left-0 z-30 w-2 -translate-x-1/2 cursor-col-resize touch-none outline-none focus-visible:ring-1 focus-visible:ring-(--dt-composer-ring)',
                 onDoubleClick: resetDrawerWidth,
                 onKeyDown: resizeDrawerWithKeyboard,
                 onPointerCancel: finishDrawerResize,
@@ -4744,18 +7027,35 @@ function JiraPage() {
                   jsx('span', { className: 'ml-auto text-[0.65rem] text-(--ui-text-tertiary)', children: settingsState }),
                   jsx('button', {
                     'aria-label': 'Close Jira settings',
-                    className: 'grid size-6 place-items-center rounded text-(--ui-text-tertiary) transition-colors hover:bg-(--chrome-action-hover) hover:text-foreground',
+                    className: 'grid size-6 place-items-center rounded text-(--ui-text-tertiary) transition-colors hover:bg-(--chrome-action-hover) hover:text-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-(--dt-composer-ring)',
                     onClick: () => setShowSettings(false),
                     type: 'button',
                     children: jsx(Codicon, { name: 'close', size: '0.9rem' })
                   })
                 ]
               }),
+              settingsError
+                ? jsxs('div', {
+                    className: 'mx-4 mb-3 flex items-center gap-2 rounded-md bg-destructive/10 px-3 py-2 text-xs text-destructive',
+                    role: 'alert',
+                    children: [
+                      jsx(Codicon, { name: 'warning', size: '0.875rem' }),
+                      jsx('span', { className: 'min-w-0 flex-1 break-words', children: settingsError }),
+                      settingsState === 'Save failed' || settingsState === 'Reload failed'
+                        ? jsx(Button, {
+                            onClick: settingsState === 'Save failed' ? retrySettingsSave : reloadSettingsFile,
+                            size: 'xs',
+                            variant: 'ghost',
+                            children: 'Retry'
+                          })
+                        : null
+                    ]
+                  })
+                : null,
               jsx('div', {
                 className: 'min-h-0 flex-1 overflow-y-auto px-4 pb-4',
                 children: jsx(SettingsDrawer, {
                   draft: settingsDraft,
-                  error: settingsError,
                   onAddBacklogView: addBacklogView,
                   onAddView: addSavedView,
                   onChangeDraft: setSettingsDraft,
@@ -4767,9 +7067,12 @@ function JiraPage() {
                   onMoveView: reorderSavedView,
                   onReload: reloadSettingsFile,
                   onRemoveView: removeSavedView,
+                  onOpenTicket: openTicket,
                   onViewChange: updateSavedView,
                   onViewModeChange: updateViewMode,
                   activeView,
+                  attentionByKey,
+                  detectedStoryPoints,
                   settings: editableSettings,
                   state: settingsState
                 })
@@ -4788,7 +7091,7 @@ function JiraPage() {
                 'aria-valuemax': DRAWER_MAX_WIDTH,
                 'aria-valuemin': DRAWER_MIN_WIDTH,
                 'aria-valuenow': drawerWidth,
-                className: 'group absolute inset-y-0 left-0 z-30 w-2 -translate-x-1/2 cursor-col-resize touch-none outline-none',
+                className: 'group absolute inset-y-0 left-0 z-30 w-2 -translate-x-1/2 cursor-col-resize touch-none outline-none focus-visible:ring-1 focus-visible:ring-(--dt-composer-ring)',
                 onDoubleClick: resetDrawerWidth,
                 onKeyDown: resizeDrawerWithKeyboard,
                 onPointerCancel: finishDrawerResize,
@@ -4805,28 +7108,50 @@ function JiraPage() {
               jsxs('header', {
                 className: 'flex items-center gap-2 px-4 pt-3.5 pb-3',
                 children: [
+                  commentDraftMarker(activeDraftScope, selectedKey),
                   jsx('span', { className: 'font-mono text-[0.6875rem] text-(--ui-text-tertiary)', children: selectedKey }),
+                  jsx(PrStatusBadge, { entry: prStatusByKey?.[selectedKey] }),
+                  detail?.key === selectedKey && detail.attachments?.length
+                    ? jsxs('button', {
+                        'aria-label': `Jump to ${detail.attachments.length} attachment${detail.attachments.length === 1 ? '' : 's'}`,
+                        className: 'inline-flex shrink-0 items-center gap-1 rounded bg-(--ui-bg-quaternary) px-1.5 py-px text-[0.6rem] tabular-nums text-(--ui-text-tertiary) transition-colors hover:bg-(--chrome-action-hover) hover:text-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-(--dt-composer-ring)',
+                        onClick: () => document.getElementById('jira-detail-attachments')?.scrollIntoView?.({ behavior: 'smooth', block: 'nearest' }),
+                        title: `${detail.attachments.length} attachment${detail.attachments.length === 1 ? '' : 's'} · click to jump`,
+                        type: 'button',
+                        children: [jsx(Codicon, { name: 'attach', size: '0.6rem' }), detail.attachments.length]
+                      })
+                    : null,
+                  detail?.key === selectedKey && detail.comments?.length
+                    ? jsxs('button', {
+                        'aria-label': `Jump to ${detail.comments.length} comment${detail.comments.length === 1 ? '' : 's'}`,
+                        className: 'inline-flex shrink-0 items-center gap-1 rounded bg-(--ui-bg-quaternary) px-1.5 py-px text-[0.6rem] tabular-nums text-(--ui-text-tertiary) transition-colors hover:bg-(--chrome-action-hover) hover:text-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-(--dt-composer-ring)',
+                        onClick: () => document.getElementById('jira-detail-comments')?.scrollIntoView?.({ behavior: 'smooth', block: 'nearest' }),
+                        title: `${detail.comments.length} comment${detail.comments.length === 1 ? '' : 's'} · click to jump`,
+                        type: 'button',
+                        children: [jsx(Codicon, { name: 'comment', size: '0.6rem' }), detail.comments.length]
+                      })
+                    : null,
                   jsx(Button, {
                     'aria-label': 'Previous Jira ticket',
-                    disabled: !previousIssueKey,
+                    disabled: !previousIssueKey || sortedVisibleIssues.length < 2,
                     onClick: () => openTicket(previousIssueKey),
                     size: 'icon-xs',
-                    title: 'Previous ticket',
+                    title: 'Previous ticket · wraps to the end',
                     variant: 'ghost',
                     children: jsx(Codicon, { name: 'chevron-up', size: '0.8rem' })
                   }),
                   jsx(Button, {
                     'aria-label': 'Next Jira ticket',
-                    disabled: !nextIssueKey,
+                    disabled: !nextIssueKey || sortedVisibleIssues.length < 2,
                     onClick: () => openTicket(nextIssueKey),
                     size: 'icon-xs',
-                    title: 'Next ticket',
+                    title: 'Next ticket · wraps to the start',
                     variant: 'ghost',
                     children: jsx(Codicon, { name: 'chevron-down', size: '0.8rem' })
                   }),
                   jsx('button', {
                     'aria-label': 'Close Jira ticket',
-                    className: 'ml-auto grid size-6 place-items-center rounded text-(--ui-text-tertiary) transition-colors hover:bg-(--chrome-action-hover) hover:text-foreground',
+                    className: 'ml-auto grid size-6 place-items-center rounded text-(--ui-text-tertiary) transition-colors hover:bg-(--chrome-action-hover) hover:text-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-(--dt-composer-ring)',
                     onClick: () => setSelectedKey(''),
                     type: 'button',
                     children: jsx(Codicon, { name: 'close', size: '0.9rem' })
@@ -4837,19 +7162,32 @@ function JiraPage() {
                 className: 'min-h-0 flex-1 overflow-y-auto px-4 pb-4',
                 children: detailLoading
                   ? jsx('div', { className: 'grid h-32 place-items-center', children: jsx(Loader, { type: 'lemniscate-bloom' }) })
-                  : jsx(IssueDetail, {
+                  : detailError?.key === selectedKey
+                    ? jsxs('div', {
+                        className: 'flex items-center gap-2 rounded-md bg-destructive/10 px-3 py-2 text-xs text-destructive',
+                        role: 'alert',
+                        children: [
+                          jsx(Codicon, { name: 'warning', size: '0.875rem' }),
+                          jsx('span', { className: 'min-w-0 flex-1 break-words', children: detailError.message }),
+                          jsx(Button, { onClick: retryDetail, size: 'xs', variant: 'ghost', children: 'Retry this ticket' })
+                        ]
+                      })
+                    : detail?.key === selectedKey ? jsx(IssueDetail, {
                       issue: detail,
                       status,
                       projects,
                       mapping,
                       links,
                       baseRef: settings?.baseRef || 'HEAD',
+                      attachRequest,
                       onOpenIssue: openTicket,
-                      onIssueChanged: setDetail,
+                      onIssueChanged: nextDetail => {
+                        if (activeDetailKeyRef.current === nextDetail?.key) setDetail(nextDetail)
+                      },
                       onMappingSaved: setMapping,
                       onLinksChanged: reloadLinks,
                       onPin: pinTicket
-                    })
+                    }) : null
               })
             ]
           })

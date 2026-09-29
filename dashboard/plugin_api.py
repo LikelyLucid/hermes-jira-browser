@@ -121,7 +121,11 @@ def _store():
 
 
 def _client():
-    return SERVICE.JiraClient(SERVICE.load_jira_config())
+    settings = SERVICE.load_settings()
+    return SERVICE.JiraClient(
+        SERVICE.load_jira_config(),
+        story_points_field=settings.get("storyPointsField", SERVICE.STORY_POINTS_FIELD_AUTO),
+    )
 
 
 def _safe_http_error(exc: Exception, *, status_code: int = 500) -> HTTPException:
@@ -447,10 +451,18 @@ async def search_issues(
         raise _safe_http_error(exc, status_code=502) from exc
 
 
+def _load_issue_detail(client: Any, issue_key: str) -> dict[str, Any]:
+    resolver = getattr(client, "resolve_story_points_field", None)
+    if callable(resolver):
+        resolver()
+    return client.issue(issue_key)
+
+
 @router.get("/issues/{issue_key}")
 async def issue(issue_key: str) -> dict[str, Any]:
     try:
-        return await asyncio.to_thread(_client().issue, issue_key)
+        client = _client()
+        return await asyncio.to_thread(_load_issue_detail, client, issue_key)
     except Exception as exc:
         raise _safe_http_error(exc, status_code=502) from exc
 
